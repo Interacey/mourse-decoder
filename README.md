@@ -34,7 +34,7 @@ To publish a new release, push a tag (`git tag v0.1.0 && git push origin v0.1.0`
 Requirements: [Rust](https://rustup.rs) (stable, ≥ 1.83) and Python ≥ 3.10.
 
 ```powershell
-git clone <repo> ; cd mourse-decoder-decoder
+git clone https://github.com/Interacey/mourse-decoder.git ; cd mourse-decoder
 python -m venv .venv ; .venv\Scripts\activate
 pip install maturin pytest
 maturin develop --release        # builds src/ → python/mourse_decoder/_morse_core.pyd
