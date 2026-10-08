@@ -1,0 +1,46 @@
+# CI: Rust and Python tests on Windows (the target platform) and Linux.
+# Windows is what proves rdev, enigo and PyO3 build there.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        python: ["3.10", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: X11 headers (Linux only, for rdev/enigo)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxtst-dev libxi-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Rust - format, lints, tests
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets --features python,pyo3/extension-module -- -D warnings
+          cargo test
+
+      - name: Python - build the module and test
+        shell: bash
+        run: |
+          python -m venv .venv
+          if [ "$RUNNER_OS" = "Windows" ]; then source .venv/Scripts/activate; else source .venv/bin/activate; fi
+          pip install maturin pytest ruff
+          maturin develop --release
+          ruff check python tests
+          pytest -q

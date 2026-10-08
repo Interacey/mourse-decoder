@@ -1,0 +1,49 @@
+# Rust core engine of Mourse Decoder.
+#
+# One crate that builds both as a Rust library (rlib, for `cargo test`) and as a native
+# Python extension (cdylib, for maturin/PyO3). Everything platform- or Python-specific
+# sits behind features so the timing logic tests without Python or real system hooks:
+#   native-io: global hooks (rdev) and text injection (enigo)
+#   python:    PyO3 bindings (turned on by maturin)
+[package]
+name = "morse_core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.83"            # minimum version PyO3 0.29 requires
+description = "Timing-präzise Morse-Engine mit globalen Input-Hooks und PyO3-Bridge"
+license = "MIT"
+publish = false
+
+[lib]
+name = "morse_core"
+# cdylib gives the .pyd/.so for Python, rlib lets `cargo test` link
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["native-io"]
+# global keyboard/mouse hooks and key simulation
+native-io = ["dep:rdev", "dep:enigo"]
+# Python bindings. Not a default feature so `cargo test` works without a Python
+# interpreter or linker flags.
+python = ["dep:pyo3"]
+
+[dependencies]
+# rdev uses SetWindowsHookEx(WH_KEYBOARD_LL/WH_MOUSE_LL) on Windows and is portable
+# (X11 record on Linux, CGEventTap on macOS).
+rdev = { version = "0.5.3", optional = true }
+# enigo can send any Unicode character (SendInput with KEYEVENTF_UNICODE on Windows),
+# which Greek, Cyrillic and kana need; rdev::simulate only knows physical keys.
+enigo = { version = "0.6.1", optional = true }
+pyo3 = { version = "0.29.3", optional = true }
+
+# swallowing the trigger key needs rdev::grab, which on Windows is part of the same hook
+# (on Linux it pulls in evdev, so it stays off there and the hook only observes)
+[target.'cfg(windows)'.dependencies]
+rdev = { version = "0.5.3", optional = true, features = ["unstable_grab"] }
+
+[profile.release]
+# Small, fast binary, which matters for the under-10-MB-RAM goal. `lto = "thin"` with
+# `codegen-units = 1` was tried but made the maturin cdylib build take over 8 minutes
+# on 2 cores for a few hundred KB, so LTO stays off.
+opt-level = 3
+strip = true

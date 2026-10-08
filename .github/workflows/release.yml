@@ -1,0 +1,57 @@
+# Builds MourseDecoder.exe and attaches it to a GitHub release.
+#
+# Publish a release by pushing a version tag:
+#   git tag v0.1.0 && git push origin v0.1.0
+# It can also be started by hand from the Actions tab (the exe is then only an artifact).
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows-exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Build the native module
+        run: |
+          python -m venv .venv
+          .venv\Scripts\python -m pip install maturin pyinstaller pystray Pillow
+          .venv\Scripts\maturin develop --release
+
+      - name: Build the exe
+        run: .venv\Scripts\python packaging\build.py
+
+      - name: Checksum
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash dist\MourseDecoder.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  MourseDecoder.exe" | Out-File dist\MourseDecoder.exe.sha256 -Encoding ascii
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MourseDecoder-windows
+          path: |
+            dist/MourseDecoder.exe
+            dist/MourseDecoder.exe.sha256
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/MourseDecoder.exe
+            dist/MourseDecoder.exe.sha256
+          generate_release_notes: true

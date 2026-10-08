@@ -1,0 +1,12 @@
+{
+  "id": "german",
+  "name": "Deutsch (Latein + Ä Ö Ü ß)",
+  "description": "Erweitert das lateinische Alphabet um die im deutschen Funkverkehr üblichen Umlaute. Dient zugleich als Beispiel für \"extends\" über zwei Ebenen.",
+  "extends": "latin",
+  "codes": {
+    ".-.-": "Ä",
+    "---.": "Ö",
+    "..--": "Ü",
+    "...--..": "ß"
+  }
+}

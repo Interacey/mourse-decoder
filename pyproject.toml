@@ -1,0 +1,69 @@
+# Python packaging as a maturin mixed project:
+#   python/mourse_decoder/                        plain Python plus the JSON files
+#   python/mourse_decoder/_morse_core.*.pyd      built by maturin
+# The Python part stays editable without recompiling and the native module is a
+# private submodule.
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "mourse-decoder"
+version = "0.1.0"
+description = "Systemweiter Morsecode-Decoder mit Rust-Core (PyO3) und mehrsprachigen Alphabeten"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Operating System :: Microsoft :: Windows",
+]
+# Runtime dependencies are kept small (goal: under 10 MB RAM): pystray and Pillow for
+# the tray icon, tkinter from the standard library instead of PySide6.
+dependencies = [
+    "pystray>=0.19",
+    "Pillow>=10.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "maturin>=1.7"]
+build = ["pyinstaller>=6.0"]
+
+# the main launcher has no console window; the -cli one is for --headless and --dry-run
+[project.gui-scripts]
+mourse-decoder = "mourse_decoder.app:main"
+
+[project.scripts]
+mourse-decoder-cli = "mourse_decoder.app:main"
+mourse-decoder-build-telecodes = "mourse_decoder.telecode:main"
+
+[tool.maturin]
+python-source = "python"
+module-name = "mourse_decoder._morse_core"
+# `python` turns on the PyO3 bindings, `extension-module` avoids linking libpython
+# (required for portable wheels on Linux/macOS).
+features = ["python", "pyo3/extension-module"]
+# ship the JSON files in sdist and wheel (the SQLite database is built locally)
+include = [
+    { path = "python/mourse_decoder/alphabets/*.json", format = ["sdist", "wheel"] },
+    { path = "python/mourse_decoder/smiley_sets/*.json", format = ["sdist", "wheel"] },
+    { path = "python/mourse_decoder/locales/*.json", format = ["sdist", "wheel"] },
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+# E/W style, F real errors, B bugbear traps, UP modern syntax, I import sorting
+select = ["E", "F", "W", "B", "UP", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+# widget constructors with many options read better on one line
+"python/mourse_decoder/ui/*" = ["E501"]
+"tests/python/*" = ["E501"]

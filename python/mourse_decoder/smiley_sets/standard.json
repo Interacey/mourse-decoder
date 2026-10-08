@@ -1,0 +1,17 @@
+{
+  "id": "standard",
+  "name": "Standard",
+  "description": "Häufige Smileys mit 8-stelligen Codes, die in keinem Alphabet vorkommen. Bei Überschneidungen gewinnt immer das Alphabet.",
+  "codes": {
+    "--..--..": "🙂",
+    "--..-.-.": "😀",
+    "--...-..": "😂",
+    "-.-..--.": "😉",
+    "-.-.-..-": "😢",
+    "-..--.-.": "😎",
+    "..-.--.-": "👍",
+    "..-..--.": "❤",
+    ".-.--..-": "🎉",
+    "---.-.-.": "😮"
+  }
+}

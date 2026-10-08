@@ -1,0 +1,29 @@
+# build output
+/target/
+/dist/
+/build/
+*.spec.bak
+*.egg-info/
+*.pdb
+
+# compiled extension and local data
+*.pyd
+*.so
+*.sqlite
+packaging/icon.ico
+
+# python environments and caches
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# editor, tool and OS files
+.vscode/
+.idea/
+.claude/
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
