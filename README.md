@@ -103,16 +103,8 @@ Cargo features: `native-io` (hooks and injection, enabled by default) and `pytho
 
 The original goal of under 10 MB of RAM cannot be reached with a Python front end, because the interpreter alone uses nearly that much. The Rust engine is the smallest part of the total.
 
-## Known limitations
+## Description
+Mourse Decoder is a system-wide Morse code decoder for Windows and Linux. A key or mouse button serves as the Morse key, and the decoded characters are typed directly into the active application. It supports Latin, German, Greek, Cyrillic, Japanese (Wabun) and Chinese telegraph code. A Rust core handles the global hooks, timing and text injection, and a Python front end handles alphabets, settings and the tray UI.
 
-- **Keys are passed through.** `rdev::listen` only observes, so the key press also reaches the active application. For this reason Scroll Lock is the default. The space bar works but also types real spaces. A remedy would be `rdev::grab` (an unstable feature) or a custom `WH_KEYBOARD_LL` hook that discards the event.
-- **Japanese kanji telecodes** are not included, because Unihan does not provide them.
-- **Wayland** (Linux) does not allow global hooks by this method. It works under X11 and Windows.
-- The tray was not tested automatically, since that requires a real desktop. Its logic resides in tested modules (`form.py`, `controller.py`, `icon.py`).
+P.S. The key and the timing (dot/dash threshold, letter pause, word pause) are configurable, so you can also use Mourse Decoder as a personal input shortcut. Define your own Morse rhythm and type with it in any application.
 
-## Portfolio highlights
-
-- **Cross-language FFI** with PyO3, including correct GIL handling across threads (with a regression test against deadlock).
-- **Event-driven instead of polling:** the worker sleeps exactly until the next deadline.
-- **Testable by design:** a pure state machine in Rust and dependency injection in Python, with 211 automated tests.
-- **Extensible:** a new language is one JSON file, and stateful writing systems are supported through the `Emission` concept.
