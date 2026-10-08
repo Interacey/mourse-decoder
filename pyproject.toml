@@ -10,7 +10,7 @@ build-backend = "maturin"
 [project]
 name = "mourse-decoder"
 version = "0.1.0"
-description = "Systemweiter Morsecode-Decoder mit Rust-Core (PyO3) und mehrsprachigen Alphabeten"
+description = "System-wide Morse code decoder with a Rust core (PyO3) and multilingual alphabets"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }

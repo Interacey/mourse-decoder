@@ -10,7 +10,7 @@ name = "morse_core"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.83"            # minimum version PyO3 0.29 requires
-description = "Timing-präzise Morse-Engine mit globalen Input-Hooks und PyO3-Bridge"
+description = "Timing-accurate Morse engine with global input hooks and a PyO3 bridge"
 license = "MIT"
 publish = false
 
