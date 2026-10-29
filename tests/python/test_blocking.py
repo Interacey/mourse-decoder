@@ -6,10 +6,12 @@ import pytest
 from mourse_decoder.controller import MorseController
 from mourse_decoder.dictionary import DictionaryManager
 from mourse_decoder.settings import Settings, is_valid_shortcut
-from mourse_decoder.triggers import MODIFIER_TOKENS, build_shortcut, shortcut_label
+from mourse_decoder.triggers import binding_label
 
 
-@pytest.mark.parametrize("spec", ["", "Pause", "Ctrl+Shift+Pause", "ctrl + alt + VK77", "Win+F9", "Ctrl+Mouse5"])
+@pytest.mark.parametrize(
+    "spec", ["", "Pause", "Ctrl+Shift+Pause", "ctrl + alt + VK77", "Win+F9", "Ctrl+Mouse5", "CapsLock+VK81"]
+)
 def test_valid_shortcuts(spec):
     assert is_valid_shortcut(spec)
 
@@ -27,17 +29,12 @@ def test_settings_defaults_and_validation():
     assert Settings(block_shortcut="Ctrl+").validate()
 
 
-def test_shortcut_building_and_labels():
-    assert build_shortcut({"Shift", "Ctrl"}, "Pause") == "Ctrl+Shift+Pause"
-    assert build_shortcut(set(), "F9") == "F9"
-    assert shortcut_label("Ctrl+Shift+Pause") == "Ctrl + Shift + Pause"
-    assert shortcut_label("Alt+VK77") == "Alt + M"
-    assert shortcut_label("") == ""
-
-
-def test_modifier_tokens_cover_both_sides():
-    for token in ("VK160", "VK161", "VK162", "VK163", "VK164", "AltGr", "ControlRight", "VK91"):
-        assert token in MODIFIER_TOKENS
+def test_binding_labels():
+    assert binding_label("Ctrl+Shift+Pause") == "Ctrl + Shift + Pause"
+    assert binding_label("Alt+VK77") == "Alt + M"
+    assert binding_label("CapsLock+VK81") == "Caps Lock + Q"
+    assert binding_label("ScrollLock") == "Scroll Lock"
+    assert binding_label("") == ""
 
 
 def make(fake_engine, injector, **settings):

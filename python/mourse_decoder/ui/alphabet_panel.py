@@ -20,6 +20,7 @@ from ..alphabet_files import (
     new_alphabet_text,
     parse_alphabet_text,
     read_alphabet_text,
+    replaced_letters,
     save_alphabet_text,
     slugify,
 )
@@ -219,6 +220,11 @@ class AlphabetPanel(tk.Frame):
 
     def _save(self) -> None:
         text = self._text.get("1.0", "end")
+        replaced = replaced_letters(text)
+        if replaced and not messagebox.askyesno(
+            tr("alpha.dlg.letters.title"), tr("alpha.dlg.letters", codes=", ".join(replaced)), parent=self
+        ):
+            return
         replacing = self._selected.id if self._selected else None
         active = self._controller.settings
         try:

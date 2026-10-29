@@ -19,7 +19,7 @@ from ..controller import MorseController
 from ..dictionary import DictionaryManager
 from ..i18n import set_language, tr
 from ..settings import Settings, SettingsStore
-from ..triggers import trigger_label
+from ..triggers import binding_label
 from . import theme
 from .icon import create_icon
 from .main_window import MainWindow
@@ -115,7 +115,7 @@ class TrayApp:
     def _tooltip(self) -> str:
         s = self._controller.settings
         state = tr("tray.state.active") if s.enabled else tr("tray.state.paused")
-        return tr("tray.tooltip", state=state, alphabet=s.alphabet, key=trigger_label(s.trigger))
+        return tr("tray.tooltip", state=state, alphabet=s.alphabet, key=binding_label(s.trigger))
 
     def _set_title(self, title: str) -> None:
         # Windows caps tray tooltips at 127 characters

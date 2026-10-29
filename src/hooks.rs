@@ -16,7 +16,7 @@
 //! too slow.
 
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Mutex;
 use std::thread;
@@ -26,7 +26,8 @@ use rdev::{Button, EventType, Key};
 
 use crate::engine::WorkerMessage;
 use crate::lock_or_recover;
-use crate::trigger::TriggerKey;
+use crate::timing::Symbol;
+use crate::trigger::{modifier_names, KeyBinding, ModifierMask, MorseKeys, TriggerKey, CAPS_LOCK};
 
 /// Edge of a trigger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,10 +36,97 @@ pub enum Edge {
     Release,
 }
 
+/// One routed key per Morse key; with a separate dash key each gets its fixed symbol.
+fn routed(keys: MorseKeys) -> Vec<RoutedKey> {
+    match keys.dash_key {
+        None => vec![RoutedKey::new(keys.key, None)],
+        Some(dash_key) => vec![
+            RoutedKey::new(keys.key, Some(Symbol::Dot)),
+            RoutedKey::new(dash_key, Some(Symbol::Dash)),
+        ],
+    }
+}
+
+/// A Morse key together with the state of its current press.
+struct RoutedKey {
+    binding: KeyBinding,
+    /// Fixed symbol of a separate dot or dash key, `None` = decided by press duration.
+    symbol: Option<Symbol>,
+    /// The press was accepted (modifiers were held), so its release counts too.
+    down: bool,
+    /// The press was swallowed, so its release is swallowed too (no stuck key).
+    swallowed: bool,
+}
+
+impl RoutedKey {
+    fn new(binding: KeyBinding, symbol: Option<Symbol>) -> Self {
+        Self {
+            binding,
+            symbol,
+            down: false,
+            swallowed: false,
+        }
+    }
+
+    /// Message for the worker, or `None` if the edge doesn't count (a modifier is
+    /// missing, or a release without an accepted press).
+    fn message(&mut self, edge: Edge, held: ModifierMask, at: Instant) -> Option<WorkerMessage> {
+        match edge {
+            Edge::Press => {
+                // key repeat of an accepted press counts even if a modifier was let go meanwhile
+                if !self.down && !self.binding.modifiers_held(held) {
+                    return None;
+                }
+                self.down = true;
+                Some(WorkerMessage::Press(at))
+            }
+            Edge::Release => {
+                if !std::mem::take(&mut self.down) {
+                    return None;
+                }
+                Some(match self.symbol {
+                    Some(symbol) => WorkerMessage::ReleaseAs(at, symbol),
+                    None => WorkerMessage::Release(at),
+                })
+            }
+        }
+    }
+
+    /// Decides whether an accepted edge is hidden from other apps.
+    ///
+    /// A swallowed press also swallows its release, so no app is left with a key stuck
+    /// down. The left mouse button is never swallowed, otherwise the app couldn't be
+    /// operated at all.
+    fn swallow(&mut self, edge: Edge) -> bool {
+        if self.binding.key == TriggerKey::MouseLeft {
+            return false;
+        }
+        match edge {
+            Edge::Press => {
+                self.swallowed = blocking_now();
+                self.swallowed
+            }
+            Edge::Release => std::mem::take(&mut self.swallowed),
+        }
+    }
+}
+
 /// Where trigger events go.
 struct Route {
-    trigger: TriggerKey,
+    keys: Vec<RoutedKey>,
     tx: Sender<WorkerMessage>,
+}
+
+impl Route {
+    /// Caps Lock used as a modifier of a Morse key would flip the caps state with every
+    /// symbol, so while blocking is on it is swallowed like the Morse keys themselves.
+    fn swallows_caps_lock(&self, event: &EventType) -> bool {
+        matches!(
+            event,
+            EventType::KeyPress(Key::CapsLock) | EventType::KeyRelease(Key::CapsLock)
+        ) && blocking_now()
+            && self.keys.iter().any(|k| k.binding.requires_caps_lock())
+    }
 }
 
 static ROUTE: Mutex<Option<Route>> = Mutex::new(None);
@@ -51,20 +139,15 @@ static SUPPRESS_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
 static BLOCK: AtomicBool = AtomicBool::new(false);
 /// Morse input is on. The shortcut toggles this; while it is off nothing is swallowed.
 static ACTIVE: AtomicBool = AtomicBool::new(true);
-/// The trigger press was swallowed, so its release is swallowed too (no stuck key).
-static PRESS_BLOCKED: AtomicBool = AtomicBool::new(false);
 /// The shortcut key is held, so key repeat doesn't toggle blocking again and again.
 static SHORTCUT_DOWN: AtomicBool = AtomicBool::new(false);
 /// Modifier keys currently held, one bit per physical key (see `modifier_bit`).
-static MODIFIERS: AtomicU8 = AtomicU8::new(0);
-static SHORTCUT: Mutex<Option<Shortcut>> = Mutex::new(None);
+static MODIFIERS: AtomicU16 = AtomicU16::new(0);
+/// The on/off shortcut, e.g. `Ctrl+Shift+Pause`.
+static SHORTCUT: Mutex<Option<KeyBinding>> = Mutex::new(None);
 
-const CTRL: u8 = 0b0000_0011;
-const ALT: u8 = 0b0000_1100;
-const SHIFT: u8 = 0b0011_0000;
-const META: u8 = 0b1100_0000;
-
-fn modifier_bit(key: Key) -> Option<u8> {
+/// Bit of a modifier key in `MODIFIERS`, matching the group masks in `trigger`.
+fn modifier_bit(key: Key) -> Option<ModifierMask> {
     match key {
         Key::ControlLeft => Some(1),
         Key::ControlRight => Some(2),
@@ -74,51 +157,14 @@ fn modifier_bit(key: Key) -> Option<u8> {
         Key::ShiftRight => Some(32),
         Key::MetaLeft => Some(64),
         Key::Unknown(92) => Some(128), // right Windows key
+        Key::CapsLock => Some(CAPS_LOCK),
         _ => None,
     }
 }
 
-/// A key combination that turns Morse input on or off, e.g. `Ctrl+Shift+Pause`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Shortcut {
-    ctrl: bool,
-    alt: bool,
-    shift: bool,
-    meta: bool,
-    key: TriggerKey,
-}
-
-impl Shortcut {
-    /// True if every required modifier is held (extra modifiers don't matter).
-    fn modifiers_held(&self, held: u8) -> bool {
-        (!self.ctrl || held & CTRL != 0)
-            && (!self.alt || held & ALT != 0)
-            && (!self.shift || held & SHIFT != 0)
-            && (!self.meta || held & META != 0)
-    }
-}
-
-/// Parses `Ctrl+Alt+Shift+Win+<trigger>`; the last part is any trigger name.
-pub fn parse_shortcut(text: &str) -> Result<Shortcut, String> {
-    let parts: Vec<&str> = text.split('+').map(str::trim).collect();
-    let (key_part, modifiers) = parts.split_last().ok_or("empty shortcut")?;
-    let mut shortcut = Shortcut {
-        ctrl: false,
-        alt: false,
-        shift: false,
-        meta: false,
-        key: key_part.parse::<TriggerKey>().map_err(|e| e.to_string())?,
-    };
-    for modifier in modifiers {
-        match modifier.to_ascii_lowercase().as_str() {
-            "ctrl" | "control" | "strg" => shortcut.ctrl = true,
-            "alt" => shortcut.alt = true,
-            "shift" => shortcut.shift = true,
-            "win" | "meta" | "super" => shortcut.meta = true,
-            other => return Err(format!("Unknown modifier '{other}'")),
-        }
-    }
-    Ok(shortcut)
+/// Blocking is switched on and Morse input is active.
+fn blocking_now() -> bool {
+    BLOCK.load(Ordering::SeqCst) && ACTIVE.load(Ordering::SeqCst)
 }
 
 /// Map an rdev event to the chosen trigger. A pure function, so it's testable without a hook.
@@ -211,15 +257,47 @@ vk_table! {
     Kp8 => 104, Kp9 => 105, KpDelete => 110,
 }
 
-// capture: grab the next key or mouse button globally
+// capture: grab the next key, mouse button or combination globally
 struct Capture {
     active: bool,
     result: Option<String>,
+    /// Modifier pressed while waiting. If it is released before any other key, the
+    /// modifier itself is the result (e.g. Right Ctrl as the Morse key).
+    lone_modifier: Option<Key>,
+}
+
+impl Capture {
+    /// Feeds one event while waiting. A key or button pressed while modifiers are held
+    /// gives a combination such as `CapsLock+VK81`.
+    fn feed(&mut self, event: &EventType, held: ModifierMask) {
+        let token = match *event {
+            EventType::KeyPress(key) if modifier_bit(key).is_some() => {
+                self.lone_modifier = Some(key);
+                return;
+            }
+            EventType::KeyRelease(key) if self.lone_modifier == Some(key) => key_token(key),
+            EventType::KeyPress(key) => with_modifiers(held, &key_token(key)),
+            EventType::ButtonPress(button) => with_modifiers(held, &button_token(button)),
+            _ => return,
+        };
+        self.active = false;
+        self.lone_modifier = None;
+        self.result = Some(token);
+    }
+}
+
+fn with_modifiers(held: ModifierMask, token: &str) -> String {
+    modifier_names(held)
+        .into_iter()
+        .chain([token])
+        .collect::<Vec<_>>()
+        .join("+")
 }
 
 static CAPTURE: Mutex<Capture> = Mutex::new(Capture {
     active: false,
     result: None,
+    lone_modifier: None,
 });
 
 /// Trigger name of a key: a known name (e.g. `Space`), otherwise `VK<code>`.
@@ -248,21 +326,14 @@ pub fn button_token(button: Button) -> String {
     }
 }
 
-fn capture_token(event: &EventType) -> Option<String> {
-    match *event {
-        EventType::KeyPress(key) => Some(key_token(key)),
-        EventType::ButtonPress(button) => Some(button_token(button)),
-        _ => None,
-    }
-}
-
-/// The next key press or click anywhere on the system is captured (and not counted as
-/// Morse input). Read the result with [`take_capture`].
+/// The next key press, click or combination anywhere on the system is captured (and not
+/// counted as Morse input). Read the result with [`take_capture`].
 pub fn begin_capture() -> io::Result<()> {
     ensure_hook_thread()?;
     let mut capture = lock_or_recover(&CAPTURE);
     capture.active = true;
     capture.result = None;
+    capture.lone_modifier = None;
     Ok(())
 }
 
@@ -270,6 +341,7 @@ pub fn cancel_capture() {
     let mut capture = lock_or_recover(&CAPTURE);
     capture.active = false;
     capture.result = None;
+    capture.lone_modifier = None;
 }
 
 /// Returns the captured trigger name once, as soon as there is one.
@@ -305,12 +377,13 @@ fn handle_event(event: rdev::Event) -> Option<rdev::Event> {
         _ => {}
     }
 
-    // waiting for input: the next press belongs to the key binding, not to morsing
-    if let Some(token) = capture_token(&event.event_type) {
+    let held = MODIFIERS.load(Ordering::SeqCst);
+
+    // waiting for input: everything belongs to the key binding, nothing to morsing
+    {
         let mut capture = lock_or_recover(&CAPTURE);
         if capture.active {
-            capture.active = false;
-            capture.result = Some(token);
+            capture.feed(&event.event_type, held);
             return Some(event);
         }
     }
@@ -321,9 +394,7 @@ fn handle_event(event: rdev::Event) -> Option<rdev::Event> {
     if let Some(shortcut) = *lock_or_recover(&SHORTCUT) {
         match route_event(shortcut.key, &event.event_type) {
             Some(Edge::Press) => {
-                if shortcut.modifiers_held(MODIFIERS.load(Ordering::SeqCst))
-                    && !SHORTCUT_DOWN.swap(true, Ordering::SeqCst)
-                {
+                if shortcut.modifiers_held(held) && !SHORTCUT_DOWN.swap(true, Ordering::SeqCst) {
                     ACTIVE.fetch_xor(true, Ordering::SeqCst);
                 }
             }
@@ -336,43 +407,26 @@ fn handle_event(event: rdev::Event) -> Option<rdev::Event> {
         return Some(event);
     }
 
-    let route = lock_or_recover(&ROUTE);
-    let Some(route) = route.as_ref() else {
+    let mut guard = lock_or_recover(&ROUTE);
+    let Some(route) = guard.as_mut() else {
         return Some(event);
     };
-    let Some(edge) = route_event(route.trigger, &event.event_type) else {
-        return Some(event);
-    };
-    let message = match edge {
-        Edge::Press => WorkerMessage::Press(now),
-        Edge::Release => WorkerMessage::Release(now),
-    };
-    // an error means the worker ended, and clear_route removes the route soon
-    let _ = route.tx.send(message);
-    if should_swallow(route.trigger, edge) {
-        None
-    } else {
-        Some(event)
+    if route.swallows_caps_lock(&event.event_type) {
+        return None;
     }
-}
-
-/// Decides whether a trigger event is hidden from other apps.
-///
-/// A swallowed press also swallows its release, so no app is left with a key stuck
-/// down. The left mouse button is never swallowed, otherwise the app couldn't be
-/// operated at all.
-fn should_swallow(trigger: TriggerKey, edge: Edge) -> bool {
-    if trigger == TriggerKey::MouseLeft {
-        return false;
+    let Route { keys, tx } = route;
+    for key in keys.iter_mut() {
+        let Some(edge) = route_event(key.binding.key, &event.event_type) else {
+            continue;
+        };
+        let Some(message) = key.message(edge, held, now) else {
+            continue;
+        };
+        // an error means the worker ended, and clear_route removes the route soon
+        let _ = tx.send(message);
+        return if key.swallow(edge) { None } else { Some(event) };
     }
-    match edge {
-        Edge::Press => {
-            let block = BLOCK.load(Ordering::SeqCst) && ACTIVE.load(Ordering::SeqCst);
-            PRESS_BLOCKED.store(block, Ordering::SeqCst);
-            block
-        }
-        Edge::Release => PRESS_BLOCKED.swap(false, Ordering::SeqCst),
-    }
+    Some(event)
 }
 
 /// Turns blocking of the trigger''s normal function on or off.
@@ -400,7 +454,7 @@ pub fn set_shortcut(text: &str) -> Result<(), String> {
     *lock_or_recover(&SHORTCUT) = if text.trim().is_empty() {
         None
     } else {
-        Some(parse_shortcut(text)?)
+        Some(text.parse::<KeyBinding>()?)
     };
     Ok(())
 }
@@ -444,9 +498,12 @@ fn ensure_hook_thread() -> io::Result<()> {
 }
 
 /// Connects the global hook to a worker.
-pub fn install_route(trigger: TriggerKey, tx: Sender<WorkerMessage>) -> io::Result<()> {
+pub fn install_route(keys: MorseKeys, tx: Sender<WorkerMessage>) -> io::Result<()> {
     ensure_hook_thread()?;
-    *lock_or_recover(&ROUTE) = Some(Route { trigger, tx });
+    *lock_or_recover(&ROUTE) = Some(Route {
+        keys: routed(keys),
+        tx,
+    });
     Ok(())
 }
 
@@ -455,10 +512,10 @@ pub fn clear_route() {
     *lock_or_recover(&ROUTE) = None;
 }
 
-/// Changes the trigger without rebuilding the route.
-pub fn set_trigger(trigger: TriggerKey) {
+/// Changes the Morse keys without rebuilding the route.
+pub fn set_keys(keys: MorseKeys) {
     if let Some(route) = lock_or_recover(&ROUTE).as_mut() {
-        route.trigger = trigger;
+        route.keys = routed(keys);
     }
 }
 
@@ -646,46 +703,153 @@ mod tests {
         }
     }
 
+    /// Routes `key` (and an optional separate dash key) to a fresh channel.
+    fn route_keys(key: &str, dash_key: Option<&str>) -> std::sync::mpsc::Receiver<WorkerMessage> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let keys = MorseKeys {
+            key: key.parse().unwrap(),
+            dash_key: dash_key.map(|k| k.parse().unwrap()),
+        };
+        *lock_or_recover(&ROUTE) = Some(Route {
+            keys: routed(keys),
+            tx,
+        });
+        rx
+    }
+
     #[test]
     fn capture_takes_next_press_once_and_does_not_route() {
         let _serial = lock_or_recover(&GLOBAL_STATE);
-        let (tx, rx) = std::sync::mpsc::channel();
-        *lock_or_recover(&ROUTE) = Some(Route {
-            trigger: TriggerKey::F12,
-            tx,
-        });
-        *lock_or_recover(&SUPPRESS_UNTIL) = None;
-        {
-            let mut capture = lock_or_recover(&CAPTURE);
-            capture.active = true;
-            capture.result = None;
-        }
-        let event = |event_type| rdev::Event {
-            time: std::time::SystemTime::now(),
-            name: None,
-            event_type,
-        };
-        handle_event(event(EventType::KeyRelease(Key::F12))); // releasing doesn't count
+        reset_block_state();
+        let rx = route_keys("F12", None);
+        begin_test_capture();
+        handle_event(release(Key::F12)); // releasing doesn't count
         assert_eq!(take_capture(), None);
-        handle_event(event(EventType::KeyPress(Key::F12)));
+        handle_event(press(Key::F12));
         assert_eq!(take_capture().as_deref(), Some("F12"));
         assert_eq!(take_capture(), None);
-        // after that the trigger works normally again; only the release (before the
-        // capture) and the last press were routed, the captured press wasn't
-        handle_event(event(EventType::KeyPress(Key::F12)));
+        // after that the trigger works normally again; the captured press wasn't routed
+        handle_event(press(Key::F12));
+        clear_route();
+        let presses = rx
+            .try_iter()
+            .filter(|m| matches!(m, WorkerMessage::Press(_)))
+            .count();
+        assert_eq!(presses, 1);
+        reset_block_state();
+    }
+
+    #[test]
+    fn capture_reports_combinations_and_lone_modifiers() {
+        let _serial = lock_or_recover(&GLOBAL_STATE);
+        reset_block_state();
+        begin_test_capture();
+        handle_event(press(Key::CapsLock));
+        handle_event(press(Key::KeyQ));
+        assert_eq!(take_capture().as_deref(), Some("CapsLock+VK81"));
+        handle_event(release(Key::KeyQ));
+        handle_event(release(Key::CapsLock));
+
+        begin_test_capture();
+        handle_event(press(Key::ControlLeft));
+        handle_event(press(Key::ShiftLeft));
+        handle_event(press(Key::Pause));
+        assert_eq!(take_capture().as_deref(), Some("Ctrl+Shift+Pause"));
+        handle_event(release(Key::ShiftLeft));
+        handle_event(release(Key::ControlLeft));
+
+        // a modifier pressed and released on its own is the key itself
+        begin_test_capture();
+        handle_event(press(Key::ControlRight));
+        assert_eq!(take_capture(), None, "might still become Ctrl+something");
+        handle_event(release(Key::ControlRight));
+        assert_eq!(take_capture().as_deref(), Some("ControlRight"));
+        reset_block_state();
+    }
+
+    fn begin_test_capture() {
+        let mut capture = lock_or_recover(&CAPTURE);
+        capture.active = true;
+        capture.result = None;
+        capture.lone_modifier = None;
+    }
+
+    #[test]
+    fn combination_key_counts_only_with_its_modifier() {
+        let _serial = lock_or_recover(&GLOBAL_STATE);
+        reset_block_state();
+        let rx = route_keys("CapsLock+VK81", None);
+        handle_event(press(Key::KeyQ)); // plain Q: normal typing, not Morse
+        handle_event(release(Key::KeyQ));
+        handle_event(press(Key::CapsLock));
+        handle_event(press(Key::KeyQ));
+        handle_event(release(Key::CapsLock)); // let go of Caps Lock first ...
+        handle_event(press(Key::KeyQ)); // ... key repeat still belongs to the accepted press
+        handle_event(release(Key::KeyQ)); // ... and the release still ends it
         clear_route();
         let kinds: Vec<_> = rx
             .try_iter()
-            .map(|m| matches!(m, WorkerMessage::Press(_)))
+            .map(|m| match m {
+                WorkerMessage::Press(_) => "press",
+                WorkerMessage::Release(_) => "release",
+                _ => "other",
+            })
             .collect();
-        assert_eq!(kinds, vec![false, true]);
+        assert_eq!(kinds, vec!["press", "press", "release"]);
+        reset_block_state();
+    }
+
+    #[test]
+    fn separate_keys_send_fixed_symbols() {
+        let _serial = lock_or_recover(&GLOBAL_STATE);
+        reset_block_state();
+        let rx = route_keys("F11", Some("F12"));
+        for key in [Key::F11, Key::F12] {
+            handle_event(press(key));
+            handle_event(release(key));
+        }
+        clear_route();
+        let symbols: Vec<_> = rx
+            .try_iter()
+            .filter_map(|m| match m {
+                WorkerMessage::ReleaseAs(_, symbol) => Some(symbol),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(symbols, vec![Symbol::Dot, Symbol::Dash]);
+        reset_block_state();
+    }
+
+    #[test]
+    fn caps_lock_is_swallowed_only_when_blocking_a_caps_combination() {
+        let _serial = lock_or_recover(&GLOBAL_STATE);
+        reset_block_state();
+        route_keys("CapsLock+VK81", None);
+        assert!(
+            handle_event(press(Key::CapsLock)).is_some(),
+            "not blocking yet"
+        );
+        handle_event(release(Key::CapsLock));
+        set_blocking(true);
+        assert!(
+            handle_event(press(Key::CapsLock)).is_none(),
+            "would flip caps on every symbol"
+        );
+        assert!(handle_event(release(Key::CapsLock)).is_none());
+        route_keys("F12", None);
+        assert!(
+            handle_event(press(Key::CapsLock)).is_some(),
+            "no caps combination in use"
+        );
+        handle_event(release(Key::CapsLock));
+        clear_route();
+        reset_block_state();
     }
 
     /// Puts the global hook state into a known state for the blocking tests.
     fn reset_block_state() {
         BLOCK.store(false, Ordering::SeqCst);
         ACTIVE.store(true, Ordering::SeqCst);
-        PRESS_BLOCKED.store(false, Ordering::SeqCst);
         SHORTCUT_DOWN.store(false, Ordering::SeqCst);
         MODIFIERS.store(0, Ordering::SeqCst);
         *lock_or_recover(&SHORTCUT) = None;
@@ -693,6 +857,7 @@ mod tests {
         *lock_or_recover(&CAPTURE) = Capture {
             active: false,
             result: None,
+            lone_modifier: None,
         };
     }
 
@@ -709,21 +874,6 @@ mod tests {
             event_type: EventType::KeyRelease(key),
             ..press(key)
         }
-    }
-
-    #[test]
-    fn shortcut_parsing() {
-        let sc = parse_shortcut("Ctrl+Shift+Pause").unwrap();
-        assert!(sc.ctrl && sc.shift && !sc.alt && !sc.meta);
-        assert_eq!(sc.key, TriggerKey::Pause);
-        assert_eq!(
-            parse_shortcut("alt + VK77").unwrap().key,
-            TriggerKey::Vk(77)
-        );
-        assert_eq!(parse_shortcut("F9").unwrap().key, TriggerKey::F9);
-        assert!(parse_shortcut("Hyper+F9").is_err());
-        assert!(parse_shortcut("Ctrl+").is_err());
-        assert!(parse_shortcut("").is_err());
     }
 
     #[test]
@@ -775,11 +925,7 @@ mod tests {
     fn blocking_stops_while_morse_input_is_off() {
         let _serial = lock_or_recover(&GLOBAL_STATE);
         reset_block_state();
-        let (tx, _rx) = std::sync::mpsc::channel();
-        *lock_or_recover(&ROUTE) = Some(Route {
-            trigger: TriggerKey::Space,
-            tx,
-        });
+        let _rx = route_keys("Space", None);
         set_blocking(true);
         assert!(handle_event(press(Key::Space)).is_none());
         handle_event(release(Key::Space));
@@ -798,11 +944,7 @@ mod tests {
     fn blocking_swallows_trigger_press_and_its_release_only() {
         let _serial = lock_or_recover(&GLOBAL_STATE);
         reset_block_state();
-        let (tx, rx) = std::sync::mpsc::channel();
-        *lock_or_recover(&ROUTE) = Some(Route {
-            trigger: TriggerKey::Space,
-            tx,
-        });
+        let rx = route_keys("Space", None);
         assert!(
             handle_event(press(Key::Space)).is_some(),
             "not blocking yet"
@@ -837,11 +979,7 @@ mod tests {
     fn left_mouse_button_is_never_swallowed() {
         let _serial = lock_or_recover(&GLOBAL_STATE);
         reset_block_state();
-        let (tx, _rx) = std::sync::mpsc::channel();
-        *lock_or_recover(&ROUTE) = Some(Route {
-            trigger: TriggerKey::MouseLeft,
-            tx,
-        });
+        let _rx = route_keys("MouseLeft", None);
         set_blocking(true);
         let click = rdev::Event {
             event_type: EventType::ButtonPress(Button::Left),
@@ -876,22 +1014,10 @@ mod tests {
         // call the callback directly with a synthetic event, without a real hook
         // thread (ensure_hook_thread isn't used here)
         let _serial = lock_or_recover(&GLOBAL_STATE);
-        let (tx, rx) = std::sync::mpsc::channel();
-        *lock_or_recover(&ROUTE) = Some(Route {
-            trigger: TriggerKey::F12,
-            tx,
-        });
-        *lock_or_recover(&SUPPRESS_UNTIL) = None;
-        handle_event(rdev::Event {
-            time: std::time::SystemTime::now(),
-            name: None,
-            event_type: EventType::KeyPress(Key::F12),
-        });
-        handle_event(rdev::Event {
-            time: std::time::SystemTime::now(),
-            name: None,
-            event_type: EventType::KeyPress(Key::KeyQ),
-        });
+        reset_block_state();
+        let rx = route_keys("F12", None);
+        handle_event(press(Key::F12));
+        handle_event(press(Key::KeyQ));
         clear_route();
         let received: Vec<_> = rx.try_iter().collect();
         assert_eq!(received.len(), 1);

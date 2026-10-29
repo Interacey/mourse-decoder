@@ -6,7 +6,7 @@ import tkinter as tk
 
 from ..controller import MorseController
 from ..i18n import tr
-from ..triggers import trigger_label
+from ..triggers import binding_label
 from . import theme
 from .theme import Button, Card, boxed, label, text_box
 
@@ -51,10 +51,13 @@ class LivePanel(tk.Frame):
     def refresh(self) -> None:
         s = self._controller.settings
         state = tr("live.state.active") if s.enabled else tr("live.state.paused")
-        self._hint.set(
-            tr("live.hint", key=trigger_label(s.trigger), alphabet=s.alphabet, state=state,
-               dot=s.dot_threshold_ms, gap=s.letter_gap_ms)
-        )
+        if s.separate_dash_key:
+            hint = tr("live.hint.two_keys", key=binding_label(s.trigger), dash_key=binding_label(s.dash_trigger),
+                      alphabet=s.alphabet, state=state, gap=s.letter_gap_ms)
+        else:
+            hint = tr("live.hint", key=binding_label(s.trigger), alphabet=s.alphabet, state=state,
+                      dot=s.dot_threshold_ms, gap=s.letter_gap_ms)
+        self._hint.set(hint)
 
     # called on the UI thread via TrayApp.call_in_ui
     def add_symbol(self, symbol: str) -> None:

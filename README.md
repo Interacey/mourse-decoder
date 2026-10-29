@@ -44,7 +44,38 @@ python -m mourse_decoder --headless --dry-run   # console mode, types nothing
 
 The default key is **Scroll Lock**. A short press is a dot, a long press (≥ 200 ms) is a dash, a pause of 600 ms ends a letter, and a pause of 1400 ms inserts a space. All values can be changed in the tray menu under "Settings …".
 
+The Morse key can also be a combination such as Caps Lock + Q: click the key button, hold Caps Lock (or Ctrl, Alt, Shift, Win) and press the key. Q on its own keeps typing normally. While "Block normal input" is on, Caps Lock no longer switches capitals when it is part of a Morse combination.
+
+With "Separate dash key" switched on, the duration no longer matters: the Morse key always gives a dot and a second key always a dash. The pause after the last key still completes the letter. Both keys can be combinations.
+
 On Linux, the packages `libx11-dev libxtst-dev libxi-dev` are also required.
+
+### Long texts and shortcuts (smiley sets)
+
+A code in a smiley set can output any text, however long, and press key combinations written in braces, as many in a row as you like:
+
+```json
+{"id": "macros", "name": "Macros", "codes": {
+  "--..--..": "Kind regards\nJane Doe",
+  "--..-.-.": "{Ctrl+A}{Ctrl+C}",
+  "--...-..": "Hello{Enter}{Ctrl+S}",
+  "--..--.-": "{Win+R}{WaitWindow Run}notepad{Enter}{WaitWindow Untitled}Hello"
+}}
+```
+
+`{WaitWindow Untitled}` waits until the title of the window in front contains "Untitled" (case is ignored). If no such window shows up within 10 seconds, the rest of the macro is dropped instead of typed into the wrong window. `{Wait 500}` simply pauses for 500 ms.
+
+`{Loop 3}…{EndLoop}` repeats everything in between (text, keys, waits) three times. Loops can be nested. At most 1000 repetitions per loop and one million characters in total are allowed. A loop without its `{EndLoop}` stops the macro before anything is typed.
+
+Modifiers: `Ctrl`/`Strg`, `Alt`, `Shift`/`Umschalt`, `Win`/`Windows`. Keys: one character, `F1`–`F12`, `Enter`/`Eingabe`, `Tab`, `Esc`, `Backspace`/`Rücktaste`, `Delete`/`Entf`, `Space`/`Leertaste`, `Home`/`Pos1`, `End`/`Ende`, `PageUp`/`BildAuf`, `PageDown`/`BildAb`, `Up`/`Hoch`, `Down`/`Runter`, `Left`/`Links`, `Right`/`Rechts`. The commands have German names too: `{Warte 500}`, `{WarteFenster …}`, `{Schleife 3}…{SchleifenEnde}`.
+
+Protection against mistakes:
+- The whole macro is checked first. A typo such as `{Crtl+C}` stops it with a message, and nothing is typed. Braces without letters or digits, such as `{^_^}`, are typed as text.
+- The on/off shortcut stops a running macro at once, even in the middle of a wait or a loop.
+- Morse input made while a macro runs is dropped, so it does not come out as stray letters afterwards.
+- When you save an alphabet in which an ordinary letter (e.g. `.-` = A) outputs a whole text, the app asks first.
+
+On Windows, texts of 200 characters or more are pasted through the clipboard, because typing them makes apps drop characters. Everything that was on the clipboard (text, formatted text, images, files) is restored afterwards.
 
 ### Chinese telecodes (optional)
 

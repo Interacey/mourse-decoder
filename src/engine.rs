@@ -22,7 +22,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
-use crate::timing::{MorseTimer, TimerOutput, TimingConfig};
+use crate::timing::{MorseTimer, Symbol, TimerOutput, TimingConfig};
 
 /// Messages to the worker.
 #[derive(Debug, Clone)]
@@ -30,7 +30,10 @@ pub enum WorkerMessage {
     /// Key pressed. The timestamp is taken when the event is *captured* (in the hook),
     /// not when it is processed, so channel latency doesn't distort the measurement.
     Press(Instant),
+    /// Release whose symbol follows from the press duration (one Morse key).
     Release(Instant),
+    /// Release of a key that always means the same symbol (separate dot and dash keys).
+    ReleaseAs(Instant, Symbol),
     Configure(TimingConfig),
     Reset,
     Shutdown,
@@ -89,6 +92,11 @@ where
             }
             Some(WorkerMessage::Release(at)) => {
                 if let Some(symbol) = timer.on_release(at) {
+                    sink(TimerOutput::Symbol(symbol));
+                }
+            }
+            Some(WorkerMessage::ReleaseAs(at, fixed)) => {
+                if let Some(symbol) = timer.on_release_as(at, fixed) {
                     sink(TimerOutput::Symbol(symbol));
                 }
             }
@@ -157,7 +165,6 @@ impl Drop for EngineHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::timing::Symbol;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -185,6 +192,30 @@ mod tests {
                                                                  // because the sender is dropped
         drop(tx);
 
+        let mut outputs = Vec::new();
+        run_worker(rx, fast_config(), |o| outputs.push(o));
+        assert_eq!(
+            outputs,
+            vec![
+                TimerOutput::Symbol(Symbol::Dot),
+                TimerOutput::Symbol(Symbol::Dash),
+                TimerOutput::Letter(".-".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn separate_keys_give_fixed_symbols() {
+        // a long press on the dot key stays a dot, a short one on the dash key a dash
+        let (tx, rx) = mpsc::channel();
+        let past = Instant::now() - ms(10_000);
+        tx.send(WorkerMessage::Press(past)).unwrap();
+        tx.send(WorkerMessage::ReleaseAs(past + ms(500), Symbol::Dot))
+            .unwrap();
+        tx.send(WorkerMessage::Press(past + ms(510))).unwrap();
+        tx.send(WorkerMessage::ReleaseAs(past + ms(515), Symbol::Dash))
+            .unwrap();
+        drop(tx);
         let mut outputs = Vec::new();
         run_worker(rx, fast_config(), |o| outputs.push(o));
         assert_eq!(

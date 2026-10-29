@@ -10,21 +10,23 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections import deque
 from collections.abc import Callable
 from typing import Protocol
 
+from . import clipboard, desktop, macros
 from .decoders import Decoder, Emission, create_decoder
 from .dictionary import DictionaryManager
 from .settings import Settings
 
 log = logging.getLogger(__name__)
 
-
 class EngineLike(Protocol):
     """The part of ``_morse_core.MorseEngine`` the controller uses."""
 
     trigger: str
+    dash_trigger: str  # "" = one key, the press duration decides
     block_input: bool
     active: bool
     block_shortcut: str
@@ -38,6 +40,10 @@ class EngineLike(Protocol):
 class InjectorLike(Protocol):
     def inject_text(self, text: str) -> None: ...
     def inject_backspaces(self, count: int) -> None: ...
+    def press_shortcut(self, combo: str) -> None: ...
+    def check_shortcut(self, combo: str) -> None:
+        """ValueError if ``combo`` is no key combination such as "Ctrl+C"; presses nothing."""
+    def foreground_title(self) -> str: ...
 
 
 class ControllerListener(Protocol):
@@ -49,20 +55,56 @@ class ControllerListener(Protocol):
 
 
 class NativeInjector:
-    """Adapter for the Rust ``inject_text`` / ``inject_backspaces`` functions."""
+    """Adapter for the Rust ``inject_text`` / ``inject_backspaces`` / ``press_shortcut`` functions."""
 
-    def __init__(self, native_module) -> None:
+    # typing thousands of characters overflows the target app's input queue (measured:
+    # 3000 of 20000 arrived, scrambled), so long texts are pasted via the clipboard
+    PASTE_FROM = 200
+    # the app reads the clipboard only after Ctrl+V arrives, restoring earlier pastes the old content
+    PASTE_SETTLE_S = 0.3
+
+    def __init__(self, native_module, clipboard_module=clipboard) -> None:
         self._native = native_module
+        self._clipboard = clipboard_module
 
     def inject_text(self, text: str) -> None:
+        # shortcut: Windows only, other systems type long texts and may drop characters
+        if len(text) >= self.PASTE_FROM and self._clipboard.available():
+            try:
+                saved = self._clipboard.save()
+            except OSError:
+                saved = None  # clipboard busy: type instead, never paste over content we couldn't save
+            if saved is not None:
+                self._paste(text, saved)
+                return
         self._native.inject_text(text)
+
+    def _paste(self, text: str, saved: list) -> None:
+        # Windows apps expect CRLF in the clipboard, a bare LF shows up as nothing in some
+        self._clipboard.set_text(text.replace("\r\n", "\n").replace("\n", "\r\n"))
+        try:
+            self._native.press_shortcut("Ctrl+V")
+            time.sleep(self.PASTE_SETTLE_S)
+        finally:
+            self._clipboard.restore(saved)
 
     def inject_backspaces(self, count: int) -> None:
         self._native.inject_backspaces(count)
 
+    def press_shortcut(self, combo: str) -> None:
+        self._native.press_shortcut(combo)
+
+    def check_shortcut(self, combo: str) -> None:
+        self._native.check_shortcut(combo)
+
+    def foreground_title(self) -> str:
+        return desktop.foreground_title()
+
 
 class MorseController:
     HISTORY_LIMIT = 500
+    WINDOW_TIMEOUT_S = 10.0  # for {WaitWindow …}; slow apps like a cold Firefox start need a few seconds
+    POLL_S = 0.05  # how often waits look at the window title and the on/off switch
 
     def __init__(
         self,
@@ -109,7 +151,7 @@ class MorseController:
                 return
             s = self._settings
             self._engine.configure(s.dot_threshold_ms, s.letter_gap_ms, s.word_gap_ms)
-            self._engine.trigger = s.trigger
+            self._apply_keys(s)
             self._apply_blocking(s)
             self._engine.start(self._on_engine_event, use_hook=self._use_hook)
             self._running = True
@@ -147,10 +189,15 @@ class MorseController:
             )
             if timing_changed:
                 self._engine.configure(new.dot_threshold_ms, new.letter_gap_ms, new.word_gap_ms)
-            if new.trigger != old.trigger:
-                self._engine.trigger = new.trigger
+            # only on a real change: rebuilding the keys would forget a press in progress
+            if (new.trigger, new.engine_dash_trigger) != (old.trigger, old.engine_dash_trigger):
+                self._apply_keys(new)
             self._apply_blocking(new)
             self._settings = new
+
+    def _apply_keys(self, s: Settings) -> None:
+        self._engine.trigger = s.trigger
+        self._engine.dash_trigger = s.engine_dash_trigger
 
     def _apply_blocking(self, s: Settings) -> None:
         self._engine.block_shortcut = s.block_shortcut
@@ -216,13 +263,50 @@ class MorseController:
 
     def _emit(self, emission: Emission) -> None:
         # typing takes a few ms, so do it outside the lock to not block apply_settings
+        steps = macros.parse(emission.text, self._injector.check_shortcut)  # first, so a broken macro changes nothing
         if emission.erase:
             self._injector.inject_backspaces(emission.erase)
             for _ in range(min(emission.erase, len(self.history))):
                 self.history.pop()
-        if emission.text:
-            self._injector.inject_text(emission.text)
-            self.history.extend(emission.text)
+        try:
+            for kind, value in steps:
+                self._stop_if_switched_off()
+                if kind == "text":
+                    self._injector.inject_text(value)
+                    self.history.extend(value)
+                elif kind == "keys":
+                    self._injector.press_shortcut(value)
+                elif kind == "wait":
+                    self._sleep(value)
+                else:
+                    self._wait_for_window(value)
+        finally:
+            if len(emission.text) > 1:
+                # clicks made while the macro ran are queued in the engine; drop them so
+                # they don't come out as stray letters afterwards
+                self._engine.reset()
+
+    def _stop_if_switched_off(self) -> None:
+        # the on/off shortcut flips engine.active right away, also while a macro runs
+        if not self._engine.active:
+            raise macros.MacroError("Makro gestoppt, weil die Morse-Eingabe ausgeschaltet wurde.")
+
+    def _sleep(self, seconds: float) -> None:
+        """time.sleep in small steps, so switching Morse input off stops a long wait."""
+        end = time.monotonic() + seconds
+        while (left := end - time.monotonic()) > 0:
+            time.sleep(min(left, self.POLL_S))
+            self._stop_if_switched_off()
+
+    def _wait_for_window(self, title_part: str) -> None:
+        deadline = time.monotonic() + self.WINDOW_TIMEOUT_S
+        while title_part.casefold() not in self._injector.foreground_title().casefold():
+            if time.monotonic() > deadline:
+                raise macros.MacroError(
+                    f"Kein Fenster mit '{title_part}' im Titel erschienen – Rest des Makros nicht ausgeführt."
+                )
+            time.sleep(self.POLL_S)
+            self._stop_if_switched_off()
 
     def _notify(self, method: str, *args: object) -> None:
         if self._listener is None:

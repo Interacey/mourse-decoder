@@ -73,6 +73,17 @@ class SettingsPanel(tk.Frame):
         self._key_button.pack()
         self._key_hint = label(body, "", size=9, muted=True)
 
+        self._separate_dash = tk.BooleanVar()
+        self._separate_dash.trace_add("write", lambda *_: self._changed())
+        Switch(card.add_row(tr("settings.dash"), tr("settings.dash.hint")), self._separate_dash).pack()
+
+        dash_row = card.add_row(tr("settings.dash_key"), tr("settings.dash_key.hint"))
+        self._dash_button = KeyCaptureButton(
+            dash_row, controller.settings.dash_trigger, on_change=lambda _name: self._changed(),
+            on_hint=self._show_key_hint, backend=capture_backend,
+        )
+        self._dash_button.pack()
+
         self._block = tk.BooleanVar()
         self._block.trace_add("write", lambda *_: self._changed())
         Switch(card.add_row(tr("settings.block"), tr("settings.block.hint")), self._block).pack()
@@ -153,6 +164,9 @@ class SettingsPanel(tk.Frame):
             for key, var in self._vars.items():
                 var.set(str(getattr(current, key)))
             self._key_button.set_trigger(current.trigger)
+            self._separate_dash.set(current.separate_dash_key)
+            self._dash_button.set_trigger(current.dash_trigger)
+            self._dash_button.set_enabled(current.separate_dash_key)
             self._block.set(current.block_input)
             self._notify.set(current.notifications)
             self._shortcut_button.set_shortcut(current.block_shortcut)
@@ -198,7 +212,10 @@ class SettingsPanel(tk.Frame):
         if errors or settings is None:
             self._error.configure(text="\n".join(errors))
             return
+        self._dash_button.set_enabled(self._separate_dash.get())
         settings = settings.replace(
+            separate_dash_key=self._separate_dash.get(),
+            dash_trigger=self._dash_button.trigger,
             enabled=self._enabled.get(),
             block_input=self._block.get(),
             notifications=self._notify.get(),
@@ -215,8 +232,8 @@ class SettingsPanel(tk.Frame):
             self._apply(settings)
             self._error.configure(text="")
         except Exception as exc:  # noqa: BLE001 - e.g. a broken alphabet file
-            self._error.configure(text=f"{tr('err.apply')}: {exc}")
             self._busy = False
-            self.refresh()  # reset the form to what is actually active
+            self.refresh()  # reset the form to what is actually active; this clears the error label
+            self._error.configure(text=f"{tr('err.apply')}: {exc}")
         finally:
             self._busy = False

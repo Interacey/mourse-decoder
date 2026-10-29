@@ -19,6 +19,7 @@ class FakeEngine:
 
     def __init__(self) -> None:
         self.trigger = "ScrollLock"
+        self.dash_trigger = ""
         self.block_input = False
         self.active = True
         self.block_shortcut = ""
@@ -63,6 +64,7 @@ class RecordingInjector:
         self.calls: list[tuple[str, object]] = []
         self.buffer = ""
         self.fail = False
+        self.titles = [""]
 
     def inject_text(self, text: str) -> None:
         if self.fail:
@@ -73,6 +75,21 @@ class RecordingInjector:
     def inject_backspaces(self, count: int) -> None:
         self.calls.append(("backspace", count))
         self.buffer = self.buffer[: max(0, len(self.buffer) - count)]
+
+    def check_shortcut(self, combo: str) -> None:
+        # rough stand-in for the Rust parser: known modifiers, then one key
+        *modifiers, key = (part.strip().lower() for part in combo.split("+"))
+        known_key = (len(key) == 1 and key.isalnum()) or key in {"enter", "end", "esc", "tab", "delete", "f5"}
+        if any(m not in {"ctrl", "strg", "alt", "shift", "win"} for m in modifiers) or not known_key:
+            raise ValueError(f"keine Tastenkombination: {combo!r}")
+
+    def press_shortcut(self, combo: str) -> None:
+        self.check_shortcut(combo)
+        self.calls.append(("keys", combo))
+
+    def foreground_title(self) -> str:
+        # tests set ``titles`` to the window titles seen one after another
+        return self.titles.pop(0) if len(self.titles) > 1 else self.titles[0]
 
 
 class RecordingListener:

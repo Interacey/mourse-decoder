@@ -223,6 +223,62 @@ def test_native_controller_round_trip():
     assert injector.buffer == "Ο"
 
 
+def test_combinations_and_dash_key_on_the_real_engine():
+    eng = core.MorseEngine(trigger="caps + vk81")
+    assert eng.trigger == "CapsLock+VK81"  # normalized
+    assert eng.dash_trigger == ""
+    eng.dash_trigger = "Strg+Umschalt+F9"
+    assert eng.dash_trigger == "Ctrl+Shift+F9"
+    eng.dash_trigger = ""
+    assert eng.dash_trigger == ""
+    for bad in ("CapsLock+", "Hyper+Q"):
+        with pytest.raises(ValueError):
+            eng.dash_trigger = bad
+        with pytest.raises(ValueError):
+            eng.trigger = bad
+
+
+def test_fixed_symbols_ignore_press_duration(engine):
+    events = EventCollector()
+    engine.start(events, use_hook=False)
+    engine.feed_press()
+    time.sleep(0.3)  # long press on the dot key ...
+    engine.feed_release(".")  # ... stays a dot
+    time.sleep(0.03)
+    engine.feed_press()
+    engine.feed_release("-")  # short press on the dash key is a dash
+    assert events.wait_for("letter") == [".-"]
+    with pytest.raises(ValueError):
+        engine.feed_release("x")
+
+
+def test_reset_from_inside_a_macro_keeps_the_engine_working(tmp_path):
+    # a macro calls engine.reset() on the worker thread, inside the callback
+    import json
+
+    from conftest import RecordingInjector
+    from mourse_decoder.controller import MorseController
+    from mourse_decoder.dictionary import DictionaryManager
+    from mourse_decoder.settings import Settings
+
+    (tmp_path / "m.json").write_text(json.dumps({"id": "m", "codes": {".": "xy", "-": "z"}}), encoding="utf-8")
+    eng = core.MorseEngine()
+    injector = RecordingInjector()
+    settings = Settings(dot_threshold_ms=150, letter_gap_ms=250, word_gap_ms=0, alphabet="m")
+    controller = MorseController(eng, injector, DictionaryManager(user_directory=tmp_path), settings, use_hook=False)
+    controller.start()
+    try:
+        key(eng, 0.02)  # "." = macro "xy"
+        time.sleep(0.5)
+        key(eng, 0.30)  # "-" = "z", must still arrive after the reset
+        deadline = time.monotonic() + 3
+        while injector.buffer != "xyz" and time.monotonic() < deadline:
+            time.sleep(0.01)
+    finally:
+        controller.stop()
+    assert injector.buffer == "xyz"
+
+
 def test_any_key_and_extra_mouse_buttons_are_accepted_as_trigger():
     eng = core.MorseEngine(trigger="Mouse5")
     assert eng.trigger == "Mouse5"
@@ -239,6 +295,17 @@ def test_capture_api_is_idle_without_input():
     assert core.poll_capture() is None
     core.cancel_capture()
     assert core.poll_capture() is None
+
+def test_press_shortcut_rejects_unknown_combos():
+    # valid combos would really press keys, so only the parser errors are tested here
+    for bad in ("Hyper+C", "Ctrl+", "Foo", ""):
+        with pytest.raises(ValueError):
+            core.press_shortcut(bad)
+        with pytest.raises(ValueError):
+            core.check_shortcut(bad)
+    for good in ("Ctrl+C", "Win+R", "Umschalt+Eingabe", "F5"):
+        core.check_shortcut(good)  # only checks, presses nothing
+
 
 def test_blocking_api_on_the_real_module():
     eng = core.MorseEngine()

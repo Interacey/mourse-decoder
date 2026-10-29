@@ -8,6 +8,7 @@ import os
 import sys
 import time
 
+from . import desktop
 from ._native import load_native
 from .controller import MorseController, NativeInjector
 from .dictionary import DictionaryManager
@@ -37,6 +38,15 @@ class _PrintInjector:
 
     def inject_backspaces(self, count: int) -> None:
         print(f"[lösche {count}]", flush=True)
+
+    def press_shortcut(self, combo: str) -> None:
+        print(f"[drücke {combo}]", flush=True)
+
+    def check_shortcut(self, combo: str) -> None:
+        pass  # shortcut: dry run accepts every combo, the real run checks it in Rust
+
+    def foreground_title(self) -> str:
+        return desktop.foreground_title()
 
 
 def _prepare_windows() -> None:
