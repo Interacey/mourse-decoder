@@ -7,7 +7,7 @@
 #   python:    PyO3 bindings (turned on by maturin)
 [package]
 name = "morse_core"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.83"            # minimum version PyO3 0.29 requires
 description = "Timing-accurate Morse engine with global input hooks and a PyO3 bridge"

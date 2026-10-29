@@ -27,7 +27,7 @@ The program has a hybrid architecture: **Rust** handles everything time-critical
 
 To build the executable yourself (after the quick start below), run `pip install pyinstaller` and `python packaging/build.py`. The result is placed in `dist/`.
 
-To publish a new release, push a tag (`git tag v0.1.0 && git push origin v0.1.0`). The `release.yml` workflow then builds the EXE and attaches it to the release.
+To publish a new release, raise the version in `pyproject.toml`, `Cargo.toml` and `python/mourse_decoder/__init__.py` (a test checks they match), add an entry to `CHANGELOG.md`, and push a tag of the form `v` + version, e.g. `git tag v0.1.1 && git push origin v0.1.1`. The `release.yml` workflow then builds the EXE and attaches it to the release. It refuses tags that don't match the version.
 
 ## Quick start (Windows)
 

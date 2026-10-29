@@ -9,7 +9,7 @@ build-backend = "maturin"
 
 [project]
 name = "mourse-decoder"
-version = "0.1.0"
+version = "0.1.1"
 description = "System-wide Morse code decoder with a Rust core (PyO3) and multilingual alphabets"
 readme = "README.md"
 requires-python = ">=3.10"
