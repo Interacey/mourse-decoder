@@ -80,7 +80,8 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 def _read_json(path: Path) -> dict[str, Any]:
     try:
         with path.open(encoding="utf-8") as fh:
-            data = json.load(fh, object_pairs_hook=_reject_duplicate_keys)
+            # strict=False: hand-edited files may hold raw line breaks inside strings
+            data = json.load(fh, object_pairs_hook=_reject_duplicate_keys, strict=False)
     except AlphabetError as exc:
         raise AlphabetError(f"{path.name}: {exc}") from None
     except (OSError, json.JSONDecodeError) as exc:

@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import jsontext
+
 BUILTIN_SMILEY_DIR = Path(__file__).with_name("smiley_sets")
 
 _CODE_PATTERN = re.compile(r"^[.-]{1,32}$")
@@ -50,7 +52,7 @@ def _no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 def parse_smiley_text(text: str) -> dict[str, Any]:
     try:
-        data = json.loads(text, object_pairs_hook=_no_duplicates)
+        data = jsontext.loads(text, _no_duplicates)
     except json.JSONDecodeError as exc:
         raise SmileyError(f"Kein gültiges JSON: {exc}") from exc
     if not isinstance(data, dict):

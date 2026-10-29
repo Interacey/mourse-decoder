@@ -49,24 +49,14 @@ def trigger_label(name: str) -> str:
     return name if label == key else label
 
 
-# Tokens the hook reports for modifier keys (AltGr counts as Alt)
-MODIFIER_TOKENS: dict[str, str] = {
-    "ControlRight": "Ctrl", "VK162": "Ctrl", "VK163": "Ctrl",
-    "VK160": "Shift", "VK161": "Shift",
-    "VK164": "Alt", "VK165": "Alt", "AltGr": "Alt",
-    "VK91": "Win", "VK92": "Win",
-}
-MODIFIER_ORDER = ("Ctrl", "Alt", "Shift", "Win")
+# Display names of the modifiers the Rust hook reports ("CapsLock+VK81")
+_MODIFIER_LABELS = {"ctrl": "Ctrl", "alt": "Alt", "shift": "Shift", "win": "Win", "capslock": "Caps Lock"}
 
 
-def build_shortcut(modifiers: set[str], key: str) -> str:
-    """e.g. ({"Shift", "Ctrl"}, "Pause") -> "Ctrl+Shift+Pause" (fixed modifier order)."""
-    return "+".join([m for m in MODIFIER_ORDER if m in modifiers] + [key])
-
-
-def shortcut_label(spec: str) -> str:
-    """Readable form of a shortcut such as "Ctrl+Shift+Pause", with a translated key name."""
+def binding_label(spec: str) -> str:
+    """Readable form of a key or combination, e.g. "CapsLock+VK81" -> "Caps Lock + Q"; "" stays ""."""
     if not spec.strip():
         return ""
     *modifiers, key = (part.strip() for part in spec.split("+"))
-    return " + ".join([m.capitalize() if m.lower() != "win" else "Win" for m in modifiers] + [trigger_label(key)])
+    names = [_MODIFIER_LABELS.get(m.lower(), m) for m in modifiers]
+    return " + ".join([*names, trigger_label(key)])

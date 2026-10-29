@@ -1,8 +1,9 @@
 """Key button: shows the current Morse key and changes it on click.
 
-Like key binding in games: click the button (say "Space"), then press ANY key or
-mouse button (say "Mouse 5"). The input is read by the global Rust hook, not by
-Tk, which is why every key and extra mouse buttons like Mouse 4/5 work. Esc cancels.
+Like key binding in games: click the button (say "Space"), then press ANY key, mouse
+button or combination (say "Mouse 5" or Caps Lock + Q). The input is read by the global
+Rust hook, not by Tk, which is why every key and extra mouse buttons like Mouse 4/5 work.
+The hook also turns held modifiers into combinations. Esc cancels.
 """
 
 from __future__ import annotations
@@ -13,15 +14,8 @@ from collections.abc import Callable
 from typing import Protocol
 
 from ..i18n import tr
-from ..settings import is_valid_trigger
-from ..triggers import (
-    CANCEL_TOKEN,
-    MODIFIER_ORDER,
-    MODIFIER_TOKENS,
-    build_shortcut,
-    shortcut_label,
-    trigger_label,
-)
+from ..settings import is_valid_binding
+from ..triggers import CANCEL_TOKEN, binding_label
 from .theme import Button
 
 POLL_MS = 30
@@ -52,7 +46,7 @@ class KeyCaptureButton(Button):
         backend: CaptureBackend | None = None,
         min_width: int = 190,
     ) -> None:
-        super().__init__(master, trigger_label(trigger), self._toggle, variant="secondary", min_width=min_width)
+        super().__init__(master, binding_label(trigger), self._toggle, variant="secondary", min_width=min_width)
         self._trigger = trigger
         self._on_change = on_change or (lambda _name: None)
         self._on_hint = on_hint or (lambda _text: None)
@@ -107,7 +101,7 @@ class KeyCaptureButton(Button):
             self._handle_token(token)
 
     def _handle_token(self, token: str) -> None:
-        if is_valid_trigger(token):
+        if is_valid_binding(token):
             self._trigger = token
             self._stop()
             self._on_change(token)
@@ -122,7 +116,7 @@ class KeyCaptureButton(Button):
         self._poll_job = self.after(POLL_MS, self._poll)
 
     def _display(self) -> str:
-        return trigger_label(self._trigger)
+        return binding_label(self._trigger)
 
     def _stop(self) -> None:
         was_waiting = self._waiting
@@ -141,47 +135,20 @@ class KeyCaptureButton(Button):
         self.set_text(self._display())
         self._on_hint("")
 
-class ShortcutCaptureButton(KeyCaptureButton):
-    """Like the key button, but records a combination: hold modifiers, then press the last key.
 
-    The value is a string such as "Ctrl+Shift+Pause" (see ``settings.is_valid_shortcut``).
-    """
+class ShortcutCaptureButton(KeyCaptureButton):
+    """Key button for the on/off shortcut, which may also be empty (shown as "-")."""
 
     def __init__(self, master: tk.Misc, shortcut: str, **kwargs) -> None:
-        super().__init__(master, "Pause", **kwargs)
-        self._shortcut = shortcut
-        self._modifiers: set[str] = set()
+        super().__init__(master, shortcut, **kwargs)
         self.set_text(self._display())
 
     @property
     def shortcut(self) -> str:
-        return self._shortcut
+        return self.trigger
 
     def set_shortcut(self, shortcut: str) -> None:
-        self._shortcut = shortcut
-        self._modifiers = set()
-        self._stop()
+        self.set_trigger(shortcut)
 
     def _display(self) -> str:
-        if self._waiting and self._modifiers:
-            return " + ".join([m for m in MODIFIER_ORDER if m in self._modifiers] + ["..."])
-        return shortcut_label(self._shortcut) or "-"
-
-    def _handle_token(self, token: str) -> None:
-        if token in MODIFIER_TOKENS:
-            self._modifiers.add(MODIFIER_TOKENS[token])
-            self.set_text(self._display())
-            self._keep_waiting()
-        elif is_valid_trigger(token):
-            self._shortcut = build_shortcut(self._modifiers, token)
-            self._modifiers = set()
-            self._stop()
-            self._on_change(self._shortcut)
-        else:
-            self._on_hint(tr("key.unsupported", key=token))
-            self._keep_waiting()
-
-    def _stop(self) -> None:
-        if not self._waiting:
-            self._modifiers = set()
-        super()._stop()
+        return super()._display() or "-"

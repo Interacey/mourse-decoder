@@ -12,6 +12,7 @@ import os
 import re
 from pathlib import Path
 
+from . import jsontext
 from .dictionary import (
     _ID_PATTERN,
     AlphabetError,
@@ -44,12 +45,33 @@ def slugify(name: str) -> str:
 
 def parse_alphabet_text(text: str) -> dict:
     try:
-        data = json.loads(text, object_pairs_hook=_reject_duplicate_keys)
+        data = jsontext.loads(text, _reject_duplicate_keys)
     except json.JSONDecodeError as exc:
-        raise AlphabetError(f"Kein gültiges JSON: {exc}") from exc
+        hint = ' Tipp: Ein " mitten im Text muss als \\" geschrieben werden.' if "delimiter" in exc.msg else ""
+        raise AlphabetError(f"Kein gültiges JSON: {exc}.{hint}") from exc
     if not isinstance(data, dict):
         raise AlphabetError("Das Wurzelelement muss ein JSON-Objekt { … } sein.")
     return data
+
+
+def replaced_letters(text: str) -> list[str]:
+    """Codes of ordinary Latin letters, digits or punctuation that now output a whole text.
+
+    Nearly always a mistake: every A or E would then type the text. Returns entries like
+    ".- (A)"; broken JSON gives [] because saving reports that anyway.
+    """
+    try:
+        codes = parse_alphabet_text(text).get("codes")
+    except AlphabetError:
+        return []
+    if not isinstance(codes, dict):
+        return []
+    standard = load_alphabet("latin").codes
+    return [
+        f"{code} ({standard[code]})"
+        for code, value in codes.items()
+        if code in standard and isinstance(value, str) and len(value) > 1
+    ]
 
 
 def read_alphabet_text(info: AlphabetInfo) -> str:

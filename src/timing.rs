@@ -233,11 +233,21 @@ impl MorseTimer {
     ///
     /// A release without a press (the engine started while the key was held) is ignored.
     pub fn on_release(&mut self, at: Instant) -> Option<Symbol> {
-        let pressed_at = self.pressed_at.take()?;
+        let pressed_at = self.pressed_at?;
         // saturating: guards against timestamps from different sources running backwards,
         // which then gives 0 ms, a dot
         let duration = at.saturating_duration_since(pressed_at);
-        let symbol = classify(duration, self.config.dot_threshold);
+        self.on_release_as(at, classify(duration, self.config.dot_threshold))
+    }
+
+    /// The key was released and stands for a fixed symbol, whatever the press duration
+    /// (separate dot and dash keys). Ignored without a press, like [`Self::on_release`].
+    ///
+    /// Both keys share one press state: pressing the second key while the first is still
+    /// held counts as key repeat, so overlapping presses give a single symbol (that of the
+    /// key released first).
+    pub fn on_release_as(&mut self, at: Instant, symbol: Symbol) -> Option<Symbol> {
+        self.pressed_at.take()?;
         if self.buffer.len() < MAX_SEQUENCE_LEN {
             self.buffer.push(symbol.as_char());
         }
@@ -423,6 +433,32 @@ mod tests {
         timer.on_press(t0 + ms(60));
         // measured from the FIRST press, so 300 ms is a dash
         assert_eq!(timer.on_release(t0 + ms(300)), Some(Symbol::Dash));
+    }
+
+    #[test]
+    fn fixed_symbol_ignores_press_duration() {
+        let mut timer = MorseTimer::new(TimingConfig::default());
+        let t0 = Instant::now();
+        timer.on_press(t0);
+        assert_eq!(
+            timer.on_release_as(t0 + ms(900), Symbol::Dot),
+            Some(Symbol::Dot)
+        );
+        timer.on_press(t0 + ms(1000));
+        assert_eq!(
+            timer.on_release_as(t0 + ms(1010), Symbol::Dash),
+            Some(Symbol::Dash)
+        );
+        assert_eq!(timer.pending_sequence(), ".-");
+        assert_eq!(
+            timer.poll(t0 + ms(1610)),
+            vec![TimerOutput::Letter(".-".into())]
+        );
+        assert_eq!(
+            timer.on_release_as(t0 + ms(2000), Symbol::Dot),
+            None,
+            "no press, no symbol"
+        );
     }
 
     #[test]

@@ -48,17 +48,34 @@ def is_valid_trigger(name: object) -> bool:
     return False
 
 
-_MODIFIERS = {"ctrl", "control", "strg", "alt", "shift", "win", "meta", "super"}
+# Keep in sync with modifier_group in src/trigger.rs.
+_MODIFIERS = {
+    "ctrl", "control", "strg", "alt", "shift", "umschalt", "win", "windows", "meta", "super",
+    "capslock", "caps", "feststell",
+}
+
+
+def is_valid_binding(spec: object) -> bool:
+    """A trigger, optionally after modifiers joined with "+", e.g. "F8" or "CapsLock+VK81"."""
+    if not isinstance(spec, str) or not spec.strip():
+        return False
+    *modifiers, key = (part.strip() for part in spec.split("+"))
+    return is_valid_trigger(key) and all(m.lower() in _MODIFIERS for m in modifiers)
 
 
 def is_valid_shortcut(spec: object) -> bool:
-    """"" (no shortcut) or modifiers joined with "+" and a trigger, e.g. "Ctrl+Shift+Pause"."""
-    if not isinstance(spec, str):
-        return False
-    if not spec.strip():
-        return True
-    *modifiers, key = (part.strip() for part in spec.split("+"))
-    return is_valid_trigger(key) and all(m.lower() in _MODIFIERS for m in modifiers)
+    """"" (no shortcut) or a key binding such as "Ctrl+Shift+Pause"."""
+    return spec == "" or is_valid_binding(spec)
+
+
+def same_binding(first: str, second: str) -> bool:
+    """True if both specs name the same keys; case, blanks and modifier order don't matter."""
+
+    def normalized(spec: str) -> tuple[frozenset[str], str]:
+        *modifiers, key = (part.strip().lower() for part in spec.split("+"))
+        return frozenset(modifiers), key
+
+    return normalized(first) == normalized(second)
 
 
 # UI limits in ms: below 50 nobody can tell dot from dash on purpose, above 5 s it isn't morsing
@@ -72,7 +89,9 @@ class Settings:
     dot_threshold_ms: int = 200  # shorter press is a dot
     letter_gap_ms: int = 600     # silence that ends a letter
     word_gap_ms: int = 1400      # ITU ratio 7:3 -> 600 * 7/3, 0 = no spaces
-    trigger: str = "ScrollLock"
+    trigger: str = "ScrollLock"  # key or combination; with a separate dash key it gives the dots
+    separate_dash_key: bool = False  # off: press duration decides, on: dash_trigger gives dashes
+    dash_trigger: str = "Pause"
     alphabet: str = "latin"
     smileys: str = ""            # smiley set id, "" = none
     enabled: bool = True
@@ -101,8 +120,7 @@ class Settings:
         if not errors:
             if self.word_gap_ms and self.word_gap_ms <= self.letter_gap_ms:
                 errors.append("Die Wortpause muss länger als die Buchstabenpause sein (oder 0 = aus).")
-        if not is_valid_trigger(self.trigger):
-            errors.append(f"Unbekannter Taster '{self.trigger}'.")
+        errors.extend(self._key_errors())
         if not isinstance(self.alphabet, str) or not self.alphabet:
             errors.append("Es muss ein Alphabet gewählt sein.")
         if not isinstance(self.smileys, str):
@@ -122,6 +140,22 @@ class Settings:
         if not is_valid_shortcut(self.block_shortcut):
             errors.append(f"Ungültiges Tastenkürzel '{self.block_shortcut}'.")
         return errors
+
+    def _key_errors(self) -> list[str]:
+        if not is_valid_binding(self.trigger):
+            return [f"Unbekannter Taster '{self.trigger}'."]
+        if not isinstance(self.separate_dash_key, bool):
+            return ["'separate_dash_key' muss true oder false sein."]
+        if not is_valid_binding(self.dash_trigger):
+            return [f"Unbekannte Strich-Taste '{self.dash_trigger}'."]
+        if self.separate_dash_key and same_binding(self.trigger, self.dash_trigger):
+            return ["Punkt- und Strich-Taste müssen verschieden sein."]
+        return []
+
+    @property
+    def engine_dash_trigger(self) -> str:
+        """Dash key as the engine expects it: "" while the press duration decides."""
+        return self.dash_trigger if self.separate_dash_key else ""
 
     def replace(self, **changes: Any) -> Settings:
         return dataclasses.replace(self, **changes)

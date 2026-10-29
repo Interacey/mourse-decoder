@@ -23,7 +23,7 @@ use pyo3::prelude::*;
 use crate::engine::{EngineHandle, WorkerMessage};
 use crate::lock_or_recover;
 use crate::timing::{classify, Symbol, TimerOutput, TimingConfig};
-use crate::trigger::TriggerKey;
+use crate::trigger::{KeyBinding, MorseKeys, TriggerKey};
 
 /// Mutable state behind a mutex.
 ///
@@ -31,9 +31,19 @@ use crate::trigger::TriggerKey;
 /// several threads (tray, Tk main loop, ...), so methods take `&self` and lock inside.
 struct EngineState {
     config: TimingConfig,
-    trigger: TriggerKey,
+    keys: MorseKeys,
     handle: Option<EngineHandle>,
     hooked: bool,
+}
+
+impl EngineState {
+    /// Hands changed keys to a running hook.
+    fn apply_keys(&self) {
+        #[cfg(feature = "native-io")]
+        if self.hooked {
+            crate::hooks::set_keys(self.keys);
+        }
+    }
 }
 
 #[pyclass(name = "MorseEngine", module = "mourse_decoder._morse_core")]
@@ -46,9 +56,8 @@ fn config_from_ms(dot: u64, letter: u64, word: u64) -> PyResult<TimingConfig> {
     TimingConfig::from_millis(dot, letter, word).map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
-fn parse_trigger(name: &str) -> PyResult<TriggerKey> {
-    name.parse::<TriggerKey>()
-        .map_err(|e| PyValueError::new_err(e.to_string()))
+fn parse_binding(spec: &str) -> PyResult<KeyBinding> {
+    spec.parse::<KeyBinding>().map_err(PyValueError::new_err)
 }
 
 /// Translate a Rust output into the (kind, payload) pair for Python.
@@ -73,7 +82,10 @@ impl PyMorseEngine {
         Ok(Self {
             state: Mutex::new(EngineState {
                 config: config_from_ms(dot_threshold_ms, letter_gap_ms, word_gap_ms)?,
-                trigger: parse_trigger(trigger)?,
+                keys: MorseKeys {
+                    key: parse_binding(trigger)?,
+                    dash_key: None,
+                },
                 handle: None,
                 hooked: false,
             }),
@@ -111,7 +123,7 @@ impl PyMorseEngine {
 
         #[cfg(feature = "native-io")]
         if use_hook {
-            crate::hooks::install_route(state.trigger, handle.sender()).map_err(|e| {
+            crate::hooks::install_route(state.keys, handle.sender()).map_err(|e| {
                 PyRuntimeError::new_err(format!("Input-Hook konnte nicht starten: {e}"))
             })?;
         }
@@ -168,20 +180,41 @@ impl PyMorseEngine {
         }
     }
 
+    /// The Morse key, a key or combination such as "ScrollLock" or "CapsLock+VK81". With a
+    /// separate dash key it gives the dots.
     #[getter]
     fn trigger(&self) -> String {
-        lock_or_recover(&self.state).trigger.name().to_string()
+        lock_or_recover(&self.state).keys.key.to_string()
     }
 
     #[setter]
-    fn set_trigger(&self, name: &str) -> PyResult<()> {
-        let trigger = parse_trigger(name)?;
+    fn set_trigger(&self, spec: &str) -> PyResult<()> {
+        let key = parse_binding(spec)?;
         let mut state = lock_or_recover(&self.state);
-        state.trigger = trigger;
-        #[cfg(feature = "native-io")]
-        if state.hooked {
-            crate::hooks::set_trigger(trigger);
-        }
+        state.keys.key = key;
+        state.apply_keys();
+        Ok(())
+    }
+
+    /// Separate key for dashes; "" = none, then the press duration decides.
+    #[getter]
+    fn dash_trigger(&self) -> String {
+        lock_or_recover(&self.state)
+            .keys
+            .dash_key
+            .map_or_else(String::new, |k| k.to_string())
+    }
+
+    #[setter]
+    fn set_dash_trigger(&self, spec: &str) -> PyResult<()> {
+        let dash_key = if spec.trim().is_empty() {
+            None
+        } else {
+            Some(parse_binding(spec)?)
+        };
+        let mut state = lock_or_recover(&self.state);
+        state.keys.dash_key = dash_key;
+        state.apply_keys();
         Ok(())
     }
 
@@ -276,16 +309,29 @@ impl PyMorseEngine {
         self.feed(WorkerMessage::Press(Instant::now()))
     }
 
-    /// Manual release (no hook), timestamped now.
-    fn feed_release(&self) -> PyResult<()> {
-        self.feed(WorkerMessage::Release(Instant::now()))
+    /// Manual release (no hook), timestamped now. `symbol` "." or "-" acts like a separate
+    /// dot or dash key; without it the press duration decides.
+    #[pyo3(signature = (symbol = None))]
+    fn feed_release(&self, symbol: Option<&str>) -> PyResult<()> {
+        let now = Instant::now();
+        let message = match symbol {
+            None => WorkerMessage::Release(now),
+            Some(".") => WorkerMessage::ReleaseAs(now, Symbol::Dot),
+            Some("-") => WorkerMessage::ReleaseAs(now, Symbol::Dash),
+            Some(other) => {
+                return Err(PyValueError::new_err(format!(
+                    "symbol muss '.' oder '-' sein, nicht {other:?}"
+                )))
+            }
+        };
+        self.feed(message)
     }
 
     fn __repr__(&self) -> String {
         let state = lock_or_recover(&self.state);
         format!(
             "MorseEngine(trigger={}, dot_threshold_ms={}, letter_gap_ms={}, word_gap_ms={}, running={})",
-            state.trigger,
+            state.keys.key,
             state.config.dot_threshold.as_millis(),
             state.config.letter_gap.as_millis(),
             state.config.word_gap.map_or(0, |d| d.as_millis()),
@@ -397,6 +443,39 @@ fn inject_text(py: Python<'_>, text: String) -> PyResult<()> {
     }
 }
 
+/// Presses a key combination such as "Ctrl+C". ValueError if the combination is unknown.
+#[pyfunction]
+fn press_shortcut(py: Python<'_>, combo: String) -> PyResult<()> {
+    #[cfg(feature = "native-io")]
+    {
+        let (modifiers, key) =
+            crate::injector::parse_combo(&combo).map_err(PyValueError::new_err)?;
+        py.detach(move || crate::injector::press_keys(&modifiers, key))
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+    #[cfg(not(feature = "native-io"))]
+    {
+        let _ = (py, combo);
+        Err(PyRuntimeError::new_err("Ohne Feature 'native-io' gebaut"))
+    }
+}
+
+/// Checks a key combination without pressing it. ValueError if it is unknown.
+#[pyfunction]
+fn check_shortcut(combo: &str) -> PyResult<()> {
+    #[cfg(feature = "native-io")]
+    {
+        crate::injector::parse_combo(combo)
+            .map(|_| ())
+            .map_err(PyValueError::new_err)
+    }
+    #[cfg(not(feature = "native-io"))]
+    {
+        let _ = combo;
+        Err(PyRuntimeError::new_err("Ohne Feature 'native-io' gebaut"))
+    }
+}
+
 /// Deletes `count` characters left of the cursor.
 #[pyfunction]
 fn inject_backspaces(py: Python<'_>, count: u32) -> PyResult<()> {
@@ -425,6 +504,8 @@ fn morse_core_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(poll_capture, m)?)?;
     m.add_function(wrap_pyfunction!(inject_text, m)?)?;
     m.add_function(wrap_pyfunction!(inject_backspaces, m)?)?;
+    m.add_function(wrap_pyfunction!(press_shortcut, m)?)?;
+    m.add_function(wrap_pyfunction!(check_shortcut, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add("NATIVE_IO", cfg!(feature = "native-io"))?;
     Ok(())

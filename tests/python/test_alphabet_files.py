@@ -9,6 +9,7 @@ from mourse_decoder.alphabet_files import (
     delete_alphabet,
     import_alphabet_file,
     new_alphabet_text,
+    replaced_letters,
     save_alphabet_text,
 )
 from mourse_decoder.dictionary import AlphabetError, DictionaryManager
@@ -38,6 +39,38 @@ def test_invalid_json_is_rejected_and_nothing_written(manager):
     with pytest.raises(AlphabetError, match="JSON"):
         save_alphabet_text(manager, "{ kaputt")
     assert not list((manager.user_directory).glob("*.json"))
+
+
+def test_pasted_multi_line_text_is_accepted(manager):
+    # raw line breaks inside a string, as when a long text is pasted into the editor
+    text = '{"id": "mine", "codes": {"--..--..": "Zeile 1\n\nZeile 2\tTab"}}'
+    info = save_alphabet_text(manager, text)
+    json.loads(info.path.read_text(encoding="utf-8"))  # stored as strict, escaped JSON
+    assert manager.select("mine").lookup("--..--..") == "Zeile 1\n\nZeile 2\tTab"
+
+
+def test_letter_replaced_by_a_text_is_reported():
+    # the user's real mistake: the NIV text on ".-", so every A typed the whole text
+    text = json.dumps({"id": "x", "codes": {".-": "Ein langer Text", ".": "E", "--..--..": "Makro {Enter}"}})
+    assert replaced_letters(text) == [".- (A)"]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        json.dumps({"id": "x", "codes": {".-": "A", "-...": "Б"}}),  # single characters are fine
+        json.dumps({"id": "x", "codes": {"--..--..": "langer Text"}}),  # free code
+        "{ kaputt",  # saving reports broken JSON itself
+        json.dumps({"id": "x"}),
+    ],
+)
+def test_no_warning_without_replaced_letters(text):
+    assert replaced_letters(text) == []
+
+
+def test_quote_error_explains_the_fix(manager):
+    with pytest.raises(AlphabetError, match=r'als \\"'):
+        save_alphabet_text(manager, '{"id": "x", "codes": {"--..--..": "er sagte "hi", dann"}}')
 
 
 def test_duplicate_keys_rejected(manager):

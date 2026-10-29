@@ -94,6 +94,14 @@ def test_import_rejects_invalid(tmp_path, data):
     assert not list((tmp_path / "user").glob("*.json")) if (tmp_path / "user").exists() else True
 
 
+def test_import_accepts_raw_line_breaks_in_texts(tmp_path):
+    src = tmp_path / "brief.json"
+    src.write_text('{"codes": {"-.-.-.-.": "Hallo\nWelt"}}', encoding="utf-8")
+    info = import_smiley_file(src, BUILTIN_SMILEY_DIR, tmp_path / "user")
+    json.loads(info.path.read_text(encoding="utf-8"))  # stored as strict, escaped JSON
+    assert load_smiley_codes("brief", BUILTIN_SMILEY_DIR, tmp_path / "user") == {"-.-.-.-.": "Hallo\nWelt"}
+
+
 def test_delete_only_user_sets(tmp_path):
     write(tmp_path / "mine.json", {"id": "mine", "codes": {"-.-.-.-.": "X"}})
     delete_smiley_set("mine", tmp_path)
