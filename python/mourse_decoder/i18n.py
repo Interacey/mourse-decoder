@@ -10,6 +10,7 @@ a language, drop in another JSON file.
 from __future__ import annotations
 
 import json
+import string
 from pathlib import Path
 
 BUILTIN_LOCALE_DIR = Path(__file__).with_name("locales")
@@ -66,13 +67,29 @@ def current_language() -> str:
     return _current
 
 
+class _PlainFormatter(string.Formatter):
+    """Only plain names as placeholders.
+
+    ``str.format`` also follows ``{msg.__class__.__init__.__globals__}`` into any object. A language
+    file from the user's folder is not trusted, so such a placeholder must not read anything.
+    """
+
+    def get_field(self, field_name: str, args: tuple, kwargs: dict) -> tuple[object, str]:
+        if not field_name.isidentifier():
+            raise ValueError(f"Platzhalter {field_name!r} nicht erlaubt")
+        return kwargs[field_name], field_name
+
+
+_formatter = _PlainFormatter()
+
+
 def tr(key: str, /, **values: object) -> str:
     """Translate ``key`` and fill {placeholders}; a bad placeholder returns the raw text."""
     text = _strings.get(key) or _fallback.get(key) or key
     if not values:
         return text
     try:
-        return text.format(**values)
+        return _formatter.vformat(text, (), values)
     except (KeyError, IndexError, ValueError):
         return text
 

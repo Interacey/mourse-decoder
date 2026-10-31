@@ -23,6 +23,8 @@ class FakeEngine:
         self.block_input = False
         self.active = True
         self.block_shortcut = ""
+        self.cycle_shortcut = ""
+        self.cycle_count = 0
         self.callback: Callable[[str, str], None] | None = None
         self.configure_calls: list[tuple[int, int, int]] = []
         self.reset_calls = 0
@@ -65,12 +67,19 @@ class RecordingInjector:
         self.buffer = ""
         self.fail = False
         self.titles = [""]
+        self.clipboard: str | None = None  # what ``clipboard_text`` returns
 
     def inject_text(self, text: str) -> None:
         if self.fail:
             raise RuntimeError("Injektion kaputt")
         self.calls.append(("text", text))
         self.buffer += text
+
+    def type_text(self, text: str) -> None:
+        self.inject_text(text)
+
+    def pastes(self, text: str) -> bool:
+        return False
 
     def inject_backspaces(self, count: int) -> None:
         self.calls.append(("backspace", count))
@@ -90,6 +99,12 @@ class RecordingInjector:
     def foreground_title(self) -> str:
         # tests set ``titles`` to the window titles seen one after another
         return self.titles.pop(0) if len(self.titles) > 1 else self.titles[0]
+
+    def clipboard_text(self) -> str | None:
+        return self.clipboard
+
+    def paste_files(self, paths: list[str]) -> None:
+        self.calls.append(("files", paths))
 
 
 class RecordingListener:

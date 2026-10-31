@@ -164,7 +164,7 @@ def test_switching_morse_off_stops_a_long_wait(tmp_path, fake_engine, injector, 
     controller.set_listener(listener)
     fake_engine.letters("--..--..")
     assert injector.calls == [("text", "vorher")]
-    assert "ausgeschaltet" in listener.errors[0]
+    assert listener.errors == []  # switching off was the user's own decision, no message
 
 
 def test_switching_morse_off_stops_a_running_loop(tmp_path, fake_engine, injector, listener):
@@ -179,7 +179,7 @@ def test_switching_morse_off_stops_a_running_loop(tmp_path, fake_engine, injecto
     injector.press_shortcut = press_then_switch_off
     fake_engine.letters("--..--..")
     assert injector.calls == [("text", "x"), ("keys", "Ctrl+C")]
-    assert len(listener.errors) == 1
+    assert listener.errors == []
 
 
 def test_clicks_during_a_macro_are_dropped(tmp_path, fake_engine, injector):
@@ -240,17 +240,24 @@ class FakeClipboard:
     def set_text(self, text):
         self.content = text
 
+    def set_files(self, paths):
+        self.content = ("files", paths)
+
+    def get_text(self):
+        return self.content if isinstance(self.content, str) else None
+
 
 @pytest.fixture
 def no_settle(monkeypatch):
     monkeypatch.setattr(NativeInjector, "PASTE_SETTLE_S", 0)
+    monkeypatch.setattr(NativeInjector, "PASTE_FILES_SETTLE_S", 0)
 
 
 def test_long_text_is_pasted_and_clipboard_restored(no_settle):
     board = FakeClipboard()
     native = FakeNative(board)
-    NativeInjector(native, board).inject_text("a\nb" * 100)
-    assert native.calls == [("keys", "Ctrl+V", "a\r\nb" * 100)]
+    NativeInjector(native, board).inject_text("a\nb" * 1000)  # 3000 characters, above PASTE_FROM
+    assert native.calls == [("keys", "Ctrl+V", "a\r\nb" * 1000)]
     assert board.content == "alt"
 
 

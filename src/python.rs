@@ -275,6 +275,33 @@ impl PyMorseEngine {
         }
     }
 
+    /// Shortcut that switches to the next alphabet of the user's list; "" removes it.
+    #[setter]
+    fn set_cycle_shortcut(&self, spec: &str) -> PyResult<()> {
+        #[cfg(feature = "native-io")]
+        {
+            crate::hooks::set_cycle_shortcut(spec).map_err(PyValueError::new_err)
+        }
+        #[cfg(not(feature = "native-io"))]
+        {
+            let _ = spec;
+            Ok(())
+        }
+    }
+
+    /// How often the cycle shortcut was pressed; the UI compares it with the last value it saw.
+    #[getter]
+    fn cycle_count(&self) -> u32 {
+        #[cfg(feature = "native-io")]
+        {
+            crate::hooks::cycle_count()
+        }
+        #[cfg(not(feature = "native-io"))]
+        {
+            0
+        }
+    }
+
     #[getter]
     fn is_running(&self) -> bool {
         lock_or_recover(&self.state)

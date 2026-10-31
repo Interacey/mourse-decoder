@@ -63,6 +63,42 @@ def test_builtin_set_is_valid_and_never_shadows_a_letter():
         assert not set(codes) & set(load_alphabet(alphabet_id).codes), alphabet_id
 
 
+ORIGINAL_SMILEYS = {
+    "--..--..": "🙂", "--..-.-.": "😀", "--...-..": "😂", "-.-..--.": "😉", "-.-.-..-": "😢",
+    "-..--.-.": "😎", "..-.--.-": "👍", "..-..--.": "❤", ".-.--..-": "🎉", "---.-.-.": "😮",
+}
+
+
+def test_builtin_set_is_large_and_keeps_the_original_codes():
+    codes = load_smiley_codes("standard")
+    assert len(codes) >= 100
+    assert {c: codes[c] for c in ORIGINAL_SMILEYS} == ORIGINAL_SMILEYS  # nobody has to relearn a code
+
+
+def test_builtin_codes_are_free_unique_and_one_emoji_each():
+    codes = load_smiley_codes("standard")
+    assert all(len(code) == 8 for code in codes)  # no alphabet has codes that long, so none is shadowed
+    assert len(set(codes.values())) == len(codes)  # every emoji only once
+    assert all(len(emoji) == 1 and ord(emoji) > 0x2000 for emoji in codes.values())
+    assert "️" not in "".join(codes.values())  # no variation selectors, they type as boxes in some apps
+    assert not any(code in ("." * 8, "-" * 8) for code in codes)  # those look like an error signal
+
+
+@pytest.mark.parametrize("emoji", ["😊", "😍", "🔥", "💯", "✅", "❌", "🚀", "☕", "💔", "👋"])
+def test_new_emoji_are_in_the_set(emoji):
+    assert emoji in load_smiley_codes("standard").values()
+
+
+def test_every_builtin_code_types_its_emoji(fake_engine, injector):
+    manager = DictionaryManager()
+    controller = MorseController(fake_engine, injector, manager, Settings(smileys="standard"), use_hook=False)
+    controller.start()
+    codes = load_smiley_codes("standard")
+    for code in codes:
+        fake_engine.letters(code)
+    assert [value for _, value in injector.calls] == list(codes.values())
+
+
 def test_list_marks_builtin_and_user(tmp_path):
     write(tmp_path / "mine.json", {"id": "mine", "name": "Meins", "codes": {"-.-.-.-.": "X"}})
     infos = {i.id: i for i in list_smiley_sets(BUILTIN_SMILEY_DIR, tmp_path)}

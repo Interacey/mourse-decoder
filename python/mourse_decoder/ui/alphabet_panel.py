@@ -20,7 +20,6 @@ from ..alphabet_files import (
     new_alphabet_text,
     parse_alphabet_text,
     read_alphabet_text,
-    replaced_letters,
     save_alphabet_text,
     slugify,
 )
@@ -29,7 +28,7 @@ from ..dictionary import AlphabetError, AlphabetInfo, DictionaryManager
 from ..i18n import tr
 from ..settings import Settings
 from . import theme
-from .theme import Button, boxed, list_box, text_box
+from .theme import Button, boxed, confirm_commands, list_box, text_box
 
 
 class AlphabetPanel(tk.Frame):
@@ -220,11 +219,6 @@ class AlphabetPanel(tk.Frame):
 
     def _save(self) -> None:
         text = self._text.get("1.0", "end")
-        replaced = replaced_letters(text)
-        if replaced and not messagebox.askyesno(
-            tr("alpha.dlg.letters.title"), tr("alpha.dlg.letters", codes=", ".join(replaced)), parent=self
-        ):
-            return
         replacing = self._selected.id if self._selected else None
         active = self._controller.settings
         try:
@@ -241,7 +235,7 @@ class AlphabetPanel(tk.Frame):
         self._selected = None  # refresh reselects by id
         self.refresh(select_id=info.id)
         self._on_changed()
-        self._status.set(tr("alpha.status.saved", path=info.path))  # after on_changed, which redraws the list
+        self._status.set("")  # saving is silent, only errors are reported
 
     def _activate(self) -> None:
         if self._selected is None:
@@ -264,6 +258,8 @@ class AlphabetPanel(tk.Frame):
         errors: list[str] = []
         last_id: str | None = None
         for path in paths:
+            if not confirm_commands(self, Path(path)):
+                continue
             try:
                 info = import_alphabet_file(self._dictionaries, Path(path))
             except (AlphabetError, OSError) as exc:

@@ -93,6 +93,7 @@ def _rgb(color: str) -> tuple[int, int, int]:
 
 
 _images: dict[tuple, ImageTk.PhotoImage] = {}
+IMAGE_CACHE_PIXELS = 1_500_000  # about 6 MB of images that are no longer shown, at most
 
 
 def _render(
@@ -149,8 +150,10 @@ def shape_image(
     key = (w, h, radius, fill, border, hi, gloss, shadow, margin)
     image = _images.get(key)
     if image is None:
-        if len(_images) > 300:
-            _images.clear()
+        # a window drag renders a new size every few milliseconds; drop the oldest sizes first
+        # (a widget that still shows one keeps its own reference, so it stays alive)
+        while _images and sum(i.width() * i.height() for i in _images.values()) + w * h > IMAGE_CACHE_PIXELS:
+            del _images[next(iter(_images))]
         image = _images[key] = ImageTk.PhotoImage(_render(w, h, radius, fill, border, hi, gloss, shadow, margin))
     return image
 
@@ -491,6 +494,24 @@ class ScrollFrame(tk.Frame):
             self._canvas.yview_scroll(-2 if event.delta > 0 else 2, "units")
 
 
+def confirm_commands(parent: tk.Misc, path) -> bool:
+    """Before an import: ask once if the file holds commands that do something (Win+R, File, Clipboard).
+
+    True to go on. Files without such commands import silently, and so does everything else.
+    """
+    from tkinter import messagebox
+
+    from .. import macros
+    from ..i18n import tr
+
+    commands = macros.commands_in_file(path)
+    if not commands:
+        return True
+    return messagebox.askyesno(
+        tr("import.risky.title"), tr("import.risky", file=path.name, commands=", ".join(commands[:12])), parent=parent
+    )
+
+
 def text_box(master: tk.Misc, **kw: object) -> tk.Text:
     """Text input without its own border, put it in a RoundedBox (fit=False)."""
     options = dict(
@@ -545,6 +566,10 @@ def draw_glyph(canvas: tk.Canvas, name: str, cx: float, cy: float, color: str, t
             dot_x, dash = (x + 2, (x + 8, x + 17)) if dot_first else (x + 16, (x + 1, x + 10))
             canvas.create_oval(dot_x - 2, yy - 2, dot_x + 2, yy + 2, fill=color, outline=color, tags=tag)
             canvas.create_line(dash[0], yy, dash[1], yy, **line)
+    elif name == "update":  # arrow down onto a line
+        canvas.create_line(x + 9, y + 2, x + 9, y + 12, **line)
+        canvas.create_line(x + 4, y + 8, x + 9, y + 13, x + 14, y + 8, joinstyle="round", **line)
+        canvas.create_line(x + 3, y + 16, x + 15, y + 16, **line)
     elif name == "credits":  # circle with an i
         canvas.create_oval(x + 1, y + 1, x + 17, y + 17, fill="", outline=color, width=2, tags=tag)
         canvas.create_line(x + 9, y + 8, x + 9, y + 13, **line)

@@ -1,7 +1,7 @@
 # Builds MourseDecoder.exe and attaches it to a GitHub release.
 #
 # Publish a release by pushing a version tag:
-#   git tag v0.1.0 && git push origin v0.1.0
+#   git tag v.0.1.2 && git push origin v.0.1.2
 # It can also be started by hand from the Actions tab (the exe is then only an artifact).
 name: Release
 

@@ -16,7 +16,7 @@ from ..settings import THEME_MODES, Settings
 from . import theme
 from .form import parse_form
 from .key_capture import CaptureBackend, KeyCaptureButton, ShortcutCaptureButton
-from .theme import Card, ScrollFrame, Switch, field_box, label
+from .theme import Card, ScrollFrame, Switch, field_box, label, list_box
 
 _TIMING_FIELDS = (
     ("dot_threshold_ms", "timing.dot"),
@@ -53,8 +53,6 @@ class SettingsPanel(tk.Frame):
         scroll.grid(row=0, column=0, sticky="nsew")
         self._body = body = scroll.body
         body.columnconfigure(0, weight=1)
-
-        label(body, tr("settings.live"), size=9, muted=True).grid(row=0, column=0, sticky="w", padx=6, pady=(0, 4))
 
         # input
         self._section(1, "settings.section.input")
@@ -129,8 +127,27 @@ class SettingsPanel(tk.Frame):
             box.pack(side="right")
             self._vars[key] = var
 
+        # the user's own list of alphabets, and the shortcut that switches through it
+        self._section(8, "settings.section.cycle")
+        cycle = Card(body)
+        cycle.grid(row=9, column=0, sticky="ew")
+        self._cycle_button = ShortcutCaptureButton(
+            cycle.add_row(tr("settings.cycle_shortcut"), tr("settings.cycle_shortcut.hint")),
+            controller.settings.cycle_shortcut, on_change=lambda _spec: self._changed(),
+            on_hint=self._show_key_hint, backend=capture_backend,
+        )
+        self._cycle_button.pack()
+        self._cycle_ids: list[str] = []  # alphabet id of each list row
+        box, self._cycle_list = field_box(
+            cycle.add_row(tr("settings.cycle_list"), tr("settings.cycle_list.hint")),
+            list_box, selectmode="multiple", height=6, width=28,
+        )
+        box.configure(width=300, height=150)
+        box.pack()
+        self._cycle_list.bind("<<ListboxSelect>>", lambda _e: self._changed())
+
         self._error = tk.Label(body, bg=theme.P.bg, fg=theme.P.danger, font=theme.font(9), anchor="w", justify="left")
-        self._error.grid(row=8, column=0, sticky="w", padx=6, pady=(10, 0))
+        self._error.grid(row=10, column=0, sticky="w", padx=6, pady=(10, 0))
 
         self.refresh()
 
@@ -175,6 +192,13 @@ class SettingsPanel(tk.Frame):
             self._alphabet_by_label = {a.name: a.id for a in infos}
             self._alphabet_box.configure(values=list(self._alphabet_by_label))
             self._alphabet_var.set(next((a.name for a in infos if a.id == current.alphabet), current.alphabet))
+            self._cycle_button.set_shortcut(current.cycle_shortcut)
+            self._cycle_ids = [a.id for a in infos]
+            self._cycle_list.delete(0, "end")
+            for i, info in enumerate(infos):
+                self._cycle_list.insert("end", f"  {info.name}")
+                if info.id in current.cycle_alphabets:
+                    self._cycle_list.selection_set(i)
 
             sets = self._dictionaries.smiley_sets()
             self._smiley_by_label = {tr("smileys.off"): "", **{s.name: s.id for s in sets}}
@@ -220,6 +244,8 @@ class SettingsPanel(tk.Frame):
             block_input=self._block.get(),
             notifications=self._notify.get(),
             block_shortcut=self._shortcut_button.shortcut,
+            cycle_shortcut=self._cycle_button.shortcut,
+            cycle_alphabets=tuple(self._cycle_ids[i] for i in self._cycle_list.curselection()),
             smileys=self._smiley_by_label.get(self._smiley_var.get(), current.smileys),
             language=self._language_by_label.get(self._language_var.get(), current.language),
             theme=self._theme_by_label.get(self._theme_var.get(), current.theme),

@@ -1,4 +1,4 @@
-# Rust core engine of Mourse Decoder.
+﻿# Rust core engine of Mourse Decoder.
 #
 # One crate that builds both as a Rust library (rlib, for `cargo test`) and as a native
 # Python extension (cdylib, for maturin/PyO3). Everything platform- or Python-specific
@@ -7,7 +7,7 @@
 #   python:    PyO3 bindings (turned on by maturin)
 [package]
 name = "morse_core"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.83"            # minimum version PyO3 0.29 requires
 description = "Timing-accurate Morse engine with global input hooks and a PyO3 bridge"
@@ -40,6 +40,9 @@ pyo3 = { version = "0.29.3", optional = true }
 # (on Linux it pulls in evdev, so it stays off there and the hook only observes)
 [target.'cfg(windows)'.dependencies]
 rdev = { version = "0.5.3", optional = true, features = ["unstable_grab"] }
+# own SendInput for typing: enigo sends the characters in one batch, and the target app then
+# reads several queued characters as "the last one" (see injector.rs)
+windows = { version = "0.61.3", features = ["Win32_UI_Input_KeyboardAndMouse"] }
 
 [profile.release]
 # Small, fast binary, which matters for the under-10-MB-RAM goal. `lto = "thin"` with

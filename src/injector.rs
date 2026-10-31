@@ -1,9 +1,9 @@
 //! Native text injection.
 //!
-//! Writes the decoded character into the focused app as if it were typed. On Windows
-//! `Enigo::text` sends the characters with `SendInput` and `KEYEVENTF_UNICODE`, so any
-//! Unicode character works regardless of the keyboard layout, which a simulation with
-//! virtual key codes couldn't do.
+//! Writes the decoded character into the focused app as if it were typed. Characters go in
+//! as `KEYEVENTF_UNICODE` events, so any Unicode character works regardless of the keyboard
+//! layout, which a simulation with virtual key codes couldn't do. On Windows that is our own
+//! `SendInput` (see `win`), elsewhere `Enigo::text`.
 
 use std::cell::RefCell;
 use std::fmt;
@@ -60,8 +60,7 @@ enum Segment<'a> {
     Key(Key),
 }
 
-/// Splits text at line breaks and tabs. On Windows `Enigo::text` sends these as a key
-/// *and* as a character, so many apps would get every line break twice.
+/// Splits text at line breaks and tabs, which are typed as keys.
 fn segments(text: &str) -> Vec<Segment<'_>> {
     let mut out = Vec::new();
     let mut start = 0;
@@ -90,15 +89,95 @@ fn segments(text: &str) -> Vec<Segment<'_>> {
     out
 }
 
-/// Pause after every typed character. Sent as one batch, a busy app scrambles the text
-/// (a fresh Windows 11 Notepad tab turned "Hallo Welt" into "MorsollaH ttttttttt": it
-/// reads every queued character as the last one). 10 ms was reliable in tests, 15 ms
-/// leaves headroom; long texts are pasted by the Python side anyway.
-const CHAR_DELAY: Duration = Duration::from_millis(15);
+/// Pause after every typed character.
+///
+/// Windows remembers only the LAST injected Unicode character, and the app reads that value
+/// when it gets round to a key message. Two characters injected before it did turn into two
+/// copies of the second one: a fresh Windows 11 Notepad tab turned "Hallo Welt" into
+/// "MorsollaH ttttttttt", "Tab" after a Tab key into "aab", and the second emoji in a row
+/// into two low surrogates. Asking the app whether it is idle (WM_NULL) did not help, it
+/// answers before it works off its key queue, so only waiting does. 4 ms scrambled plain
+/// text in Notepad, 15 ms is the shortest pause that kept it intact.
+const CHAR_DELAY: Duration = Duration::from_millis(20);
+/// After Return and Tab the app lays out the text and is slow for a moment.
+const LINE_KEY_DELAY: Duration = Duration::from_millis(150);
 
-fn pause_between_chars() {
+fn pause(delay: Duration) {
     hooks::suppress_for(SELF_INPUT_GUARD); // typing may outlast the guard set at the start
-    std::thread::sleep(CHAR_DELAY);
+    std::thread::sleep(delay);
+}
+
+/// Types one character as if it came from the keyboard.
+fn type_char(enigo: &mut Enigo, c: char) -> Result<(), InjectError> {
+    #[cfg(windows)]
+    {
+        let _ = enigo; // our own SendInput, see `win`
+        win::type_char(c)
+    }
+    #[cfg(not(windows))]
+    {
+        let mut buffer = [0u8; 4];
+        enigo
+            .text(c.encode_utf8(&mut buffer))
+            .map_err(|e| InjectError(format!("{e:?}")))
+    }
+}
+
+#[cfg(windows)]
+mod win {
+    //! Typing on Windows: one `SendInput` per UTF-16 unit. enigo sends a whole batch, and its
+    //! key-up of a second surrogate carries the first one.
+
+    use std::mem::size_of;
+    use std::time::Duration;
+
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
+        KEYEVENTF_UNICODE, VIRTUAL_KEY,
+    };
+
+    use super::InjectError;
+
+    /// Between the two halves of an emoji and after it: the app is slow with those.
+    const SURROGATE_DELAY: Duration = Duration::from_millis(60);
+
+    fn unit_event(unit: u16, up: bool) -> INPUT {
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VIRTUAL_KEY(0), // must be zero for KEYEVENTF_UNICODE
+                    wScan: unit,
+                    dwFlags: KEYEVENTF_UNICODE
+                        | if up { KEYEVENTF_KEYUP } else { KEYBD_EVENT_FLAGS(0) },
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        }
+    }
+
+    pub fn type_char(c: char) -> Result<(), InjectError> {
+        let mut buffer = [0u16; 2];
+        let units = c.encode_utf16(&mut buffer);
+        let pair = units.len() == 2;
+        // one SendInput per half, both halves in one batch came out as two low surrogates
+        for (i, &unit) in units.iter().enumerate() {
+            if i > 0 {
+                super::pause(SURROGATE_DELAY); // the second half must not overtake the first
+            }
+            let events = [unit_event(unit, false), unit_event(unit, true)];
+            // SAFETY: `events` is a valid slice of initialised INPUT structs
+            let sent = unsafe { SendInput(&events, size_of::<INPUT>() as i32) };
+            if sent != events.len() as u32 {
+                return Err(InjectError(format!("SendInput hat {sent} von 2 Ereignissen gesendet")));
+            }
+        }
+        if pair {
+            super::pause(SURROGATE_DELAY);
+        }
+        Ok(())
+    }
 }
 
 /// Types `text` into the active app, one character at a time.
@@ -111,18 +190,16 @@ pub fn inject_text(text: &str) -> Result<(), InjectError> {
         for segment in segments(text) {
             match segment {
                 Segment::Text(part) => {
-                    for (i, c) in part.char_indices() {
-                        enigo
-                            .text(&part[i..i + c.len_utf8()])
-                            .map_err(|e| InjectError(format!("{e:?}")))?;
-                        pause_between_chars();
+                    for c in part.chars() {
+                        type_char(enigo, c)?;
+                        pause(CHAR_DELAY);
                     }
                 }
                 Segment::Key(key) => {
                     enigo
                         .key(key, Direction::Click)
                         .map_err(|e| InjectError(format!("{e:?}")))?;
-                    pause_between_chars();
+                    pause(LINE_KEY_DELAY);
                 }
             }
         }

@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import sys
+from collections.abc import Collection
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -78,6 +79,10 @@ def same_binding(first: str, second: str) -> bool:
     return normalized(first) == normalized(second)
 
 
+# same shape as an alphabet id (which is also its file name), see dictionary.py
+_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+MAX_CYCLE_ALPHABETS = 64
+
 # UI limits in ms: below 50 nobody can tell dot from dash on purpose, above 5 s it isn't morsing
 DOT_THRESHOLD_RANGE = (50, 2000)
 LETTER_GAP_RANGE = (100, 5000)
@@ -101,6 +106,8 @@ class Settings:
     notifications: bool = True   # small message when the shortcut turns Morse input on or off
     block_input: bool = False    # hide the trigger's normal function so only decoded text arrives
     block_shortcut: str = "Ctrl+Shift+Pause"  # toggles block_input from anywhere, "" = none
+    cycle_shortcut: str = ""     # switches to the next alphabet of cycle_alphabets, "" = none
+    cycle_alphabets: tuple[str, ...] = ()  # the user's own pick of alphabet ids to switch through
 
     def validate(self) -> list[str]:
         """List of error messages, empty if valid."""
@@ -137,9 +144,21 @@ class Settings:
             errors.append("'notifications' muss true oder false sein.")
         if not isinstance(self.block_input, bool):
             errors.append("'block_input' muss true oder false sein.")
-        if not is_valid_shortcut(self.block_shortcut):
-            errors.append(f"Ungültiges Tastenkürzel '{self.block_shortcut}'.")
+        for spec in (self.block_shortcut, self.cycle_shortcut):
+            if not is_valid_shortcut(spec):
+                errors.append(f"Ungültiges Tastenkürzel '{spec}'.")
+        if self.block_shortcut and self.cycle_shortcut and same_binding(self.block_shortcut, self.cycle_shortcut):
+            errors.append("Die beiden Kürzel (Ein/Aus und Umschalten) müssen verschieden sein.")
+        errors.extend(self._cycle_errors())
         return errors
+
+    def _cycle_errors(self) -> list[str]:
+        items = self.cycle_alphabets
+        if not isinstance(items, tuple) or not all(isinstance(i, str) and _ID_PATTERN.match(i) for i in items):
+            return ["'cycle_alphabets' muss eine Liste von Alphabet-IDs sein."]
+        if len(items) > MAX_CYCLE_ALPHABETS or len(set(items)) != len(items):
+            return [f"Die Umschalt-Liste darf höchstens {MAX_CYCLE_ALPHABETS} verschiedene Alphabete enthalten."]
+        return []
 
     def _key_errors(self) -> list[str]:
         if not is_valid_binding(self.trigger):
@@ -167,7 +186,23 @@ class Settings:
     def from_dict(cls, data: dict[str, Any]) -> Settings:
         """Ignore unknown keys, default the missing ones, so versions can read each other's files."""
         known = {f.name for f in dataclasses.fields(cls)}
-        return cls(**{k: v for k, v in data.items() if k in known})
+        values = {k: v for k, v in data.items() if k in known}
+        if isinstance(values.get("cycle_alphabets"), list):  # JSON has no tuples
+            values["cycle_alphabets"] = tuple(values["cycle_alphabets"])
+        return cls(**values)
+
+    def cycle_target(self, available: Collection[str], steps: int = 1) -> tuple[str, int, int] | None:
+        """(alphabet id, position, list length) after ``steps`` presses of the cycle shortcut.
+
+        Alphabets that were deleted meanwhile are skipped. If the active alphabet is not in the
+        list, the first press goes to its first entry. None if no entry is usable.
+        """
+        usable = [a for a in self.cycle_alphabets if a in available]
+        if not usable:
+            return None
+        current = usable.index(self.alphabet) if self.alphabet in usable else -1
+        position = (current + steps) % len(usable)
+        return usable[position], position + 1, len(usable)
 
 
 def default_config_dir() -> Path:

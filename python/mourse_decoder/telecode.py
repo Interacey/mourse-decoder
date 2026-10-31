@@ -8,13 +8,10 @@ Unihan and aren't supported.
 
 from __future__ import annotations
 
-import argparse
 import io
 import re
-import sqlite3
 import sys
 import threading
-import zipfile
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import TextIO
@@ -40,6 +37,8 @@ class TelecodeStore:
     """Read-only lookup in the telecode database."""
 
     def __init__(self, db_path: Path) -> None:
+        import sqlite3  # only Chinese needs it, so it is loaded when a database is opened
+
         db_path = Path(db_path)
         if not db_path.is_file():
             raise TelecodeError(f"Telecode-Datenbank nicht gefunden: {db_path}")
@@ -87,6 +86,8 @@ def parse_unihan(lines: Iterable[str], field: str = "kMainlandTelegraph") -> Ite
 def _open_unihan(source: Path) -> TextIO:
     """Accepts the text file directly or the official Unihan.zip."""
     if source.suffix.lower() == ".zip":
+        import zipfile
+
         archive = zipfile.ZipFile(source)
         try:
             raw = archive.open(UNIHAN_FILE)
@@ -106,6 +107,8 @@ def build_database(
     Duplicate codes are skipped, the first one wins. It writes to a temp file
     and renames it, so an aborted build never leaves a half-written database.
     """
+    import sqlite3
+
     db_path = Path(db_path)
     tmp_path = db_path.with_suffix(db_path.suffix + ".tmp")
     tmp_path.unlink(missing_ok=True)
@@ -133,6 +136,8 @@ def build_database(
 
 
 def main(argv: list[str] | None = None) -> int:
+    import argparse
+
     parser = argparse.ArgumentParser(
         description="Erzeugt telecode.sqlite aus der Unicode-Unihan-Datenbank.",
         epilog="Unihan.zip: https://www.unicode.org/Public/UCD/latest/ucd/Unihan.zip",

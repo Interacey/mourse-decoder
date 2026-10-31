@@ -14,7 +14,7 @@ from ..i18n import tr
 from ..settings import Settings
 from ..smileys import SmileyError, SmileySetInfo, delete_smiley_set, import_smiley_file, load_smiley_codes
 from . import theme
-from .theme import Button, RoundedBox, boxed, list_box
+from .theme import Button, RoundedBox, boxed, confirm_commands, list_box
 
 
 class SmileyPanel(tk.Frame):
@@ -73,7 +73,10 @@ class SmileyPanel(tk.Frame):
         self._tree.heading("smiley", text=tr("smiley.col.output"), anchor="w")
         self._tree.column("code", width=180, anchor="w")
         self._tree.column("smiley", width=120, anchor="w")
-        self._tree.pack(fill="both", expand=True, padx=10, pady=10)
+        bar = ttk.Scrollbar(table.body, orient="vertical", command=self._tree.yview)
+        self._tree.configure(yscrollcommand=bar.set)
+        bar.pack(side="right", fill="y", padx=(0, 10), pady=10)
+        self._tree.pack(side="left", fill="both", expand=True, padx=(10, 0), pady=10)
 
         self._status = tk.StringVar()
         tk.Label(
@@ -150,6 +153,8 @@ class SmileyPanel(tk.Frame):
         errors: list[str] = []
         last: SmileySetInfo | None = None
         for path in paths:
+            if not confirm_commands(self, Path(path)):
+                continue
             try:
                 last = import_smiley_file(Path(path), self._dictionaries.smiley_directory, folder)
             except (SmileyError, OSError) as exc:

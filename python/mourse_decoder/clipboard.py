@@ -7,10 +7,12 @@ target app's input queue and characters go missing (measured in Notepad: 0 of 63
 from __future__ import annotations
 
 import ctypes
+import struct
 import sys
 import time
 
 CF_UNICODETEXT = 13
+CF_HDROP = 15
 GMEM_MOVEABLE = 0x0002
 # GDI handles instead of memory blocks; Windows rebuilds CF_BITMAP and friends from CF_DIB
 _HANDLE_FORMATS = {2, 3, 9, 14, 0x80, 0x82, 0x83, 0x8E}
@@ -35,6 +37,8 @@ if available():
     _user32.SetClipboardData.restype = wintypes.HANDLE
     _user32.EnumClipboardFormats.argtypes = [wintypes.UINT]
     _user32.EnumClipboardFormats.restype = wintypes.UINT
+    _user32.RegisterClipboardFormatW.argtypes = [wintypes.LPCWSTR]
+    _user32.RegisterClipboardFormatW.restype = wintypes.UINT
     _user32.GetClipboardFormatNameW.argtypes = [wintypes.UINT, wintypes.LPWSTR, ctypes.c_int]
     _kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
     _kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
@@ -98,12 +102,23 @@ def set_text(text: str) -> None:
         _put(CF_UNICODETEXT, (text + "\0").encode("utf-16-le"))
 
 
+def set_files(paths: list[str]) -> None:
+    """Put files and folders on the clipboard as if copied in Explorer (Ctrl+V pastes them)."""
+    # DROPFILES: offset of the list, point x/y, non-client flag, wide-characters flag
+    header = struct.pack("<Iiiii", 20, 0, 0, 0, 1)
+    listing = ("\0".join(paths) + "\0\0").encode("utf-16-le")
+    with _Open():
+        _user32.EmptyClipboard()
+        _put(CF_HDROP, header + listing)
+        _put(_user32.RegisterClipboardFormatW("Preferred DropEffect"), struct.pack("<I", 1))  # copy, not move
+
+
 def get_text() -> str | None:
     with _Open():
         handle = _user32.GetClipboardData(CF_UNICODETEXT)
-        if not handle:
+        pointer = _kernel32.GlobalLock(handle) if handle else None
+        if not pointer:
             return None
-        pointer = _kernel32.GlobalLock(handle)
         try:
             return ctypes.wstring_at(pointer)
         finally:
