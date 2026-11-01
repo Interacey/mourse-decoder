@@ -9,7 +9,7 @@ import pytest
 from mourse_decoder import clipboard
 from mourse_decoder.controller import MorseController, NativeInjector
 from mourse_decoder.dictionary import DictionaryManager
-from mourse_decoder.macros import expand_loops
+from mourse_decoder.macros import parse
 from mourse_decoder.settings import Settings
 
 LONG = "Lorem ipsum dolor sit amet.\n" * 1000  # 28000 characters
@@ -110,7 +110,7 @@ def test_loop_repeats_text_keys_and_waits(tmp_path, fake_engine, injector, recor
     ],
 )
 def test_expand_loops(macro, expected):
-    assert expand_loops(macro) == expected
+    assert parse(macro, lambda _combo: None) == [("text", expected)]
 
 
 @pytest.mark.parametrize(
