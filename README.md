@@ -105,6 +105,138 @@ mourse-decoder-build-telecodes Unihan.zip "%APPDATA%\MourseDecoder\telecode.sqli
 
 Afterwards, "Chinese (telegraph code)" appears in the alphabet list. The user keys in four digits. The first three appear immediately and are replaced by the character after the fourth (`0022` → 中).
 
+## Configuration files (JSON)
+
+Everything the program reads is JSON. Files live in one folder, `%APPDATA%\MourseDecoder` on Windows (`~/.config/mourse-decoder` on Linux, `~/Library/Application Support/MourseDecoder` on macOS). The pages "Alphabets" and "Smileys" have a Folder button that opens the right sub-folder.
+
+```
+MourseDecoder/
+  settings.json     the settings page writes it, you may also edit it
+  alphabets/        your own alphabets        (<id>.json)
+  smileys/          your own smiley sets      (<id>.json)
+  languages/        your own languages        (<id>.json)
+  telecode.sqlite   optional, see "Chinese telecodes"
+```
+
+General rules for all four kinds of file:
+- Plain UTF-8 JSON (a BOM is fine). Keys must not repeat inside one object; a duplicate is reported, never silently overwritten.
+- The `id` is also the file name: `id` `mein-alphabet` lives in `mein-alphabet.json`. Allowed: `a-z`, `0-9`, `-`, `_`, starting with a letter or digit.
+- Files you write by hand may hold raw line breaks inside texts and a stray `"` (`"NIV"`). The app accepts them and saves strict JSON back. A broken file is skipped with a message, it never stops the program.
+- Files are size-unlimited on purpose, but a text of several 100 KB takes minutes to type; see "Emoji and long texts".
+- Importing: the Import buttons copy any JSON file into the right folder, take a missing `id` from the file name, and check it completely. If the file holds commands that do something when keyed (`{Win+R}`, `{File …}`, `{Clipboard}`) you are asked first.
+
+### settings.json
+
+All keys are optional. A missing key gets its default, an unknown key is ignored. A file with an invalid value is moved to `settings.json.bak` and the defaults are used.
+
+```json
+{
+  "dot_threshold_ms": 200,
+  "letter_gap_ms": 600,
+  "word_gap_ms": 1400,
+  "trigger": "ScrollLock",
+  "separate_dash_key": false,
+  "dash_trigger": "Pause",
+  "alphabet": "latin",
+  "smileys": "standard",
+  "enabled": true,
+  "language": "de",
+  "theme": "system",
+  "sidebar_collapsed": false,
+  "notifications": true,
+  "block_input": false,
+  "block_shortcut": "Ctrl+Shift+Pause",
+  "cycle_shortcut": "Ctrl+Alt+F9",
+  "cycle_alphabets": ["latin", "german", "greek"]
+}
+```
+
+| Key | Meaning | Allowed |
+|---|---|---|
+| `dot_threshold_ms` | A press shorter than this is a dot, longer is a dash (ignored with a separate dash key) | 50 to 2000 |
+| `letter_gap_ms` | Silence that ends a letter | 100 to 5000 |
+| `word_gap_ms` | Silence that adds a space; `0` = never | 0 to 15000, and above `letter_gap_ms` unless 0 |
+| `trigger` | The Morse key (the dot key with a separate dash key) | a key binding, see below |
+| `separate_dash_key` | On: `trigger` always gives a dot and `dash_trigger` a dash | `true` or `false` |
+| `dash_trigger` | The dash key | a key binding, different from `trigger` |
+| `alphabet` | Id of the active alphabet, or `chinese-telecode` | an id from `alphabets/` or the built-in ones |
+| `smileys` | Id of the smiley set; `""` = none | an id, or empty |
+| `enabled` | Morse input on or off | `true` or `false` |
+| `language` | Id of the interface language | `en`, `de`, `de-saar`, `es`, `fr`, `it`, `pt` or one of yours |
+| `theme` | Appearance | `"system"`, `"light"`, `"dark"` |
+| `sidebar_collapsed` | Sidebar shows icons only | `true` or `false` |
+| `notifications` | Small message when the on/off shortcut fires | `true` or `false` |
+| `block_input` | Hide the trigger's normal function (a space, a click) while Morse input is on | `true` or `false` |
+| `block_shortcut` | Shortcut that switches Morse input and blocking on or off; `""` = none | a key binding, see below |
+| `cycle_shortcut` | Shortcut that switches to the next alphabet of `cycle_alphabets`; `""` = none; must differ from `block_shortcut` | a key binding |
+| `cycle_alphabets` | Your own pick of alphabet ids, switched in this order | a list of up to 64 different ids |
+
+**Key bindings** are one key, or modifiers joined with `+` in front of one key: `F8`, `Ctrl+Shift+Pause`, `CapsLock+VK81`. Modifiers: `Ctrl`, `Alt`, `Shift`, `Win`, `CapsLock` (German names such as `Strg` and `Umschalt` work too). Keys: `ScrollLock`, `Pause`, `Insert`, `ControlRight`, `AltGr`, `F1` to `F12`, `Space`, `MouseLeft`, `MouseRight`, `MouseMiddle`, `Mouse4` to `Mouse32`, and any other key as its Windows virtual-key code `VK1` to `VK255`. The easy way: click a key button on the settings page, press the key. If you press nothing for 8 seconds, a shortcut is removed and a Morse key stays as it was.
+
+### Alphabets (`alphabets/<id>.json`)
+
+```json
+{
+  "id": "mein-alphabet",
+  "name": "Mein Alphabet",
+  "description": "Latein plus ein paar Zeichen",
+  "extends": "latin",
+  "word_separator": " ",
+  "codes": {
+    ".-.-": "Ä",
+    "--..--..": "Hallo{Enter}Welt"
+  },
+  "combining": {
+    "-.-.-.-": "゙"
+  }
+}
+```
+
+| Key | Meaning |
+|---|---|
+| `id` | Required, must equal the file name without `.json`. Ids of built-in alphabets (`latin`, `german`, `greek`, `cyrillic`, `wabun`, `common`) are taken |
+| `name` | Name in the lists; the id if missing |
+| `description` | Free text |
+| `extends` | Id of an alphabet whose codes you inherit; yours win on the same code. May be a built-in one or another of yours, chains are fine, cycles are refused. `common` brings digits and punctuation |
+| `codes` | Required unless inherited: Morse code to output. A code is 1 to 32 characters of `.` and `-`. The output is any non-empty text, with macros (see "Emoji and long texts") |
+| `combining` | Codes that change the letter before them instead of typing one, for example Japanese dakuten (`カ` + U+3099 gives `ガ`). The code must be free in the whole chain, so not one that `latin` or `common` already use. The mark is merged with the previous character; an invalid pair types nothing. A code may not be in `codes` and `combining` at once |
+| `word_separator` | Typed after a word gap; default is a space, `""` for none (Japanese) |
+| `abstract` | `true` = only a base for `extends`, not selectable (like `common`) |
+
+Built-in alphabets cannot be edited; use "Create copy" on the Alphabets page, which gives you a copy to change.
+
+### Smiley sets (`smileys/<id>.json`)
+
+```json
+{
+  "id": "meine-smileys",
+  "name": "Meine Smileys",
+  "description": "Emoji und Textbausteine",
+  "codes": {
+    "--..--..": "🙂",
+    "--..-.-.": "Mit freundlichen Grüßen{Enter}Anton",
+    "--...-..": "{Ctrl+A}{Ctrl+C}"
+  }
+}
+```
+
+`id`, `codes` (not empty) as for alphabets; `name` and `description` are optional. The active set sits under the alphabet: on the same code the alphabet wins, so a smiley never hides a letter. Use 8-symbol codes, no alphabet has those. The built-in set `standard` is read-only.
+
+### Languages (`languages/<id>.json`)
+
+```json
+{
+  "id": "nl",
+  "name": "Nederlands",
+  "strings": {
+    "nav.settings": "Instellingen",
+    "nav.alphabets": "Alfabetten"
+  }
+}
+```
+
+Copy `python/mourse_decoder/locales/en.json` as a template and translate the values. Keys you leave out fall back to English, so a partial file works. Placeholders such as `{name}` or `{total}` must stay as they are, and only plain names are allowed inside the braces. Pick the language on the settings page, or set `"language": "nl"`.
+
 ## Security
 
 - **Network paths are refused** in `{File …}`. Merely checking whether `\\server\share\x` exists makes Windows log in at that server and hand over the user's NTLM hash, so a smiley set from a stranger could leak it. Local drives and mapped drives (`Z:\`) work.
