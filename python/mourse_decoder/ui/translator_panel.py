@@ -25,23 +25,23 @@ class TranslatorPanel(tk.Frame):
         tk.Label(self, textvariable=self._hint, bg=theme.P.bg, fg=theme.P.muted, font=theme.font(10), anchor="w").grid(
             row=0, column=0, sticky="w"
         )
-        label(self, tr("translator.input"), size=9, weight="bold", muted=True).grid(row=1, column=0, sticky="w", pady=(14, 6))
+        label(self, tr("translator.input"), size=9, weight="bold", muted=True).grid(row=1, column=0, sticky="w", pady=(16, 8))
         box, self._input = boxed(self, text_box, pad=4, height=5, wrap="word", font=theme.font(12))
         box.grid(row=2, column=0, sticky="nsew")
         self._input.bind("<<Modified>>", self._on_modified)
 
-        label(self, tr("translator.output"), size=9, weight="bold", muted=True).grid(row=3, column=0, sticky="w", pady=(14, 6))
+        label(self, tr("translator.output"), size=9, weight="bold", muted=True).grid(row=3, column=0, sticky="w", pady=(16, 8))
         self._status = tk.StringVar()
         tk.Label(self, textvariable=self._status, bg=theme.P.bg, fg=theme.P.muted, font=theme.font(9), anchor="w").grid(
             row=4, column=0, sticky="w"
         )
         out_box, self._output = boxed(self, text_box, pad=4, height=5, wrap="word", undo=False, state="disabled")
-        out_box.grid(row=5, column=0, sticky="nsew", pady=(6, 0))
+        out_box.grid(row=5, column=0, sticky="nsew", pady=(8, 0))
         self._output.configure(font=(theme.MONO, 13))
 
         buttons = tk.Frame(self, bg=theme.P.bg)
         buttons.grid(row=6, column=0, sticky="e", pady=(12, 0))
-        Button(buttons, tr("translator.clear"), self._clear, variant="plain").pack(side="left", padx=(0, 6))
+        Button(buttons, tr("translator.clear"), self._clear, variant="plain").pack(side="left", padx=(0, 8))
         Button(buttons, tr("translator.copy"), self._copy, variant="primary", min_width=110).pack(side="left")
         self.refresh()
 

@@ -37,7 +37,7 @@ class UpdatePanel(tk.Frame):
         self._latest = label(card.add_row(tr("update.latest")), "–", weight="bold")
         self._latest.pack()
 
-        label(self, tr("update.notes"), size=9, weight="bold", muted=True).grid(row=1, column=0, sticky="w", pady=(18, 6))
+        label(self, tr("update.notes"), size=9, weight="bold", muted=True).grid(row=1, column=0, sticky="w", pady=(16, 8))
         box, self._notes = boxed(self, text_box, pad=4, height=6, wrap="word", undo=False, state="disabled", font=theme.font(10))
         box.grid(row=2, column=0, sticky="nsew")
 
@@ -45,17 +45,17 @@ class UpdatePanel(tk.Frame):
         tk.Label(
             self, textvariable=self._status, bg=theme.P.bg, fg=theme.P.muted, font=theme.font(9), anchor="w",
             justify="left", wraplength=600,
-        ).grid(row=3, column=0, sticky="w", pady=(10, 0))
+        ).grid(row=3, column=0, sticky="w", pady=(8, 0))
 
         buttons = tk.Frame(self, bg=theme.P.bg)
-        buttons.grid(row=4, column=0, sticky="w", pady=(10, 0))
+        buttons.grid(row=4, column=0, sticky="w", pady=(8, 0))
         self._check_btn = Button(buttons, tr("update.check"), self._check, min_width=170)
         self._install_btn = Button(buttons, tr("update.install"), self._install, variant="primary", min_width=170)
-        self._check_btn.pack(side="left", padx=(0, 6))
+        self._check_btn.pack(side="left", padx=(0, 8))
         self._install_btn.pack(side="left")
         self._install_btn.set_enabled(False)
 
-        label(self, tr("uninstall.section"), size=9, weight="bold", muted=True).grid(row=5, column=0, sticky="w", pady=(24, 6))
+        label(self, tr("uninstall.section"), size=9, weight="bold", muted=True).grid(row=5, column=0, sticky="w", pady=(24, 8))
         removal = Card(self)
         removal.grid(row=6, column=0, sticky="ew")
         Button(removal.add_row(tr("uninstall.title"), tr("uninstall.hint")), tr("uninstall.button"), self._uninstall).pack()

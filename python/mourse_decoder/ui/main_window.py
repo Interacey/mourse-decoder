@@ -58,7 +58,7 @@ class _NavItem(tk.Canvas):
             fill = ""
         if fill and width > 8:
             self._shape = theme.shape_image(
-                width - 4, ITEM_HEIGHT - 4, 18, fill, theme.P.border if self._selected else None, theme.P.glass, gloss=True
+                width - 4, ITEM_HEIGHT - 4, 10, fill, theme.P.border if self._selected else None, theme.P.glass, gloss=True
             )
             self.create_image(2, 2, anchor="nw", image=self._shape)
         color = theme.P.accent_text if self._selected else theme.P.text
@@ -131,7 +131,7 @@ class MainWindow:
         self._sidebar.rowconfigure(2, weight=1)
 
         self._brand = tk.Frame(self._sidebar, bg=theme.P.sidebar)
-        self._brand.grid(row=0, column=0, sticky="ew", padx=14, pady=(22, 18))
+        self._brand.grid(row=0, column=0, sticky="ew", padx=16, pady=(24, 16))
         self._brand_logo = ImageTk.PhotoImage(create_icon(True, 34))
         self._brand_image = tk.Label(self._brand, image=self._brand_logo, bg=theme.P.sidebar)
         bind_sos(self._brand_image, self.open_battleship)  # easter egg: click SOS on the icon
@@ -140,16 +140,16 @@ class MainWindow:
         )
 
         self._nav_frame = tk.Frame(self._sidebar, bg=theme.P.sidebar)
-        self._nav_frame.grid(row=1, column=0, sticky="ew", padx=10)
+        self._nav_frame.grid(row=1, column=0, sticky="ew", padx=8)
 
         bottom = tk.Frame(self._sidebar, bg=theme.P.sidebar)
-        bottom.grid(row=3, column=0, sticky="ew", padx=10, pady=(0, 16))
+        bottom.grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 16))
         self._status = tk.Label(
             bottom, bg=theme.P.sidebar, fg=theme.P.muted, font=theme.font(9), anchor="w", justify="left", wraplength=180
         )
         self._toggle = _NavItem(bottom, "sidebar", "", self._toggle_sidebar)
         self._toggle.pack(side="bottom", fill="x")
-        self._status.pack(side="bottom", fill="x", padx=14, pady=(0, 10))
+        self._status.pack(side="bottom", fill="x", padx=16, pady=(0, 8))
         tk.Frame(root, bg=theme.P.border, width=1).grid(row=0, column=0, sticky="nse")
 
         # content
@@ -158,9 +158,9 @@ class MainWindow:
         content.columnconfigure(0, weight=1)
         content.rowconfigure(1, weight=1)
         self._heading = tk.Label(content, bg=theme.P.bg, fg=theme.P.text, font=theme.font(24, "bold"), anchor="w")
-        self._heading.grid(row=0, column=0, sticky="ew", padx=36, pady=(26, 14))
+        self._heading.grid(row=0, column=0, sticky="ew", padx=36, pady=(24, 16))
         stack = tk.Frame(content, bg=theme.P.bg)
-        stack.grid(row=1, column=0, sticky="nsew", padx=36, pady=(0, 30))
+        stack.grid(row=1, column=0, sticky="nsew", padx=36, pady=(0, 32))
         stack.columnconfigure(0, weight=1)
         stack.rowconfigure(0, weight=1)
 
@@ -237,9 +237,9 @@ class MainWindow:
             self._brand_image.pack()
             self._status.pack_forget()
         else:
-            self._brand_image.pack(side="left", padx=(6, 10))
+            self._brand_image.pack(side="left", padx=(8, 8))
             self._brand_title.pack(side="left")
-            self._status.pack(side="bottom", fill="x", padx=14, pady=(0, 10), before=self._toggle)
+            self._status.pack(side="bottom", fill="x", padx=16, pady=(0, 8), before=self._toggle)
         for item in (*self._nav.values(), self._toggle):
             item.set_collapsed(collapsed)
 

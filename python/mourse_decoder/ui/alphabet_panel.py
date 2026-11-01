@@ -64,8 +64,8 @@ class AlphabetPanel(tk.Frame):
 
         actions = tk.Frame(left, bg=theme.P.bg)
         actions.grid(row=1, column=0, sticky="w", pady=(12, 0))
-        Button(actions, tr("alpha.new"), self._new).pack(side="left", padx=(0, 6))
-        Button(actions, tr("alpha.import"), self._import).pack(side="left", padx=(0, 6))
+        Button(actions, tr("alpha.new"), self._new).pack(side="left", padx=(0, 8))
+        Button(actions, tr("alpha.import"), self._import).pack(side="left", padx=(0, 8))
         Button(actions, tr("alpha.delete"), self._delete, variant="plain").pack(side="left")
 
         # right: editor
@@ -86,18 +86,18 @@ class AlphabetPanel(tk.Frame):
         tk.Label(
             right, textvariable=self._status, bg=theme.P.bg, fg=theme.P.muted, font=theme.font(9), anchor="w",
             justify="left", wraplength=520,
-        ).grid(row=2, column=0, sticky="w", pady=(10, 0))
+        ).grid(row=2, column=0, sticky="w", pady=(8, 0))
 
         buttons = tk.Frame(right, bg=theme.P.bg)
         buttons.grid(row=3, column=0, sticky="w", pady=(12, 0))
         self._save_btn = Button(buttons, tr("alpha.save"), self._save, variant="primary", min_width=100)
         self._copy_btn = Button(buttons, tr("alpha.copy"), self._copy)
         self._use_btn = Button(buttons, tr("alpha.use"), self._activate)
-        self._save_btn.grid(row=0, column=0, padx=(0, 6))
-        Button(buttons, tr("alpha.check"), self._check).grid(row=0, column=1, padx=(0, 6))
+        self._save_btn.grid(row=0, column=0, padx=(0, 8))
+        Button(buttons, tr("alpha.check"), self._check).grid(row=0, column=1, padx=(0, 8))
         self._copy_btn.grid(row=0, column=2)
-        self._use_btn.grid(row=1, column=0, padx=(0, 6), pady=(8, 0))
-        Button(buttons, tr("alpha.export"), self._export).grid(row=1, column=1, padx=(0, 6), pady=(8, 0))
+        self._use_btn.grid(row=1, column=0, padx=(0, 8), pady=(8, 0))
+        Button(buttons, tr("alpha.export"), self._export).grid(row=1, column=1, padx=(0, 8), pady=(8, 0))
         Button(buttons, tr("alpha.folder"), self._open_folder, variant="plain").grid(row=1, column=2, sticky="w", pady=(8, 0))
 
         self.refresh()

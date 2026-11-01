@@ -119,7 +119,7 @@ class SettingsPanel(tk.Frame):
             var = tk.StringVar()
             var.trace_add("write", lambda *_: self._schedule())
             holder = timing.add_row(tr(title), tr(f"{title}.hint"))
-            label(holder, tr("unit.ms"), muted=True).pack(side="right", padx=(10, 0))
+            label(holder, tr("unit.ms"), muted=True).pack(side="right", padx=(8, 0))
             box, _ = field_box(
                 holder, ttk.Spinbox, textvariable=var, from_=0, to=15000, increment=50, width=7
             )
@@ -147,13 +147,13 @@ class SettingsPanel(tk.Frame):
         self._cycle_list.bind("<<ListboxSelect>>", lambda _e: self._changed())
 
         self._error = tk.Label(body, bg=theme.P.bg, fg=theme.P.danger, font=theme.font(9), anchor="w", justify="left")
-        self._error.grid(row=10, column=0, sticky="w", padx=6, pady=(10, 0))
+        self._error.grid(row=10, column=0, sticky="w", padx=8, pady=(8, 0))
 
         self.refresh()
 
     def _section(self, row: int, key: str) -> None:
         label(self._body, tr(key), size=9, weight="bold", muted=True).grid(
-            row=row, column=0, sticky="w", padx=6, pady=(18 if row > 1 else 4, 6)
+            row=row, column=0, sticky="w", padx=8, pady=(16 if row > 1 else 4, 8)
         )
 
     def _combo(self, parent: tk.Misc, variable: tk.StringVar, values: list[str] | None = None) -> ttk.Combobox:
@@ -165,7 +165,7 @@ class SettingsPanel(tk.Frame):
 
     def _show_key_hint(self, text: str) -> None:
         if text:
-            self._key_hint.grid(row=3, column=0, sticky="w", padx=6, pady=(6, 0))
+            self._key_hint.grid(row=3, column=0, sticky="w", padx=8, pady=(8, 0))
             self._key_hint.configure(text=text)
         else:
             self._key_hint.grid_remove()

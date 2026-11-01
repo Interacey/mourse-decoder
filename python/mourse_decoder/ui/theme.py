@@ -45,14 +45,14 @@ class Palette:
 
 LIGHT = Palette(
     bg="#F5F5F5", surface="#E8E8EA", field="#F5F5F5", sidebar="#F5F5F5", border="#D3D3D7", glass="#FFFFFF",
-    text="#22252A", muted="#6B6F76", accent="#2b7bd6", accent_hover="#50555C", accent_fg="#F5F5F5",
-    accent_text="#2F3338", soft="#DCDCE0", soft_hover="#D0D0D5", soft_fg="#22252A", hover="#E2E2E5",
+    text="#22252A", muted="#6B6F76", accent="#074E81", accent_hover="#102D57", accent_fg="#F5F5F5",
+    accent_text="#074E81", soft="#DCDCE0", soft_hover="#D0D0D5", soft_fg="#22252A", hover="#E2E2E5",
     select="#E0E0E4", danger="#C62828", knob="#F5F5F5", knob_on="#F5F5F5", shadow=0.12,
 )
 DARK = Palette(
     bg="#2A2D31", surface="#34383D", field="#2B2F33", sidebar="#222528", border="#464B52", glass="#5C636B",
-    text="#D9DCE0", muted="#9AA1A9", accent="#bfe6ff", accent_hover="#FFFFFF", accent_fg="#22262A",
-    accent_text="#bfe6ff", soft="#454A51", soft_hover="#50565E", soft_fg="#E4E6E9", hover="#3F444A",
+    text="#D9DCE0", muted="#9AA1A9", accent="#6CB4CA", accent_hover="#8CC6D8", accent_fg="#1D1C22",
+    accent_text="#6CB4CA", soft="#454A51", soft_hover="#50565E", soft_fg="#E4E6E9", hover="#3F444A",
     select="#3F454C", danger="#E5645B", knob="#D5D8DC", knob_on="#2F3338", shadow=0.40,
 )
 # set by apply_theme; widgets read theme.P when they are created
@@ -60,9 +60,10 @@ P: Palette = LIGHT
 FONT = "Segoe UI"
 MONO = "Consolas"
 
-CARD_RADIUS = 24
-FIELD_RADIUS = 15
+CARD_RADIUS = 16
+FIELD_RADIUS = 10
 BUTTON_HEIGHT = 36
+BUTTON_RADIUS = 10
 CARD_MARGIN = 6  # room for the soft shadow around cards
 
 
@@ -80,7 +81,12 @@ def system_prefers_dark() -> bool:
         return False
 
 
+SEMIBOLD = ""  # "Segoe UI Semibold" is weight 600; Tk itself only knows 400 and 700
+
+
 def font(size: int = 10, weight: str = "normal") -> tuple[str, int, str]:
+    if weight == "bold" and SEMIBOLD:
+        return (SEMIBOLD, size, "normal")
     return (FONT, size, weight)
 
 
@@ -160,7 +166,7 @@ def shape_image(
 
 def apply_theme(root: tk.Misc, mode: str = "system") -> None:
     """Pick the palette (system/light/dark) and set all ttk styles."""
-    global P, FONT
+    global P, FONT, SEMIBOLD
     dark = system_prefers_dark() if mode == "system" else mode == "dark"
     P = DARK if dark else LIGHT
     _images.clear()
@@ -169,6 +175,7 @@ def apply_theme(root: tk.Misc, mode: str = "system") -> None:
         (f for f in ("Segoe UI Variable Text", "Segoe UI", "Helvetica Neue", "Helvetica") if f in families),
         "TkDefaultFont",
     )
+    SEMIBOLD = "Segoe UI Semibold" if FONT.startswith("Segoe UI") and "Segoe UI Semibold" in families else ""
 
     root.configure(bg=P.bg)
     for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont"):
@@ -275,7 +282,7 @@ class Button(tk.Canvas):
     """Pill button with a sheen. Variants: primary (selection color), secondary (gray), plain (text only)."""
 
     def __init__(self, master: tk.Misc, text: str, command=None, variant: str = "secondary", min_width: int = 0) -> None:
-        self._font = tkfont.Font(family=FONT, size=10, weight="bold" if variant == "primary" else "normal")
+        self._font = tkfont.Font(font=font(10, "bold" if variant == "primary" else "normal"))
         self._text, self._command, self._variant = text, command, variant
         self._min_width = min_width
         self._width = self._measure(text)
@@ -321,7 +328,7 @@ class Button(tk.Canvas):
         fill, fg, border = self._colors()
         if fill is not None:
             self._shape = shape_image(
-                self._width, BUTTON_HEIGHT, BUTTON_HEIGHT // 2, fill, border, P.glass if border else None, gloss=True
+                self._width, BUTTON_HEIGHT, BUTTON_RADIUS, fill, border, P.glass if border else None, gloss=True
             )
             self.create_image(0, 0, anchor="nw", image=self._shape)
         self.create_text(self._width / 2, BUTTON_HEIGHT / 2, text=self._text, fill=fg, font=self._font)
@@ -516,7 +523,7 @@ def text_box(master: tk.Misc, **kw: object) -> tk.Text:
     """Text input without its own border, put it in a RoundedBox (fit=False)."""
     options = dict(
         bg=P.surface, fg=P.text, insertbackground=P.text, selectbackground=P.select, selectforeground=P.text,
-        relief="flat", bd=0, highlightthickness=0, padx=16, pady=14, font=(MONO, 10), undo=True,
+        relief="flat", bd=0, highlightthickness=0, padx=16, pady=16, font=(MONO, 10), undo=True,
     )
     options.update(kw)
     return tk.Text(master, **options)

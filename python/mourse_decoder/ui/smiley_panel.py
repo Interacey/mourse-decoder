@@ -48,7 +48,7 @@ class SmileyPanel(tk.Frame):
         self._list.bind("<<ListboxSelect>>", self._on_select)
         actions = tk.Frame(left, bg=theme.P.bg)
         actions.grid(row=1, column=0, sticky="w", pady=(12, 0))
-        Button(actions, tr("alpha.import"), self._import).pack(side="left", padx=(0, 6))
+        Button(actions, tr("alpha.import"), self._import).pack(side="left", padx=(0, 8))
         Button(actions, tr("alpha.delete"), self._delete, variant="plain").pack(side="left")
 
         right = tk.Frame(self, bg=theme.P.bg)
@@ -64,7 +64,7 @@ class SmileyPanel(tk.Frame):
         tk.Label(
             right, textvariable=self._desc, bg=theme.P.bg, fg=theme.P.muted, font=theme.font(9), anchor="w",
             justify="left", wraplength=480,
-        ).grid(row=1, column=0, sticky="w", pady=(2, 10))
+        ).grid(row=1, column=0, sticky="w", pady=(2, 8))
 
         table = RoundedBox(right, fit=False)
         table.grid(row=2, column=0, sticky="nsew")
@@ -75,18 +75,18 @@ class SmileyPanel(tk.Frame):
         self._tree.column("smiley", width=120, anchor="w")
         bar = ttk.Scrollbar(table.body, orient="vertical", command=self._tree.yview)
         self._tree.configure(yscrollcommand=bar.set)
-        bar.pack(side="right", fill="y", padx=(0, 10), pady=10)
-        self._tree.pack(side="left", fill="both", expand=True, padx=(10, 0), pady=10)
+        bar.pack(side="right", fill="y", padx=(0, 8), pady=8)
+        self._tree.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=8)
 
         self._status = tk.StringVar()
         tk.Label(
             right, textvariable=self._status, bg=theme.P.bg, fg=theme.P.muted, font=theme.font(9), anchor="w",
             justify="left", wraplength=480,
-        ).grid(row=3, column=0, sticky="w", pady=(10, 0))
+        ).grid(row=3, column=0, sticky="w", pady=(8, 0))
 
         buttons = tk.Frame(right, bg=theme.P.bg)
         buttons.grid(row=4, column=0, sticky="w", pady=(12, 0))
-        Button(buttons, tr("alpha.use"), self._use, variant="primary", min_width=100).pack(side="left", padx=(0, 6))
+        Button(buttons, tr("alpha.use"), self._use, variant="primary", min_width=100).pack(side="left", padx=(0, 8))
         Button(buttons, tr("alpha.folder"), self._open_folder, variant="plain").pack(side="left")
 
         self.refresh()

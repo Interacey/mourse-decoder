@@ -30,9 +30,9 @@ class Splash(tk.Toplevel):
         body = tk.Frame(self, bg=theme.P.surface)
         body.pack(fill="both", expand=True)
         self._logo = ImageTk.PhotoImage(create_icon(True, 112))
-        tk.Label(body, image=self._logo, bg=theme.P.surface).pack(pady=(34, 10))
+        tk.Label(body, image=self._logo, bg=theme.P.surface).pack(pady=(36, 8))
         tk.Label(body, text=tr("app.name"), bg=theme.P.surface, fg=theme.P.text, font=theme.font(22, "bold")).pack()
-        tk.Label(body, text=tr("splash.loading"), bg=theme.P.surface, fg=theme.P.muted, font=theme.font(10)).pack(pady=(4, 18))
+        tk.Label(body, text=tr("splash.loading"), bg=theme.P.surface, fg=theme.P.muted, font=theme.font(10)).pack(pady=(4, 16))
 
         self._bar = tk.Canvas(body, width=220, height=10, bg=theme.P.surface, highlightthickness=0, bd=0)
         self._bar.pack()
