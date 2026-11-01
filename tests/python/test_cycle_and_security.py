@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 
 import pytest
 from mourse_decoder import i18n, macros
@@ -169,9 +170,9 @@ def test_network_paths_are_refused(path):
 
 def test_a_network_path_from_an_environment_variable_is_refused(monkeypatch):
     monkeypatch.setenv("MOURSE_SHARE", "\\\\evil.example\\share")
+    variable = "%MOURSE_SHARE%" if sys.platform == "win32" else "$MOURSE_SHARE"  # each system's own syntax
     with pytest.raises(macros.MacroError, match="Netzwerkpfade"):
-        macros.resolve_path("%MOURSE_SHARE%\\x.pdf")
-        macros.resolve_path("$MOURSE_SHARE/x.pdf")  # the same on systems without %VAR%
+        macros.resolve_path(variable + "\\x.pdf")
 
 
 @pytest.mark.parametrize("path", ["C:\\Windows", "relativ\\datei.txt", "~", "D:/Daten/x y.txt"])

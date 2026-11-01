@@ -55,10 +55,12 @@ def resolve_path(raw: str) -> str:
     Even looking whether ``\\\\server\\share`` exists makes Windows log in at that server and hand
     over the user's NTLM hash, so a macro from a stranger must never get that far.
     """
-    path = os.path.abspath(os.path.expandvars(os.path.expanduser(raw)))
-    if path.startswith(("\\\\", "//")):
+    expanded = os.path.expandvars(os.path.expanduser(raw))
+    # looked at before abspath: only Windows reads a backslash as a separator, and a path that starts
+    # with two of them must be refused whatever system the check runs on
+    if expanded.startswith(("\\\\", "//")):
         raise MacroError(f"Netzwerkpfade sind nicht erlaubt: {raw}. Nichts getippt.")
-    return path
+    return os.path.abspath(expanded)
 
 
 def commands_in_file(path: Path) -> list[str]:
