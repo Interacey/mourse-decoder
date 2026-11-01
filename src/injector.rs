@@ -149,7 +149,11 @@ mod win {
                     wVk: VIRTUAL_KEY(0), // must be zero for KEYEVENTF_UNICODE
                     wScan: unit,
                     dwFlags: KEYEVENTF_UNICODE
-                        | if up { KEYEVENTF_KEYUP } else { KEYBD_EVENT_FLAGS(0) },
+                        | if up {
+                            KEYEVENTF_KEYUP
+                        } else {
+                            KEYBD_EVENT_FLAGS(0)
+                        },
                     time: 0,
                     dwExtraInfo: 0,
                 },
@@ -170,7 +174,9 @@ mod win {
             // SAFETY: `events` is a valid slice of initialised INPUT structs
             let sent = unsafe { SendInput(&events, size_of::<INPUT>() as i32) };
             if sent != events.len() as u32 {
-                return Err(InjectError(format!("SendInput hat {sent} von 2 Ereignissen gesendet")));
+                return Err(InjectError(format!(
+                    "SendInput hat {sent} von 2 Ereignissen gesendet"
+                )));
             }
         }
         if pair {
