@@ -34,13 +34,18 @@ THEME_MODES: tuple[str, ...] = ("system", "light", "dark")
 # Keep in sync with TriggerKey::from_str in src/trigger.rs.
 _VK_PATTERN = re.compile(r"^VK(\d{1,3})$", re.IGNORECASE)
 _MOUSE_PATTERN = re.compile(r"^Mouse(\d{1,2})$", re.IGNORECASE)
+# F13..F24 are keys of their own (virtual-key codes 124..135); VK124 is the same key as F13
+_EXTRA_F_PATTERN = re.compile(r"^F(1[3-9]|2[0-4])$", re.IGNORECASE)
+_F13_VK = 124
 
 
 def is_valid_trigger(name: object) -> bool:
-    """True for the standard triggers, VK1..VK255 and Mouse4..Mouse32."""
+    """True for the standard triggers, F13..F24, VK1..VK255 and Mouse4..Mouse32."""
     if not isinstance(name, str):
         return False
     if name in TRIGGER_NAMES:
+        return True
+    if _EXTRA_F_PATTERN.match(name):
         return True
     if match := _VK_PATTERN.match(name):
         return 1 <= int(match.group(1)) <= 255
@@ -69,14 +74,54 @@ def is_valid_shortcut(spec: object) -> bool:
     return spec == "" or is_valid_binding(spec)
 
 
+# Spellings the Rust side accepts for the same modifier, see modifier_group in src/trigger.rs.
+_MODIFIER_ALIASES = {
+    "control": "ctrl", "strg": "ctrl", "umschalt": "shift", "windows": "win", "meta": "win",
+    "super": "win", "caps": "capslock", "feststell": "capslock",
+}
+_MODIFIER_ORDER = ("ctrl", "alt", "shift", "win", "capslock")
+_MODIFIER_NAMES = {"ctrl": "Ctrl", "alt": "Alt", "shift": "Shift", "win": "Win", "capslock": "CapsLock"}
+_TRIGGER_BY_LOWER = {name.lower(): name for name in TRIGGER_NAMES}
+
+
+def _canonical_key(key: str) -> str:
+    """Canonical spelling of a trigger name: ``f8`` -> ``F8``, ``vk124`` -> ``F13``, ``mouse5`` -> ``Mouse5``."""
+    lower = key.lower()
+    if lower in _TRIGGER_BY_LOWER:
+        return _TRIGGER_BY_LOWER[lower]
+    if match := _VK_PATTERN.match(key):
+        code = int(match.group(1))
+        return f"F{code - _F13_VK + 13}" if _F13_VK <= code <= _F13_VK + 11 else f"VK{code}"
+    if match := _MOUSE_PATTERN.match(key):
+        return f"Mouse{int(match.group(1))}"
+    if _EXTRA_F_PATTERN.match(key):
+        return f"F{int(key[1:])}"
+    return key
+
+
+def normalize_binding(spec: str) -> str:
+    """The form the Rust hook prints, e.g. ``strg+shift+vk124`` -> ``Ctrl+Shift+F13``.
+
+    Modifiers in the order Ctrl, Alt, Shift, Win, CapsLock; an invalid spec comes back stripped
+    but otherwise unchanged.
+    """
+    spec = spec.strip()
+    if not is_valid_binding(spec):
+        return spec
+    *modifiers, key = (part.strip().lower() for part in spec.split("+"))
+    wanted = {_MODIFIER_ALIASES.get(m, m) for m in modifiers}
+    names = [_MODIFIER_NAMES[m] for m in _MODIFIER_ORDER if m in wanted]
+    return "+".join([*names, _canonical_key(key.strip())])
+
+
 def same_binding(first: str, second: str) -> bool:
-    """True if both specs name the same keys; case, blanks and modifier order don't matter."""
+    """True if both specs name the same keys; case, blanks, modifier order and spellings don't matter."""
+    return normalize_binding(first).lower() == normalize_binding(second).lower() or _loose(first) == _loose(second)
 
-    def normalized(spec: str) -> tuple[frozenset[str], str]:
-        *modifiers, key = (part.strip().lower() for part in spec.split("+"))
-        return frozenset(modifiers), key
 
-    return normalized(first) == normalized(second)
+def _loose(spec: str) -> tuple[frozenset[str], str]:
+    *modifiers, key = (part.strip().lower() for part in spec.split("+"))
+    return frozenset(modifiers), key
 
 
 # same shape as an alphabet id (which is also its file name), see dictionary.py

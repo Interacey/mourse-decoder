@@ -60,6 +60,7 @@ class TrayApp:
             on_alphabets_changed=self._rebuild_menu,
             on_hide=self._hide_window,
             on_quit=self.quit,
+            config_dir=store.directory,
         )
         self._icon = pystray.Icon(
             "mourse-decoder",
@@ -84,6 +85,7 @@ class TrayApp:
                 log.exception("Fehler in UI-Aufgabe")
         self._poll_block()
         self._poll_cycle()
+        self._poll_function_keys()
         self._root.after(POLL_INTERVAL_MS, self._drain_queue)
 
     def _poll_block(self) -> None:
@@ -99,6 +101,13 @@ class TrayApp:
         # the shortcut works from any app, so say what happened (quietly, and only if wanted)
         if toggled.notifications:
             self._toast.show(tr("status.active") if toggled.enabled else tr("status.paused"), toggled.enabled)
+    def _poll_function_keys(self) -> None:
+        """Start the macros of function keys that were pressed; they run on their own threads."""
+        try:
+            self._controller.poll_function_keys()
+        except Exception:  # noqa: BLE001 - polling must never stop the UI loop
+            log.exception("Funktionstasten konnten nicht abgefragt werden")
+
     def _poll_cycle(self) -> None:
         """The cycle shortcut switches to the next alphabet of the user's list and says which one is active."""
         presses = self._controller.poll_cycle()

@@ -7,6 +7,10 @@ use std::borrow::Cow;
 use std::fmt;
 use std::str::FromStr;
 
+/// Virtual-key codes of F13 and F24 (VK_F13..VK_F24 are consecutive).
+const F13_VK: u16 = 124;
+const F24_VK: u16 = 135;
+
 /// Allowed triggers. The names (see [`TriggerKey::name`]) are the stable interface to
 /// the Python configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -40,7 +44,8 @@ pub enum TriggerKey {
     MouseMiddle,
     // any other input (not in `ALL`, but valid)
     /// Any keyboard key by its Windows virtual-key code (1..=255), named `VK<code>`,
-    /// e.g. `VK65` for A.
+    /// e.g. `VK65` for A. F13..F24 (codes 124..=135) are named `F13`..`F24` instead;
+    /// `VK124` still parses and means the same key.
     Vk(u16),
     /// Extra mouse button from Mouse4 on (`Mouse4`, `Mouse5`, ...).
     MouseButton(u8),
@@ -75,6 +80,9 @@ impl TriggerKey {
     /// Stable ASCII name for config files.
     pub fn name(self) -> Cow<'static, str> {
         match self {
+            TriggerKey::Vk(code @ F13_VK..=F24_VK) => {
+                Cow::Owned(format!("F{}", code - F13_VK + 13))
+            }
             TriggerKey::Vk(code) => Cow::Owned(format!("VK{code}")),
             TriggerKey::MouseButton(n) => Cow::Owned(format!("Mouse{n}")),
             other => Cow::Borrowed(other.legacy_name()),
@@ -158,6 +166,11 @@ impl FromStr for TriggerKey {
             return Ok(found);
         }
         let lower = wanted.to_ascii_lowercase();
+        if let Some(n) = lower.strip_prefix('f').and_then(|n| n.parse::<u16>().ok()) {
+            if (13..=24).contains(&n) && lower.len() == 3 {
+                return Ok(TriggerKey::Vk(F13_VK + n - 13));
+            }
+        }
         if let Some(code) = lower.strip_prefix("vk").and_then(|n| n.parse::<u16>().ok()) {
             if (1..=255).contains(&code) {
                 return Ok(TriggerKey::Vk(code));
@@ -218,6 +231,28 @@ impl KeyBinding {
 
     pub fn requires_caps_lock(&self) -> bool {
         self.required & CAPS_LOCK != 0
+    }
+
+    /// True if the binding needs a modifier of the given group (`CTRL`, `ALT`, ...).
+    pub fn requires(&self, group: ModifierMask) -> bool {
+        self.required & group != 0
+    }
+
+    /// True if the held Ctrl/Alt/Shift/Win groups are exactly the required ones, so `F13`
+    /// does not fire under `Ctrl+F13` and the other way round. Caps Lock is a toggle:
+    /// it only has to be held if the binding asks for it.
+    pub fn modifiers_exact(&self, held: ModifierMask) -> bool {
+        let groups_match = [CTRL, ALT, SHIFT, WIN]
+            .iter()
+            .all(|&g| (self.required & g != 0) == (held & g != 0));
+        groups_match && (self.required & CAPS_LOCK == 0 || held & CAPS_LOCK != 0)
+    }
+
+    /// True if `self` (which matches with extra modifiers allowed) fires whenever
+    /// `other` is pressed with exactly its modifiers: same key, and `self` needs
+    /// no modifier that `other` lacks.
+    pub fn fires_with(&self, other: &KeyBinding) -> bool {
+        self.key == other.key && self.required & !other.required == 0
     }
 }
 
@@ -376,6 +411,71 @@ mod tests {
         ] {
             assert!(bad.parse::<TriggerKey>().is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn f13_to_f24_are_named_keys_for_their_virtual_key_codes() {
+        for n in 13..=24u16 {
+            let name = format!("F{n}");
+            let key: TriggerKey = name.parse().unwrap();
+            assert_eq!(key, TriggerKey::Vk(124 + n - 13), "{name}");
+            assert_eq!(key.name(), name);
+            assert_eq!(key.name().parse::<TriggerKey>(), Ok(key));
+            assert_eq!(
+                format!("VK{}", 124 + n - 13).parse::<TriggerKey>(),
+                Ok(key),
+                "old spelling still parses"
+            );
+        }
+        assert_eq!(" f13 ".parse::<TriggerKey>(), Ok(TriggerKey::Vk(124)));
+        assert_eq!(
+            "Ctrl+Alt+f24".parse::<KeyBinding>().unwrap().to_string(),
+            "Ctrl+Alt+F24"
+        );
+        for bad in ["F0", "F25", "F100", "F013", "F+13", "F"] {
+            assert!(bad.parse::<TriggerKey>().is_err(), "{bad}");
+        }
+        assert_eq!(TriggerKey::Vk(123).name(), "VK123");
+        assert_eq!(TriggerKey::Vk(136).name(), "VK136");
+    }
+
+    #[test]
+    fn exact_modifiers_tell_f13_from_ctrl_f13() {
+        let plain: KeyBinding = "F13".parse().unwrap();
+        let ctrl: KeyBinding = "Ctrl+F13".parse().unwrap();
+        let all: KeyBinding = "Ctrl+Alt+Shift+Win+F13".parse().unwrap();
+        let (left_ctrl, right_ctrl, alt, shift, win) = (0b01, 0b10, 0b100, 0b1_0000, 0b100_0000);
+        assert!(plain.modifiers_exact(0));
+        assert!(!plain.modifiers_exact(left_ctrl));
+        assert!(ctrl.modifiers_exact(left_ctrl));
+        assert!(
+            ctrl.modifiers_exact(left_ctrl | right_ctrl),
+            "both sides are one group"
+        );
+        assert!(!ctrl.modifiers_exact(0));
+        assert!(!ctrl.modifiers_exact(left_ctrl | shift));
+        assert!(all.modifiers_exact(left_ctrl | alt | shift | win));
+        assert!(!all.modifiers_exact(left_ctrl | alt | shift));
+        assert!(
+            plain.modifiers_exact(CAPS_LOCK),
+            "Caps Lock state is ignored unless required"
+        );
+        let caps: KeyBinding = "CapsLock+F13".parse().unwrap();
+        assert!(!caps.modifiers_exact(0));
+        assert!(caps.modifiers_exact(CAPS_LOCK));
+    }
+
+    #[test]
+    fn fires_with_finds_shadowing_bindings() {
+        let b = |s: &str| s.parse::<KeyBinding>().unwrap();
+        assert!(b("F13").fires_with(&b("F13")));
+        assert!(
+            b("F13").fires_with(&b("Ctrl+F13")),
+            "F13 also fires with Ctrl held"
+        );
+        assert!(!b("Ctrl+F13").fires_with(&b("F13")));
+        assert!(!b("F13").fires_with(&b("F14")));
+        assert!(!b("Ctrl+F13").fires_with(&b("Alt+F13")));
     }
 
     #[test]

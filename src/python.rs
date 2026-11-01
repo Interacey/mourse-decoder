@@ -302,6 +302,66 @@ impl PyMorseEngine {
         }
     }
 
+    /// Replaces the function-key slots with `(slot 1..100, binding, swallow)` entries, e.g.
+    /// `(13, "F13", True)`. ValueError (German text) if an entry is invalid, appears twice
+    /// or clashes with the Morse keys or shortcuts; nothing changes then. Swallowing only
+    /// works on Windows, elsewhere the keys always reach the focused app.
+    fn set_function_keys(&self, entries: Vec<(u16, String, bool)>) -> PyResult<()> {
+        #[cfg(feature = "native-io")]
+        {
+            crate::hooks::set_function_keys(&entries).map_err(PyValueError::new_err)
+        }
+        #[cfg(not(feature = "native-io"))]
+        {
+            let _ = entries;
+            Err(PyRuntimeError::new_err("Ohne Feature 'native-io' gebaut"))
+        }
+    }
+
+    /// Removes all function-key slots.
+    fn clear_function_keys(&self) {
+        #[cfg(feature = "native-io")]
+        crate::hooks::clear_function_keys();
+    }
+
+    /// Slot number (1..100) of the oldest fired slot, `None` if none is waiting.
+    fn poll_function_key(&self) -> Option<u16> {
+        #[cfg(feature = "native-io")]
+        {
+            crate::hooks::poll_function_key()
+        }
+        #[cfg(not(feature = "native-io"))]
+        {
+            None
+        }
+    }
+
+    /// True if no Ctrl, Alt, Shift or Win key is held. A slot fired with such keys down,
+    /// and a macro typed meanwhile would turn into shortcuts, so wait for this first.
+    fn function_key_modifiers_released(&self) -> bool {
+        #[cfg(feature = "native-io")]
+        {
+            crate::hooks::keyboard_modifiers_released()
+        }
+        #[cfg(not(feature = "native-io"))]
+        {
+            true
+        }
+    }
+
+    /// True once if Esc was pressed twice within 500 ms since the last call (reads and
+    /// clears the flag).
+    fn poll_abort(&self) -> bool {
+        #[cfg(feature = "native-io")]
+        {
+            crate::function_keys::take_abort()
+        }
+        #[cfg(not(feature = "native-io"))]
+        {
+            false
+        }
+    }
+
     #[getter]
     fn is_running(&self) -> bool {
         lock_or_recover(&self.state)

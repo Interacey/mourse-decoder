@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import tkinter as tk
 from collections.abc import Callable
+from pathlib import Path
 
 from PIL import ImageTk
 
@@ -74,7 +75,7 @@ class _NavItem(tk.Canvas):
 class MainWindow:
     """Builds the UI inside the existing tk.Tk root."""
 
-    TABS = ("settings", "alphabets", "smileys", "live", "translator", "update", "credits")
+    TABS = ("settings", "alphabets", "smileys", "functionkeys", "live", "translator", "update", "credits")
     _GLYPHS = {t: t for t in TABS}
 
     def __init__(
@@ -86,6 +87,7 @@ class MainWindow:
         on_alphabets_changed: Callable[[], None],
         on_hide: Callable[[], None],
         on_quit: Callable[[], None],
+        config_dir: Path | None = None,
     ) -> None:
         self._root = root
         self._controller = controller
@@ -94,6 +96,7 @@ class MainWindow:
         self._on_alphabets_changed = on_alphabets_changed
         self._on_hide = on_hide
         self._on_quit = on_quit
+        self._config_dir = config_dir
         self._page = "settings"
         self._icon_image: ImageTk.PhotoImage | None = None
         self._rendered: tuple[str, str] = ("", "")
@@ -200,6 +203,11 @@ class MainWindow:
             from .smiley_panel import SmileyPanel
 
             page = SmileyPanel(stack, c, d, apply, on_changed=self._changed)
+        elif name == "functionkeys":
+            from ..function_keys import FunctionKeysStore
+            from .function_keys_panel import FunctionKeysPanel
+
+            page = FunctionKeysPanel(stack, c, FunctionKeysStore(self._config_dir))
         elif name == "live":
             from .live_panel import LivePanel
 
@@ -290,7 +298,7 @@ class MainWindow:
         if s.sidebar_collapsed != self._collapsed:
             self._collapsed = s.sidebar_collapsed
             self._apply_collapsed()
-        for name in ("settings", "alphabets", "smileys", "live", "translator"):
+        for name in ("settings", "alphabets", "smileys", "functionkeys", "live", "translator"):
             if (page := self._pages.get(name)) is not None:
                 page.refresh()
         self._update_status()

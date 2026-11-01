@@ -20,6 +20,7 @@ from typing import Protocol
 from . import clipboard, desktop, macros
 from .decoders import Decoder, Emission, create_decoder
 from .dictionary import DictionaryManager
+from .function_keys import FunctionKeys, Slot
 from .settings import Settings
 
 log = logging.getLogger(__name__)
@@ -45,6 +46,15 @@ class EngineLike(Protocol):
     def stop(self) -> None: ...
     def configure(self, dot_threshold_ms: int, letter_gap_ms: int, word_gap_ms: int = 0) -> None: ...
     def reset(self) -> None: ...
+    def set_function_keys(self, entries: list[tuple[int, str, bool]]) -> None:
+        """Install (slot, trigger, swallow) entries; ValueError if one is invalid or clashes."""
+    def clear_function_keys(self) -> None: ...
+    def poll_function_key(self) -> int | None:
+        """Slot number of the oldest fired function key, None if none is waiting."""
+    def function_key_modifiers_released(self) -> bool:
+        """True if no Ctrl, Alt, Shift or Win key is held."""
+    def poll_abort(self) -> bool:
+        """True once after Esc was pressed twice within 500 ms; reading clears it."""
 
 
 class InjectorLike(Protocol):
@@ -147,6 +157,7 @@ class MorseController:
     WINDOW_TIMEOUT_S = 10.0  # for {WaitWindow …}; slow apps like a cold Firefox start need a few seconds
     POLL_S = 0.05  # how often waits look at the window title and the on/off switch
     TYPE_CHUNK = 100  # characters typed between two looks at the on/off switch (about 2 s)
+    MODIFIER_TIMEOUT_S = 3.0  # a function key waits this long for Ctrl/Alt/Shift/Win to be let go
 
     def __init__(
         self,
@@ -168,6 +179,9 @@ class MorseController:
         self._running = False
         self._cycle_seen = 0
         self._settings = settings
+        self._function_keys = FunctionKeys()
+        # held while a macro types, whether a Morse letter or a function key started it
+        self._macro_lock = threading.Lock()
         try:
             dictionaries.set_smileys(settings.smileys)
         except ValueError as exc:  # set deleted or broken: start without smileys instead of crashing
@@ -199,6 +213,10 @@ class MorseController:
             self._cycle_seen = int(self._engine.cycle_count)  # the counter lives as long as the process
             self._engine.start(self._on_engine_event, use_hook=self._use_hook)
             self._running = True
+            try:
+                self._install_function_keys()
+            except ValueError as exc:  # e.g. the Morse key was changed to a trigger a slot uses
+                self._notify("on_error", f"Funktionstasten nicht aktiv: {exc}")
 
     def stop(self) -> None:
         # engine.stop() waits for the worker, which may be blocked on our lock,
@@ -208,10 +226,11 @@ class MorseController:
                 return
             self._running = False
         self._engine.block_input = False  # never leave the key blocked behind
+        self._engine.clear_function_keys()
         self._engine.stop()
 
     def apply_settings(self, new: Settings) -> None:
-        errors = new.validate()
+        errors = new.validate() or self._function_keys.clashes(new)
         if errors:
             raise ValueError("; ".join(errors))
         with self._lock:
@@ -273,6 +292,105 @@ class MorseController:
             presses, self._cycle_seen = (count - self._cycle_seen) % 2**32, count
             return presses
 
+    @property
+    def function_keys(self) -> FunctionKeys:
+        """The slots that were applied last."""
+        return self._function_keys
+
+    def check_shortcut(self, combo: str) -> None:
+        """ValueError if ``combo`` is no key combination; the UI checks macros with it before saving."""
+        self._injector.check_shortcut(combo)
+
+    def apply_function_keys(self, keys: FunctionKeys) -> None:
+        """Make ``keys`` the active slots. ValueError (German text) and no change if they are invalid.
+
+        Checks the slots against the current settings (a trigger that the Morse key or a shortcut
+        also reacts to is refused) and parses every macro first.
+        """
+        with self._lock:
+            errors = keys.validate(self._settings, self._injector.check_shortcut)
+            if errors:
+                raise ValueError("; ".join(errors))
+            previous = self._function_keys
+            self._function_keys = keys
+            try:
+                self._install_function_keys()
+            except ValueError:
+                self._function_keys = previous  # the hook refused; it still holds the old table
+                raise
+
+    def _install_function_keys(self) -> None:
+        """Send the active slots to the hook; only while running, ``start`` calls this again."""
+        if not self._running:
+            return
+        self._engine.set_function_keys([(s.slot, s.trigger, s.swallow) for s in self._function_keys.active_slots()])
+
+    def poll_function_keys(self) -> list[int]:
+        """Start the macros of slots whose trigger was pressed since the last call; returns their numbers.
+
+        Does not block: each macro runs on its own thread. A trigger that arrives while another macro
+        is typing is dropped. Errors reach the listener's ``on_error``.
+        """
+        started: list[int] = []
+        if not self._running:
+            return started
+        while (number := self._engine.poll_function_key()) is not None:
+            reason = self.run_slot(number)
+            if reason is None:
+                started.append(number)
+            else:
+                log.info("Funktionstaste F%d nicht ausgeführt: %s", number, reason)
+        return started
+
+    def run_slot(self, number: int, block: bool = False) -> str | None:
+        """Run the macro of a slot as if its trigger was pressed; for the test button.
+
+        Returns None when the macro was started (``block=True`` waits until it is done, for tests),
+        otherwise the reason why not: another macro runs, Morse input is off, the slot is off or has
+        no macro, or its macro is broken. A slot without a trigger can be run this way.
+        Waits up to ``MODIFIER_TIMEOUT_S`` for held Ctrl/Alt/Shift/Win keys.
+        """
+        with self._lock:
+            slot = self._function_keys.slot(number)
+            if not (slot.enabled and slot.macro.strip()):  # no trigger needed: the test button runs it from the UI
+                return f"{slot.name} ist ausgeschaltet oder hat kein Makro."
+            if not (self._settings.enabled and self._engine.active):
+                return "Die Morse-Eingabe ist ausgeschaltet."
+        try:
+            macros.parse(slot.macro, self._injector.check_shortcut)  # a broken macro is reported right away
+        except macros.MacroError as exc:
+            return str(exc)
+        if not self._macro_lock.acquire(blocking=False):
+            return "Ein anderes Makro läuft noch."
+        if block:
+            self._run_slot_locked(slot)
+        else:
+            threading.Thread(target=self._run_slot_locked, args=(slot,), name=f"macro-{slot.name}", daemon=True).start()
+        return None
+
+    def _run_slot_locked(self, slot: Slot) -> None:
+        """Body of a slot run; the caller holds ``_macro_lock``, released here."""
+        try:
+            self._engine.poll_abort()  # an Esc, Esc from before does not count
+            self._wait_for_modifiers_released()
+            self._emit_steps(Emission(slot.macro))
+        except macros.MacroStopped as exc:
+            log.info("%s: %s", slot.name, exc)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Fehler in %s: %s", slot.name, exc)
+            self._notify("on_error", f"{slot.name}: {exc}")
+        finally:
+            self._macro_lock.release()
+
+    def _wait_for_modifiers_released(self) -> None:
+        """Typed while Ctrl/Alt/Shift/Win are still down, text would turn into shortcuts."""
+        deadline = time.monotonic() + self.MODIFIER_TIMEOUT_S
+        while not self._engine.function_key_modifiers_released():
+            if time.monotonic() > deadline:
+                raise macros.MacroError("Ctrl, Alt, Shift oder Win sind noch gedrückt – Makro nicht ausgeführt.")
+            time.sleep(self.POLL_S)
+            self._stop_if_switched_off()
+
     def reload_alphabet(self) -> None:
         """Reload the active alphabet after its file changed."""
         with self._lock:
@@ -318,6 +436,17 @@ class MorseController:
             self._emit(emission)
 
     def _emit(self, emission: Emission) -> None:
+        # one macro at a time: output of a Morse letter that arrives while a function key types is dropped
+        if not self._macro_lock.acquire(blocking=False):
+            log.info("Ausgabe verworfen, weil gerade ein Makro tippt")
+            return
+        try:
+            self._engine.poll_abort()  # an Esc, Esc from before does not count
+            self._emit_steps(emission)
+        finally:
+            self._macro_lock.release()
+
+    def _emit_steps(self, emission: Emission) -> None:
         # typing takes a few ms, so do it outside the lock to not block apply_settings
         steps = macros.parse(emission.text, self._injector.check_shortcut)  # first, so a broken macro changes nothing
         self._check_paths(steps)
@@ -383,6 +512,8 @@ class MorseController:
         # the on/off shortcut flips engine.active right away, also while a macro runs
         if not self._engine.active:
             raise macros.MacroStopped("Makro gestoppt, weil die Morse-Eingabe ausgeschaltet wurde.")
+        if self._engine.poll_abort():  # Esc, Esc
+            raise macros.MacroStopped("Makro abgebrochen (zweimal Esc).")
 
     def _sleep(self, seconds: float) -> None:
         """time.sleep in small steps, so switching Morse input off stops a long wait."""

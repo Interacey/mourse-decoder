@@ -565,6 +565,9 @@ def draw_glyph(canvas: tk.Canvas, name: str, cx: float, cy: float, color: str, t
     elif name == "smileys":  # speech bubble
         canvas.create_polygon(x + 1, y + 2, x + 17, y + 2, x + 17, y + 12, x + 8, y + 12, x + 4, y + 17, x + 4, y + 12, x + 1, y + 12,
                               fill="", outline=color, width=2, joinstyle="round", tags=tag)
+    elif name == "functionkeys":  # key cap with an F
+        _round_rect(canvas, x + 1, y + 2, x + 17, y + 16, 4, fill="", outline=color, width=2, joinstyle="round", tags=tag)
+        canvas.create_text(cx, cy + 1, text="F", fill=color, font=font(9, "bold"), tags=tag)
     elif name == "live":  # pulse line
         canvas.create_line(x, y + 9, x + 4, y + 9, x + 7, y + 2, x + 11, y + 16, x + 14, y + 9, x + 18, y + 9, joinstyle="round", **line)
     elif name == "translator":  # two rows of Morse marks
