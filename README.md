@@ -75,6 +75,37 @@ A code in a smiley set can output any text, however long, and press key combinat
 
 `{Loop 3}…{EndLoop}` repeats everything in between (text, keys, waits) three times. Loops can be nested. At most 1000 repetitions per loop and one million characters in total are allowed. A loop without its `{EndLoop}` stops the macro before anything is typed.
 
+Inside a loop a counter is available. It starts at 0. `{Loop 5 n}` names it `n` (any name made of letters, digits and `_`, not starting with a digit); without a name it is `i`. `[n]` types its value, `[= …]` types the result of a calculation. Square brackets are used because `{i}` stays the key `i`:
+
+```
+{Loop 5 i}[i] {EndLoop}                          0 1 2 3 4
+{Loop 5}[= i*2+1] {EndLoop}                      1 3 5 7 9
+{Loop 3 j}{Loop 2 i}[= i+j*10] {EndLoop}{EndLoop}  0 1 10 11 20 21
+```
+
+German: `{Schleife 3 i}…{SchleifenEnde}`. A calculation knows whole numbers, counters, `+ - * / %`, parentheses and a leading `-` or `+`; there is no `**`. `/` and `%` cut toward zero like in C (`-7/2` is `-3`, `-7%2` is `-1`). No number may exceed 10^15 (neither a result nor one in between), a calculation has at most 200 characters and 32 nested parentheses. Every loop has its own counter; an inner counter with the same name hides the outer one (`{Loop 2 i}{Loop 3 i}[i]{EndLoop}{EndLoop}` types `012012`).
+
+Square brackets stay plain text unless they are a counter: `[name]` counts only if `name` is exactly the counter of a surrounding loop, and `[= …]` only inside a loop and if a letter, digit or parenthesis follows the `=` (after an optional sign). So `[1]`, `[x]`, `[=)]` and everything outside a loop are typed as they are. Inside a loop, a `[= …]` with an unknown counter, a division by 0, a typo or a too long calculation stops the macro before anything is typed. To type a literal `[i]` inside a loop, write `\[i]` (see below).
+
+Counters exist only in the loop body of the one macro that defines them: after `{EndLoop}` the name is gone (`[i]` is text again), a second loop does not see the counter of the first, and one macro never sees another one's counters.
+
+**Literal brackets.** A backslash in front of one of `[ ] ( ) { }` types that character as plain text and disappears. It works everywhere in the macro text, in loops or not, and an escaped character never starts a command or a counter:
+
+| Written | Typed |
+| --- | --- |
+| `\{Wait 100}` | `{Wait 100}` (no wait) |
+| `\[i]` | `[i]` (not the counter, also in a loop with counter `i`) |
+| `\[= i+1]` | `[= i+1]` |
+| `\(` `\)` `\{` `\}` `\]` | `(` `)` `{` `}` `]` |
+
+Edge cases:
+
+- `\\` directly before one of the six characters types one backslash and the bracket keeps its meaning: `\\[i]` types `\` and the counter. Any other `\\` stays two backslashes.
+- A backslash before any other character, or at the end of the text, is typed as it is (`C:\Users`, `\a`). Before a command's `{` it is an escape: to type a backslash right before `{Enter}`, put something between them or write `\\{Enter}`.
+- Inside `{File …}`, `{Folder …}` and `{WaitWindow …}` no escape is processed, so Windows paths keep their backslashes. A `\{` in the text in front of such a token still stops it from being a command.
+- A command ends at the first `}`. `\}` inside a command (`{Wait 100\}`) does not keep it open; it ends the command, which is then reported as an error.
+- Counter values are put in after all escapes were handled and are never searched for escapes or brackets again.
+
 Modifiers: `Ctrl`/`Strg`, `Alt`, `Shift`/`Umschalt`, `Win`/`Windows`. Keys: one character, `F1`–`F12`, `Enter`/`Eingabe`, `Tab`, `Esc`, `Backspace`/`Rücktaste`, `Delete`/`Entf`, `Space`/`Leertaste`, `Home`/`Pos1`, `End`/`Ende`, `PageUp`/`BildAuf`, `PageDown`/`BildAb`, `Up`/`Hoch`, `Down`/`Runter`, `Left`/`Links`, `Right`/`Rechts`. The commands have German names too: `{Warte 500}`, `{WarteFenster …}`, `{Schleife 3}…{SchleifenEnde}`.
 
 Protection against mistakes:
