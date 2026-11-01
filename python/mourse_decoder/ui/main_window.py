@@ -14,14 +14,7 @@ from ..easter_egg import bind_sos
 from ..i18n import set_language, tr
 from ..settings import Settings
 from . import theme
-from .alphabet_panel import AlphabetPanel
-from .battleship_window import BattleshipWindow
-from .credits_panel import CreditsPanel
 from .icon import create_icon
-from .live_panel import LivePanel
-from .settings_panel import SettingsPanel
-from .smiley_panel import SmileyPanel
-from .translator_panel import TranslatorPanel
 
 log = logging.getLogger(__name__)
 
@@ -65,7 +58,7 @@ class _NavItem(tk.Canvas):
             fill = ""
         if fill and width > 8:
             self._shape = theme.shape_image(
-                width - 4, ITEM_HEIGHT - 4, 18, fill, theme.P.border if self._selected else None, theme.P.glass, gloss=True
+                width - 4, ITEM_HEIGHT - 4, 10, fill, theme.P.border if self._selected else None, theme.P.glass, gloss=True
             )
             self.create_image(2, 2, anchor="nw", image=self._shape)
         color = theme.P.accent_text if self._selected else theme.P.text
@@ -81,8 +74,8 @@ class _NavItem(tk.Canvas):
 class MainWindow:
     """Builds the UI inside the existing tk.Tk root."""
 
-    TABS = ("settings", "alphabets", "smileys", "live", "translator", "credits")
-    _GLYPHS = {"settings": "settings", "alphabets": "alphabets", "smileys": "smileys", "live": "live", "translator": "translator", "credits": "credits"}
+    TABS = ("settings", "alphabets", "smileys", "live", "translator", "update", "credits")
+    _GLYPHS = {t: t for t in TABS}
 
     def __init__(
         self,
@@ -92,6 +85,7 @@ class MainWindow:
         apply_settings: Callable[[Settings], None],
         on_alphabets_changed: Callable[[], None],
         on_hide: Callable[[], None],
+        on_quit: Callable[[], None],
     ) -> None:
         self._root = root
         self._controller = controller
@@ -99,11 +93,12 @@ class MainWindow:
         self._apply_settings = apply_settings
         self._on_alphabets_changed = on_alphabets_changed
         self._on_hide = on_hide
+        self._on_quit = on_quit
         self._page = "settings"
         self._icon_image: ImageTk.PhotoImage | None = None
         self._rendered: tuple[str, str] = ("", "")
         self._rebuild_pending = False
-        self._battleship: BattleshipWindow | None = None
+        self._battleship: tk.Toplevel | None = None
 
         root.geometry("1040x740")
         root.minsize(900, 700)
@@ -136,7 +131,7 @@ class MainWindow:
         self._sidebar.rowconfigure(2, weight=1)
 
         self._brand = tk.Frame(self._sidebar, bg=theme.P.sidebar)
-        self._brand.grid(row=0, column=0, sticky="ew", padx=14, pady=(22, 18))
+        self._brand.grid(row=0, column=0, sticky="ew", padx=16, pady=(24, 16))
         self._brand_logo = ImageTk.PhotoImage(create_icon(True, 34))
         self._brand_image = tk.Label(self._brand, image=self._brand_logo, bg=theme.P.sidebar)
         bind_sos(self._brand_image, self.open_battleship)  # easter egg: click SOS on the icon
@@ -145,16 +140,16 @@ class MainWindow:
         )
 
         self._nav_frame = tk.Frame(self._sidebar, bg=theme.P.sidebar)
-        self._nav_frame.grid(row=1, column=0, sticky="ew", padx=10)
+        self._nav_frame.grid(row=1, column=0, sticky="ew", padx=8)
 
         bottom = tk.Frame(self._sidebar, bg=theme.P.sidebar)
-        bottom.grid(row=3, column=0, sticky="ew", padx=10, pady=(0, 16))
+        bottom.grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 16))
         self._status = tk.Label(
             bottom, bg=theme.P.sidebar, fg=theme.P.muted, font=theme.font(9), anchor="w", justify="left", wraplength=180
         )
         self._toggle = _NavItem(bottom, "sidebar", "", self._toggle_sidebar)
         self._toggle.pack(side="bottom", fill="x")
-        self._status.pack(side="bottom", fill="x", padx=14, pady=(0, 10))
+        self._status.pack(side="bottom", fill="x", padx=16, pady=(0, 8))
         tk.Frame(root, bg=theme.P.border, width=1).grid(row=0, column=0, sticky="nse")
 
         # content
@@ -163,40 +158,76 @@ class MainWindow:
         content.columnconfigure(0, weight=1)
         content.rowconfigure(1, weight=1)
         self._heading = tk.Label(content, bg=theme.P.bg, fg=theme.P.text, font=theme.font(24, "bold"), anchor="w")
-        self._heading.grid(row=0, column=0, sticky="ew", padx=36, pady=(26, 14))
+        self._heading.grid(row=0, column=0, sticky="ew", padx=36, pady=(24, 16))
         stack = tk.Frame(content, bg=theme.P.bg)
-        stack.grid(row=1, column=0, sticky="nsew", padx=36, pady=(0, 30))
+        stack.grid(row=1, column=0, sticky="nsew", padx=36, pady=(0, 32))
         stack.columnconfigure(0, weight=1)
         stack.rowconfigure(0, weight=1)
 
-        def changed() -> None:
-            self.sync()
-            self._on_alphabets_changed()
-
-        self.settings_panel = SettingsPanel(stack, self._controller, self._dictionaries, self._apply_settings)
-        self.alphabet_panel = AlphabetPanel(stack, self._controller, self._dictionaries, self._apply_settings, on_changed=changed)
-        self.smiley_panel = SmileyPanel(stack, self._controller, self._dictionaries, self._apply_settings, on_changed=changed)
-        self.live_panel = LivePanel(stack, self._controller)
-        self.translator_panel = TranslatorPanel(stack, self._controller, self._dictionaries)
-        self.credits_panel = CreditsPanel(stack, on_easter_egg=self.open_battleship)
-        self._pages = {
-            "settings": self.settings_panel,
-            "alphabets": self.alphabet_panel,
-            "smileys": self.smiley_panel,
-            "live": self.live_panel,
-            "translator": self.translator_panel,
-            "credits": self.credits_panel,
-        }
+        self._stack = stack
+        self._pages = {}  # built when first shown: unopened pages cost no memory
         self._nav: dict[str, _NavItem] = {}
-        for key, page in self._pages.items():
+        for key in self.TABS:
             item = _NavItem(self._nav_frame, self._GLYPHS[key], tr(f"nav.{key}"), lambda k=key: self.show_tab(k))
             item.pack(fill="x", pady=2)
             self._nav[key] = item
-            page.grid(row=0, column=0, sticky="nsew")
         self._apply_collapsed()
-        self.show_tab(self._page)
+        if self.visible:  # a window that starts in the tray builds its page when it is first shown
+            self.show_tab(self._page)
+        else:
+            self._highlight(self._page)
         self._update_status()
 
+    def _changed(self) -> None:
+        self.sync()
+        self._on_alphabets_changed()
+
+    def _page_widget(self, name: str) -> tk.Frame:
+        """The page ``name``, built on first use (its module is only imported then, too)."""
+        page = self._pages.get(name)
+        if page is not None:
+            return page
+        stack, c, d, apply = self._stack, self._controller, self._dictionaries, self._apply_settings
+        if name == "settings":
+            from .settings_panel import SettingsPanel
+
+            page = SettingsPanel(stack, c, d, apply)
+        elif name == "alphabets":
+            from .alphabet_panel import AlphabetPanel
+
+            page = AlphabetPanel(stack, c, d, apply, on_changed=self._changed)
+        elif name == "smileys":
+            from .smiley_panel import SmileyPanel
+
+            page = SmileyPanel(stack, c, d, apply, on_changed=self._changed)
+        elif name == "live":
+            from .live_panel import LivePanel
+
+            page = LivePanel(stack, c)
+        elif name == "translator":
+            from .translator_panel import TranslatorPanel
+
+            page = TranslatorPanel(stack, c, d)
+        elif name == "update":
+            from .update_panel import UpdatePanel
+
+            page = UpdatePanel(stack, self._on_quit)
+        else:
+            from .credits_panel import CreditsPanel
+
+            page = CreditsPanel(stack, on_easter_egg=self.open_battleship)
+        page.grid(row=0, column=0, sticky="nsew")
+        self._pages[name] = page
+        return page
+
+    def add_symbol(self, symbol: str) -> None:
+        """For the live page, if it has been opened (it shows what happens from then on)."""
+        if (live := self._pages.get("live")) is not None:
+            live.add_symbol(symbol)
+
+    def add_letter(self, sequence: str, text: str | None) -> None:
+        if (live := self._pages.get("live")) is not None:
+            live.add_letter(sequence, text)
     def _apply_collapsed(self) -> None:
         collapsed = self._collapsed
         self._sidebar.configure(width=COLLAPSED_WIDTH if collapsed else EXPANDED_WIDTH)
@@ -206,9 +237,9 @@ class MainWindow:
             self._brand_image.pack()
             self._status.pack_forget()
         else:
-            self._brand_image.pack(side="left", padx=(6, 10))
+            self._brand_image.pack(side="left", padx=(8, 8))
             self._brand_title.pack(side="left")
-            self._status.pack(side="bottom", fill="x", padx=14, pady=(0, 10), before=self._toggle)
+            self._status.pack(side="bottom", fill="x", padx=16, pady=(0, 8), before=self._toggle)
         for item in (*self._nav.values(), self._toggle):
             item.set_collapsed(collapsed)
 
@@ -225,11 +256,16 @@ class MainWindow:
         if self._battleship is not None and self._battleship.winfo_exists():
             self._battleship.lift()
             return
+        from .battleship_window import BattleshipWindow  # only for the easter egg
+
         self._battleship = BattleshipWindow(self._root)
 
     def show_tab(self, name: str) -> None:
+        self._highlight(name)
+        self._page_widget(name).tkraise()
+
+    def _highlight(self, name: str) -> None:
         self._page = name
-        self._pages[name].tkraise()
         self._heading.configure(text=tr(f"nav.{name}"))
         for key, item in self._nav.items():
             item.select(key == name)
@@ -254,11 +290,9 @@ class MainWindow:
         if s.sidebar_collapsed != self._collapsed:
             self._collapsed = s.sidebar_collapsed
             self._apply_collapsed()
-        self.settings_panel.refresh()
-        self.alphabet_panel.refresh()
-        self.smiley_panel.refresh()
-        self.live_panel.refresh()
-        self.translator_panel.refresh()
+        for name in ("settings", "alphabets", "smileys", "live", "translator"):
+            if (page := self._pages.get(name)) is not None:
+                page.refresh()
         self._update_status()
 
     def _rebuild(self) -> None:
@@ -267,6 +301,7 @@ class MainWindow:
         self._on_alphabets_changed()  # tray menu in the new language
 
     def show(self) -> None:
+        self._page_widget(self._page).tkraise()  # a window that started hidden has not built its page yet
         self._root.deiconify()
         self._root.lift()
         self._root.focus_force()

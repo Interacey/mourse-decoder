@@ -16,7 +16,7 @@
 //! too slow.
 
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Mutex;
 use std::thread;
@@ -145,6 +145,32 @@ static SHORTCUT_DOWN: AtomicBool = AtomicBool::new(false);
 static MODIFIERS: AtomicU16 = AtomicU16::new(0);
 /// The on/off shortcut, e.g. `Ctrl+Shift+Pause`.
 static SHORTCUT: Mutex<Option<KeyBinding>> = Mutex::new(None);
+/// The shortcut that switches to the next alphabet of the user's list, and how often it fired.
+/// Python polls the counter like it polls `ACTIVE`.
+static CYCLE_SHORTCUT: Mutex<Option<KeyBinding>> = Mutex::new(None);
+static CYCLE_DOWN: AtomicBool = AtomicBool::new(false);
+static CYCLE_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// True on the first press of a shortcut's key while its modifiers are held. Holding the key
+/// sends repeated presses (`down` remembers it), which must not count again.
+fn shortcut_pressed(
+    slot: &Mutex<Option<KeyBinding>>,
+    down: &AtomicBool,
+    event_type: &EventType,
+    held: ModifierMask,
+) -> bool {
+    let Some(shortcut) = *lock_or_recover(slot) else {
+        return false;
+    };
+    match route_event(shortcut.key, event_type) {
+        Some(Edge::Press) => shortcut.modifiers_held(held) && !down.swap(true, Ordering::SeqCst),
+        Some(Edge::Release) => {
+            down.store(false, Ordering::SeqCst);
+            false
+        }
+        None => false,
+    }
+}
 
 /// Bit of a modifier key in `MODIFIERS`, matching the group masks in `trigger`.
 fn modifier_bit(key: Key) -> Option<ModifierMask> {
@@ -391,16 +417,11 @@ fn handle_event(event: rdev::Event) -> Option<rdev::Event> {
     // the shortcut toggles Morse input, even while our own typing is suppressed. Only the
     // first press counts: holding the key sends repeated presses that would flip it back
     // and forth
-    if let Some(shortcut) = *lock_or_recover(&SHORTCUT) {
-        match route_event(shortcut.key, &event.event_type) {
-            Some(Edge::Press) => {
-                if shortcut.modifiers_held(held) && !SHORTCUT_DOWN.swap(true, Ordering::SeqCst) {
-                    ACTIVE.fetch_xor(true, Ordering::SeqCst);
-                }
-            }
-            Some(Edge::Release) => SHORTCUT_DOWN.store(false, Ordering::SeqCst),
-            None => {}
-        }
+    if shortcut_pressed(&SHORTCUT, &SHORTCUT_DOWN, &event.event_type, held) {
+        ACTIVE.fetch_xor(true, Ordering::SeqCst);
+    }
+    if shortcut_pressed(&CYCLE_SHORTCUT, &CYCLE_DOWN, &event.event_type, held) {
+        CYCLE_COUNT.fetch_add(1, Ordering::SeqCst);
     }
 
     if is_suppressed(now) {
@@ -451,12 +472,27 @@ pub fn active() -> bool {
 
 /// Sets the toggle shortcut; an empty string removes it.
 pub fn set_shortcut(text: &str) -> Result<(), String> {
-    *lock_or_recover(&SHORTCUT) = if text.trim().is_empty() {
-        None
-    } else {
-        Some(text.parse::<KeyBinding>()?)
-    };
+    *lock_or_recover(&SHORTCUT) = parse_shortcut(text)?;
     Ok(())
+}
+
+/// Sets the shortcut for the next alphabet of the list; an empty string removes it.
+pub fn set_cycle_shortcut(text: &str) -> Result<(), String> {
+    *lock_or_recover(&CYCLE_SHORTCUT) = parse_shortcut(text)?;
+    Ok(())
+}
+
+/// How many times the cycle shortcut was pressed since the process started (wraps around).
+pub fn cycle_count() -> u32 {
+    CYCLE_COUNT.load(Ordering::SeqCst)
+}
+
+fn parse_shortcut(text: &str) -> Result<Option<KeyBinding>, String> {
+    if text.trim().is_empty() {
+        Ok(None)
+    } else {
+        text.parse::<KeyBinding>().map(Some)
+    }
 }
 
 fn is_suppressed(now: Instant) -> bool {
@@ -853,6 +889,8 @@ mod tests {
         SHORTCUT_DOWN.store(false, Ordering::SeqCst);
         MODIFIERS.store(0, Ordering::SeqCst);
         *lock_or_recover(&SHORTCUT) = None;
+        *lock_or_recover(&CYCLE_SHORTCUT) = None;
+        CYCLE_DOWN.store(false, Ordering::SeqCst);
         *lock_or_recover(&SUPPRESS_UNTIL) = None;
         *lock_or_recover(&CAPTURE) = Capture {
             active: false,
@@ -918,6 +956,33 @@ mod tests {
         handle_event(press(Key::Pause));
         assert!(active(), "a new press toggles again");
         set_shortcut("").unwrap();
+        reset_block_state();
+    }
+
+    #[test]
+    fn cycle_shortcut_counts_each_press_once_and_leaves_morse_input_alone() {
+        let _serial = lock_or_recover(&GLOBAL_STATE);
+        reset_block_state();
+        let start = cycle_count();
+        set_cycle_shortcut("Ctrl+Alt+F9").unwrap();
+        handle_event(press(Key::F9)); // no modifiers held
+        assert_eq!(cycle_count(), start);
+        handle_event(release(Key::F9));
+        handle_event(press(Key::ControlLeft));
+        handle_event(press(Key::Alt));
+        for _ in 0..4 {
+            handle_event(press(Key::F9)); // key repeat while held
+        }
+        assert_eq!(cycle_count(), start + 1, "four repeats are one press");
+        handle_event(release(Key::F9));
+        handle_event(press(Key::F9));
+        assert_eq!(cycle_count(), start + 2, "a new press counts again");
+        assert!(active(), "the cycle shortcut never switches Morse input");
+        set_cycle_shortcut("").unwrap();
+        handle_event(release(Key::F9));
+        handle_event(press(Key::F9));
+        assert_eq!(cycle_count(), start + 2, "removed shortcut does nothing");
+        assert!(set_cycle_shortcut("Ctrl+Foo").is_err());
         reset_block_state();
     }
 

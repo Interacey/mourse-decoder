@@ -36,6 +36,12 @@ class _PrintInjector:
     def inject_text(self, text: str) -> None:
         print(f"[tippe {text!r}]", flush=True)
 
+    def type_text(self, text: str) -> None:
+        self.inject_text(text)
+
+    def pastes(self, text: str) -> bool:
+        return False
+
     def inject_backspaces(self, count: int) -> None:
         print(f"[lösche {count}]", flush=True)
 
@@ -47,6 +53,12 @@ class _PrintInjector:
 
     def foreground_title(self) -> str:
         return desktop.foreground_title()
+
+    def clipboard_text(self) -> str | None:
+        return "<Zwischenablage>"  # never print what may be a password
+
+    def paste_files(self, paths: list[str]) -> None:
+        print(f"[füge ein {paths!r}]", flush=True)
 
 
 def _prepare_windows() -> None:

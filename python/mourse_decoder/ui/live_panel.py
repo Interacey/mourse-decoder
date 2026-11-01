@@ -29,7 +29,7 @@ class LivePanel(tk.Frame):
         display = Card(self)
         display.grid(row=1, column=0, sticky="ew", pady=(16, 16))
         inner = tk.Frame(display.body, bg=theme.P.surface)
-        inner.pack(fill="x", padx=22, pady=18)
+        inner.pack(fill="x", padx=24, pady=16)
         self._sequence = tk.StringVar(value=" ")
         tk.Label(
             inner, textvariable=self._sequence, bg=theme.P.surface, fg=theme.P.text, font=(theme.MONO, 26), anchor="w"
@@ -39,7 +39,7 @@ class LivePanel(tk.Frame):
         label(row, tr("live.typed"), size=9, muted=True).pack(side="left")
         self._typed = tk.StringVar()
         tk.Label(row, textvariable=self._typed, bg=theme.P.surface, fg=theme.P.text, font=theme.font(11, "bold")).pack(
-            side="left", padx=10
+            side="left", padx=8
         )
 
         log_box, self._log = boxed(self, text_box, pad=4, height=8, state="disabled", wrap="none", undo=False)

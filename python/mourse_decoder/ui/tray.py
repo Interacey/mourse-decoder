@@ -59,6 +59,7 @@ class TrayApp:
             apply_settings=self._apply,
             on_alphabets_changed=self._rebuild_menu,
             on_hide=self._hide_window,
+            on_quit=self.quit,
         )
         self._icon = pystray.Icon(
             "mourse-decoder",
@@ -82,6 +83,7 @@ class TrayApp:
             except Exception:  # noqa: BLE001
                 log.exception("Fehler in UI-Aufgabe")
         self._poll_block()
+        self._poll_cycle()
         self._root.after(POLL_INTERVAL_MS, self._drain_queue)
 
     def _poll_block(self) -> None:
@@ -97,15 +99,35 @@ class TrayApp:
         # the shortcut works from any app, so say what happened (quietly, and only if wanted)
         if toggled.notifications:
             self._toast.show(tr("status.active") if toggled.enabled else tr("status.paused"), toggled.enabled)
+    def _poll_cycle(self) -> None:
+        """The cycle shortcut switches to the next alphabet of the user's list and says which one is active."""
+        presses = self._controller.poll_cycle()
+        if not presses:
+            return
+        infos = {a.id: a.name for a in self._dictionaries.available()}
+        target = self._controller.settings.cycle_target(infos, presses)
+        if target is None:
+            self._toast.show(tr("cycle.empty"), False)
+            return
+        alphabet, position, total = target
+        try:
+            self._apply(self._controller.settings.replace(alphabet=alphabet))
+        except Exception as exc:  # noqa: BLE001 - e.g. a broken alphabet file
+            log.exception("Umschalten auf %s fehlgeschlagen", alphabet)
+            self._toast.show(f"{tr('err.apply')}: {exc}", False)
+            return
+        # always shown, even with "show notices" off: it is the only sign that the shortcut worked
+        self._toast.show(tr("cycle.toast", name=infos[alphabet], pos=position, total=total))
+
     def on_symbol(self, symbol: str) -> None:
-        self.call_in_ui(lambda: self._window.live_panel.add_symbol(symbol))
+        self.call_in_ui(lambda: self._window.add_symbol(symbol))
 
     def on_letter(self, sequence: str, text: str | None) -> None:
         shown = text if text is not None else "?"
 
         def update() -> None:
             self._set_title(f"{self._tooltip()}\n{tr('tray.last', seq=sequence, text=shown)}")
-            self._window.live_panel.add_letter(sequence, text)
+            self._window.add_letter(sequence, text)
 
         self.call_in_ui(update)
 

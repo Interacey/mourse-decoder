@@ -54,26 +54,6 @@ def parse_alphabet_text(text: str) -> dict:
     return data
 
 
-def replaced_letters(text: str) -> list[str]:
-    """Codes of ordinary Latin letters, digits or punctuation that now output a whole text.
-
-    Nearly always a mistake: every A or E would then type the text. Returns entries like
-    ".- (A)"; broken JSON gives [] because saving reports that anyway.
-    """
-    try:
-        codes = parse_alphabet_text(text).get("codes")
-    except AlphabetError:
-        return []
-    if not isinstance(codes, dict):
-        return []
-    standard = load_alphabet("latin").codes
-    return [
-        f"{code} ({standard[code]})"
-        for code, value in codes.items()
-        if code in standard and isinstance(value, str) and len(value) > 1
-    ]
-
-
 def read_alphabet_text(info: AlphabetInfo) -> str:
     return info.path.read_text(encoding="utf-8")
 

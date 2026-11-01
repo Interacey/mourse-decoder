@@ -26,10 +26,10 @@ class CreditsPanel(tk.Frame):
         self.columnconfigure(0, weight=1)
 
         header = tk.Frame(self, bg=theme.P.bg)
-        header.grid(row=0, column=0, sticky="w", pady=(0, 22))
+        header.grid(row=0, column=0, sticky="w", pady=(0, 24))
         self._logo = ImageTk.PhotoImage(create_icon(True, 84))
         logo = tk.Label(header, image=self._logo, bg=theme.P.bg)
-        logo.pack(side="left", padx=(0, 18))
+        logo.pack(side="left", padx=(0, 16))
         if on_easter_egg is not None:
             bind_sos(logo, on_easter_egg)
         text = tk.Frame(header, bg=theme.P.bg)
@@ -43,13 +43,13 @@ class CreditsPanel(tk.Frame):
         label(card.add_row(tr("credits.developer")), DEVELOPER, weight="bold").pack()
         label(card.add_row(tr("credits.designer")), DESIGNER, weight="bold").pack()
 
-        label(self, tr("credits.support"), size=9, weight="bold", muted=True).grid(row=2, column=0, sticky="w", pady=(24, 6))
+        label(self, tr("credits.support"), size=9, weight="bold", muted=True).grid(row=2, column=0, sticky="w", pady=(24, 8))
         donate = Card(self)
         donate.grid(row=3, column=0, sticky="ew")
         inner = tk.Frame(donate.body, bg=theme.P.surface)
         inner.pack(fill="x", padx=20, pady=16)
         label(inner, tr("credits.donate.text"), wraplength=520, justify="left").pack(anchor="w")
-        Button(inner, tr("credits.donate"), self._donate, variant="primary", min_width=190).pack(anchor="w", pady=(14, 0))
+        Button(inner, tr("credits.donate"), self._donate, variant="primary", min_width=190).pack(anchor="w", pady=(16, 0))
 
     @staticmethod
     def _donate() -> None:

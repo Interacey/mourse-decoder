@@ -22,6 +22,9 @@ POLL_MS = 30
 # After capturing, ignore clicks briefly: releasing the mouse button that was just
 # assigned (e.g. Mouse 1) must not restart the wait.
 REARM_SECONDS = 0.4
+# Nobody pressing anything for this long: stop waiting, so the global hook doesn't keep
+# swallowing the next key the user types somewhere else. A shortcut is then removed.
+CAPTURE_TIMEOUT_S = 8.0
 
 
 class CaptureBackend(Protocol):
@@ -54,6 +57,7 @@ class KeyCaptureButton(Button):
         self._waiting = False
         self._poll_job: str | None = None
         self._stopped_at = 0.0
+        self._deadline = 0.0
 
     @property
     def trigger(self) -> str:
@@ -86,6 +90,7 @@ class KeyCaptureButton(Button):
         self.set_text(tr("key.waiting"))
         self._on_hint(tr("key.hint.waiting"))
         self.grab_set()  # clicks in the app now go to this button instead of other buttons
+        self._deadline = time.monotonic() + CAPTURE_TIMEOUT_S
         self._poll_job = self.after(POLL_MS, self._poll)
 
     def _poll(self) -> None:
@@ -93,12 +98,18 @@ class KeyCaptureButton(Button):
         if not self._waiting or self._backend is None:
             return
         token = self._backend.poll_capture()
-        if token is None:
+        if token is None and time.monotonic() >= self._deadline:
+            self._stop()
+            self._on_timeout()
+        elif token is None:
             self._poll_job = self.after(POLL_MS, self._poll)
         elif token == CANCEL_TOKEN:
             self._stop()
         else:
             self._handle_token(token)
+
+    def _on_timeout(self) -> None:
+        """Nothing was pressed in time; the plain key button just keeps its old key."""
 
     def _handle_token(self, token: str) -> None:
         if is_valid_binding(token):
@@ -113,6 +124,7 @@ class KeyCaptureButton(Button):
         """Arm the capture again for the next input."""
         if self._backend is not None:
             self._backend.begin_capture()
+        self._deadline = time.monotonic() + CAPTURE_TIMEOUT_S
         self._poll_job = self.after(POLL_MS, self._poll)
 
     def _display(self) -> str:
@@ -152,3 +164,10 @@ class ShortcutCaptureButton(KeyCaptureButton):
 
     def _display(self) -> str:
         return super()._display() or "-"
+
+    def _on_timeout(self) -> None:
+        """No combination in time: the shortcut is taken out completely, none is assigned."""
+        if self._trigger:
+            self._trigger = ""
+            self.set_text(self._display())
+            self._on_change("")
