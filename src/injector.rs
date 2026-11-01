@@ -240,7 +240,7 @@ fn key_by_name(name: &str) -> Result<Key, String> {
         // lowercase, so "Ctrl+C" doesn't press an implicit Shift for the capital letter
         return Ok(Key::Unicode(c.to_lowercase().next().unwrap_or(c)));
     }
-    const F_KEYS: [Key; 12] = [
+    const F_KEYS: [Key; 24] = [
         Key::F1,
         Key::F2,
         Key::F3,
@@ -253,13 +253,25 @@ fn key_by_name(name: &str) -> Result<Key, String> {
         Key::F10,
         Key::F11,
         Key::F12,
+        Key::F13,
+        Key::F14,
+        Key::F15,
+        Key::F16,
+        Key::F17,
+        Key::F18,
+        Key::F19,
+        Key::F20,
+        Key::F21,
+        Key::F22,
+        Key::F23,
+        Key::F24,
     ];
     let lower = name.to_lowercase(); // not ASCII-only, "RÜCKTASTE" must match too
     if let Some(n) = lower
         .strip_prefix('f')
         .and_then(|n| n.parse::<usize>().ok())
     {
-        if (1..=12).contains(&n) {
+        if (1..=24).contains(&n) {
             return Ok(F_KEYS[n - 1]);
         }
     }
@@ -383,6 +395,14 @@ mod tests {
         assert_eq!(parse_combo("alt+F4"), Ok((vec![Key::Alt], Key::F4)));
         assert_eq!(parse_combo("Win+Up"), Ok((vec![Key::Meta], Key::UpArrow)));
         assert_eq!(parse_combo("F12"), Ok((vec![], Key::F12)));
+        assert_eq!(parse_combo("F13"), Ok((vec![], Key::F13)));
+        assert_eq!(
+            parse_combo("Ctrl+Alt+Shift+Win+F24"),
+            Ok((
+                vec![Key::Control, Key::Alt, Key::Shift, Key::Meta],
+                Key::F24
+            ))
+        );
         assert_eq!(parse_combo("ä"), Ok((vec![], Key::Unicode('ä'))));
         assert_eq!(
             parse_combo("Umschalt+Eingabe"),
@@ -397,7 +417,7 @@ mod tests {
 
     #[test]
     fn bad_combos_are_rejected() {
-        for bad in ["", "Ctrl+", "Hyper+C", "Ctrl+Foo", "F13", "F0", "ab"] {
+        for bad in ["", "Ctrl+", "Hyper+C", "Ctrl+Foo", "F25", "F0", "ab"] {
             assert!(parse_combo(bad).is_err(), "{bad}");
         }
     }

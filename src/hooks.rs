@@ -25,9 +25,13 @@ use std::time::{Duration, Instant};
 use rdev::{Button, EventType, Key};
 
 use crate::engine::WorkerMessage;
+use crate::function_keys::{self, Reserved};
 use crate::lock_or_recover;
 use crate::timing::Symbol;
-use crate::trigger::{modifier_names, KeyBinding, ModifierMask, MorseKeys, TriggerKey, CAPS_LOCK};
+use crate::trigger::{
+    modifier_names, KeyBinding, ModifierMask, MorseKeys, TriggerKey, ALT, CAPS_LOCK, CTRL, SHIFT,
+    WIN,
+};
 
 /// Edge of a trigger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -337,7 +341,7 @@ pub fn key_token(key: Key) -> String {
         return known.name().into_owned();
     }
     match vk_of(key) {
-        Some(code) => format!("VK{code}"),
+        Some(code) => TriggerKey::Vk(code).name().into_owned(), // VK<code>, F13..F24 by name
         None => format!("{key:?}"), // e.g. MetaRight can't be used as a trigger
     }
 }
@@ -424,7 +428,14 @@ fn handle_event(event: rdev::Event) -> Option<rdev::Event> {
         CYCLE_COUNT.fetch_add(1, Ordering::SeqCst);
     }
 
-    if is_suppressed(now) {
+    // function-key slots and Esc-Esc. Own typing (`suppress_for`) can't fire a slot, so a
+    // macro with `{F13}` doesn't start itself; releases are handled even then
+    let suppressed = is_suppressed(now);
+    if function_keys::on_event(&event.event_type, held, now, suppressed, active()) {
+        return None;
+    }
+
+    if suppressed {
         return Some(event);
     }
 
@@ -485,6 +496,47 @@ pub fn set_cycle_shortcut(text: &str) -> Result<(), String> {
 /// How many times the cycle shortcut was pressed since the process started (wraps around).
 pub fn cycle_count() -> u32 {
     CYCLE_COUNT.load(Ordering::SeqCst)
+}
+
+/// Replaces the function-key slots with `(slot, binding, swallow)` entries. Fails without
+/// changing anything if an entry is invalid, duplicated or taken by the Morse keys, the
+/// on/off shortcut or the cycle shortcut (those are only known while an engine runs).
+pub fn set_function_keys(entries: &[(u16, String, bool)]) -> Result<(), String> {
+    let mut reserved: Vec<Reserved> = Vec::new();
+    if let Some(route) = lock_or_recover(&ROUTE).as_ref() {
+        for (i, key) in route.keys.iter().enumerate() {
+            let name = if route.keys.len() == 2 && i == 1 {
+                "der Strich-Taste"
+            } else {
+                "der Morse-Taste"
+            };
+            reserved.push((name, key.binding));
+        }
+    }
+    if let Some(binding) = *lock_or_recover(&SHORTCUT) {
+        reserved.push(("dem Ein/Aus-Kürzel", binding));
+    }
+    if let Some(binding) = *lock_or_recover(&CYCLE_SHORTCUT) {
+        reserved.push(("dem Umschalt-Kürzel", binding));
+    }
+    let parsed = function_keys::parse_entries(entries, &reserved)?;
+    function_keys::with_table(|table| table.set(parsed));
+    Ok(())
+}
+
+/// Removes all function-key slots.
+pub fn clear_function_keys() {
+    function_keys::with_table(|table| table.set(Vec::new()));
+}
+
+/// Next fired slot, oldest first.
+pub fn poll_function_key() -> Option<u16> {
+    function_keys::with_table(function_keys::SlotTable::pop)
+}
+
+/// True if no Ctrl, Alt, Shift or Win key is held, as far as the hook has seen.
+pub fn keyboard_modifiers_released() -> bool {
+    MODIFIERS.load(Ordering::SeqCst) & (CTRL | ALT | SHIFT | WIN) == 0
 }
 
 fn parse_shortcut(text: &str) -> Result<Option<KeyBinding>, String> {
@@ -725,7 +777,9 @@ mod tests {
     fn tokens_name_inputs_in_the_trigger_syntax() {
         assert_eq!(key_token(Key::Space), "Space");
         assert_eq!(key_token(Key::KeyA), "VK65");
-        assert_eq!(key_token(Key::Unknown(124)), "VK124");
+        assert_eq!(key_token(Key::Unknown(124)), "F13");
+        assert_eq!(key_token(Key::Unknown(135)), "F24");
+        assert_eq!(key_token(Key::Unknown(136)), "VK136");
         assert_eq!(button_token(Button::Right), "MouseRight");
         assert_eq!(button_token(Button::Unknown(1)), "Mouse4");
         assert_eq!(button_token(Button::Unknown(2)), "Mouse5");
@@ -892,6 +946,7 @@ mod tests {
         *lock_or_recover(&CYCLE_SHORTCUT) = None;
         CYCLE_DOWN.store(false, Ordering::SeqCst);
         *lock_or_recover(&SUPPRESS_UNTIL) = None;
+        function_keys::reset();
         *lock_or_recover(&CAPTURE) = Capture {
             active: false,
             result: None,
@@ -1087,5 +1142,177 @@ mod tests {
         let received: Vec<_> = rx.try_iter().collect();
         assert_eq!(received.len(), 1);
         assert!(matches!(received[0], WorkerMessage::Press(_)));
+    }
+
+    const F13: Key = Key::Unknown(124);
+
+    fn slots(entries: &[(u16, &str, bool)]) {
+        let owned: Vec<_> = entries
+            .iter()
+            .map(|&(i, b, s)| (i, b.to_string(), s))
+            .collect();
+        set_function_keys(&owned).unwrap();
+    }
+
+    fn fired_slots() -> Vec<u16> {
+        std::iter::from_fn(poll_function_key).collect()
+    }
+
+    #[test]
+    fn slot_press_is_queued_and_swallowed_only_when_asked() {
+        let _serial = lock_or_recover(&GLOBAL_STATE);
+        reset_block_state();
+        slots(&[(13, "F13", true), (14, "F14", false)]);
+        assert!(handle_event(press(F13)).is_none(), "swallowed");
+        assert!(handle_event(press(F13)).is_none(), "repeat");
+        assert!(handle_event(release(F13)).is_none(), "no orphan key-up");
+        assert!(
+            handle_event(press(Key::Unknown(125))).is_some(),
+            "F14 passes"
+        );
+        handle_event(release(Key::Unknown(125)));
+        assert!(handle_event(press(Key::F9)).is_some(), "unassigned key");
+        assert_eq!(fired_slots(), vec![13, 14]);
+        assert_eq!(poll_function_key(), None);
+        clear_function_keys();
+        assert!(handle_event(press(F13)).is_some(), "cleared table");
+        assert!(fired_slots().is_empty());
+        reset_block_state();
+    }
+
+    #[test]
+    fn slot_needs_its_exact_modifiers_in_the_hook() {
+        let _serial = lock_or_recover(&GLOBAL_STATE);
+        reset_block_state();
+        slots(&[(25, "Ctrl+Alt+Shift+Win+F13", true), (1, "Ctrl+F13", true)]);
+        for key in [Key::ControlLeft, Key::Alt, Key::ShiftLeft, Key::MetaLeft] {
+            handle_event(press(key));
+        }
+        assert!(handle_event(press(F13)).is_none());
+        assert_eq!(
+            fired_slots(),
+            vec![25],
+            "Ctrl+F13 does not fire under four modifiers"
+        );
+        handle_event(release(F13));
+        for key in [Key::Alt, Key::ShiftLeft, Key::MetaLeft] {
+            handle_event(release(key));
+        }
+        handle_event(press(F13));
+        assert_eq!(fired_slots(), vec![1]);
+        handle_event(release(F13));
+        handle_event(release(Key::ControlLeft));
+        handle_event(press(F13));
+        assert!(fired_slots().is_empty(), "plain F13 is not assigned");
+        clear_function_keys();
+        reset_block_state();
+    }
+
+    #[test]
+    fn own_typing_cannot_fire_a_slot_but_its_release_is_still_seen() {
+        let _serial = lock_or_recover(&GLOBAL_STATE);
+        reset_block_state();
+        slots(&[(13, "F13", true)]);
+        suppress_for(Duration::from_millis(500));
+        assert!(handle_event(press(F13)).is_some(), "sent by the injector");
+        handle_event(release(F13));
+        assert!(fired_slots().is_empty());
+        *lock_or_recover(&SUPPRESS_UNTIL) = None;
+        handle_event(press(F13));
+        // the user's release falls into a later suppression window
+        suppress_for(Duration::from_millis(500));
+        assert!(
+            handle_event(release(F13)).is_none(),
+            "swallowed press, swallowed release"
+        );
+        *lock_or_recover(&SUPPRESS_UNTIL) = None;
+        handle_event(press(F13));
+        assert_eq!(fired_slots(), vec![13, 13], "not stuck as held");
+        clear_function_keys();
+        reset_block_state();
+    }
+
+    #[test]
+    fn slots_do_nothing_while_morse_input_is_off() {
+        let _serial = lock_or_recover(&GLOBAL_STATE);
+        reset_block_state();
+        slots(&[(13, "F13", true)]);
+        set_active(false);
+        assert!(handle_event(press(F13)).is_some());
+        handle_event(release(F13));
+        assert!(fired_slots().is_empty());
+        set_active(true);
+        assert!(handle_event(press(F13)).is_none());
+        assert_eq!(fired_slots(), vec![13]);
+        clear_function_keys();
+        reset_block_state();
+    }
+
+    #[test]
+    fn slots_clash_with_morse_keys_and_shortcuts() {
+        let _serial = lock_or_recover(&GLOBAL_STATE);
+        reset_block_state();
+        let _rx = route_keys("F11", Some("Ctrl+F12"));
+        set_shortcut("Ctrl+Shift+Pause").unwrap();
+        set_cycle_shortcut("Alt+F9").unwrap();
+        let try_slot =
+            |binding: &str| set_function_keys(&[(1, binding.to_string(), true)]).unwrap_err();
+        assert!(try_slot("F11").contains("Morse-Taste"));
+        assert!(try_slot("Shift+F11").contains("Morse-Taste"));
+        assert!(try_slot("Ctrl+Alt+F12").contains("Strich-Taste"));
+        assert!(try_slot("Ctrl+Shift+Alt+Pause").contains("Ein/Aus"));
+        assert!(try_slot("Alt+F9").contains("Umschalt"));
+        assert!(
+            set_function_keys(&[(1, "F12".to_string(), true)]).is_ok(),
+            "needs fewer modifiers than the dash key"
+        );
+        assert!(set_function_keys(&[(1, "F13".to_string(), true)]).is_ok());
+        // a failed call leaves the old table alone
+        assert!(set_function_keys(&[(2, "F11".to_string(), true)]).is_err());
+        handle_event(press(F13));
+        assert_eq!(fired_slots(), vec![1]);
+        clear_function_keys();
+        clear_route();
+        set_shortcut("").unwrap();
+        reset_block_state();
+    }
+
+    #[test]
+    fn modifier_wait_sees_held_keys() {
+        let _serial = lock_or_recover(&GLOBAL_STATE);
+        reset_block_state();
+        assert!(keyboard_modifiers_released());
+        handle_event(press(Key::ControlRight));
+        assert!(!keyboard_modifiers_released());
+        handle_event(release(Key::ControlRight));
+        handle_event(press(Key::CapsLock));
+        assert!(keyboard_modifiers_released(), "Caps Lock is a toggle");
+        handle_event(release(Key::CapsLock));
+        handle_event(press(Key::Unknown(92)));
+        assert!(!keyboard_modifiers_released(), "right Windows key");
+        handle_event(release(Key::Unknown(92)));
+        assert!(keyboard_modifiers_released());
+        reset_block_state();
+    }
+
+    #[test]
+    fn double_esc_sets_the_abort_flag_and_is_never_swallowed() {
+        let _serial = lock_or_recover(&GLOBAL_STATE);
+        reset_block_state();
+        assert!(handle_event(press(Key::Escape)).is_some());
+        handle_event(release(Key::Escape));
+        assert!(!function_keys::take_abort());
+        assert!(handle_event(press(Key::Escape)).is_some());
+        handle_event(release(Key::Escape));
+        assert!(function_keys::take_abort());
+        assert!(!function_keys::take_abort(), "reading clears it");
+        // Esc typed by our own injector doesn't count
+        suppress_for(Duration::from_millis(500));
+        handle_event(press(Key::Escape));
+        handle_event(release(Key::Escape));
+        handle_event(press(Key::Escape));
+        handle_event(release(Key::Escape));
+        assert!(!function_keys::take_abort());
+        reset_block_state();
     }
 }

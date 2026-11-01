@@ -12,6 +12,7 @@ from . import desktop
 from ._native import load_native
 from .controller import MorseController, NativeInjector
 from .dictionary import DictionaryManager
+from .function_keys import FunctionKeysStore
 from .settings import SettingsStore
 
 log = logging.getLogger("mourse_decoder")
@@ -28,6 +29,16 @@ class _ConsoleListener:
 
     def on_error(self, message: str) -> None:
         print(f"Fehler: {message}", file=sys.stderr, flush=True)
+
+
+def _start_function_keys(controller: MorseController, directory, injector) -> list[str]:
+    """Load function_keys.json and install the slots; returns the warnings to show."""
+    keys, warnings = FunctionKeysStore(directory).load(injector.check_shortcut)
+    try:
+        controller.apply_function_keys(keys)
+    except ValueError as exc:  # e.g. a slot trigger equals the Morse key: run without slots rather than not at all
+        warnings.append(f"Funktionstasten nicht aktiv: {exc}")
+    return warnings
 
 
 class _PrintInjector:
@@ -142,10 +153,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.headless:
         controller = MorseController(engine, injector, dictionaries, settings, listener=_ConsoleListener())
         controller.start()
+        for warning in _start_function_keys(controller, store.directory, injector):
+            print(f"Warnung: {warning}", file=sys.stderr, flush=True)
         print(f"Morse-Decoder läuft (Taster: {settings.trigger}, Alphabet: {settings.alphabet}). Strg+C beendet.")
         try:
             while True:
-                time.sleep(0.5)
+                time.sleep(0.1)
+                controller.poll_function_keys()
                 if (err := native.hook_error()) is not None:
                     print(err, file=sys.stderr)
                     return 1
@@ -162,6 +176,8 @@ def main(argv: list[str] | None = None) -> int:
     tray = TrayApp(controller, dictionaries, store, start_hidden=args.minimized)
     controller.set_listener(tray)  # breaks the tray <-> controller cycle
     controller.start()
+    for warning in _start_function_keys(controller, store.directory, injector):
+        tray.on_error(warning)
     try:
         tray.run()
     finally:

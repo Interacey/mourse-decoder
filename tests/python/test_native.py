@@ -320,3 +320,44 @@ def test_blocking_api_on_the_real_module():
     eng.block_shortcut = ""
     with pytest.raises(ValueError):
         eng.block_shortcut = "Hyper+F9"
+
+
+def test_python_and_rust_agree_on_which_bindings_are_valid():
+    from mourse_decoder.function_keys import default_trigger
+    from mourse_decoder.settings import is_valid_binding, normalize_binding
+
+    specs = [
+        *(f"F{n}" for n in range(1, 27)), "F0", "F100", "F013", "VK124", "VK135", "VK136", "Ctrl+F13", "Strg+Alt+F24",
+        "Ctrl+Hyper+F13", "Ctrl+", *(default_trigger(n) for n in range(13, 101)),
+    ]
+    for spec in specs:
+        try:
+            core.MorseEngine(trigger=spec)
+            rust_accepts = True
+        except ValueError:
+            rust_accepts = False
+        # Rust also takes "f13"; the Python check is stricter about case on purpose
+        assert is_valid_binding(spec) <= rust_accepts, spec
+        if is_valid_binding(spec):
+            # the normalized spelling is what the hook prints
+            assert core.MorseEngine(trigger=spec).trigger == normalize_binding(spec), spec
+
+
+def test_function_key_api_on_the_real_module():
+    eng = core.MorseEngine()
+    eng.set_function_keys([(13, "F13", True), (25, "Ctrl+Alt+Shift+Win+F13", False), (1, "Ctrl+F13", True)])
+    assert eng.poll_function_key() is None
+    assert eng.poll_abort() is False
+    assert isinstance(eng.function_key_modifiers_released(), bool)
+    for bad, text in [
+        ([(0, "F13", True)], "Slot 0"),
+        ([(101, "F13", True)], "101"),
+        ([(5, "Hyper+F13", True)], "F5"),
+        ([(5, "F13", True), (6, "Strg+F13", True), (7, "ctrl+f13", True)], "denselben"),
+        ([(5, "F13", True), (5, "F14", True)], "doppelt"),
+    ]:
+        with pytest.raises(ValueError, match=text):
+            eng.set_function_keys(bad)
+    eng.set_function_keys([(2, "F20", True)])
+    eng.clear_function_keys()
+    eng.set_function_keys([])

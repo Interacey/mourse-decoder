@@ -143,13 +143,14 @@ Everything the program reads is JSON. Files live in one folder, `%APPDATA%\Mours
 ```
 MourseDecoder/
   settings.json     the settings page writes it, you may also edit it
+  function_keys.json  function keys F1..F100, see "Function keys"
   alphabets/        your own alphabets        (<id>.json)
   smileys/          your own smiley sets      (<id>.json)
   languages/        your own languages        (<id>.json)
   telecode.sqlite   optional, see "Chinese telecodes"
 ```
 
-General rules for all four kinds of file:
+General rules for all kinds of file:
 - Plain UTF-8 JSON (a BOM is fine). Keys must not repeat inside one object; a duplicate is reported, never silently overwritten.
 - The `id` is also the file name: `id` `mein-alphabet` lives in `mein-alphabet.json`. Allowed: `a-z`, `0-9`, `-`, `_`, starting with a letter or digit.
 - Files you write by hand may hold raw line breaks inside texts and a stray `"` (`"NIV"`). The app accepts them and saves strict JSON back. A broken file is skipped with a message, it never stops the program.
@@ -268,6 +269,29 @@ Built-in alphabets cannot be edited; use "Create copy" on the Alphabets page, wh
 
 Copy `python/mourse_decoder/locales/en.json` as a template and translate the values. Keys you leave out fall back to English, so a partial file works. Placeholders such as `{name}` or `{total}` must stay as they are, and only plain names are allowed inside the braces. Pick the language on the settings page, or set `"language": "nl"`.
 
+### Function keys (`function_keys.json`)
+
+100 slots, F1 to F100. Each slot has a trigger (a key or combination such as `Ctrl+Shift+F13`), a macro (the same macro language as the codes of an alphabet: commands in braces, loops with counters, backslash escapes), the switches `enabled` and `swallow`, and a free `label`. Pressing the trigger types the macro.
+
+```json
+{
+  "schema_version": 1,
+  "slots": [
+    { "slot": 5, "trigger": "Ctrl+F5", "macro": "Mit freundlichen Grüßen{Enter}Anton",
+      "enabled": true, "swallow": true, "label": "Gruß" }
+  ]
+}
+```
+
+- Only slots that differ from their default are written. Unknown fields are kept when the file is saved again. A file that cannot be read is moved to `function_keys.json.bak` and the defaults apply; a broken entry is reported, and a macro that does not parse is kept but switched off. A file with a newer `schema_version` is read but never overwritten.
+- F1 to F12 have no trigger until you set one. F13 to F24 exist as keys on some keyboards and in Stream Deck software, and default to the bare key. Windows has no F25 to F100, so those slots are virtual: their default triggers are long combinations of Ctrl, Alt, Shift and Win with F13 to F24 that nobody presses by accident, first all four modifiers (`Ctrl+Alt+Shift+Win+F13` is F25), then every three, then pairs. Set a Stream Deck button to send one of them. Every trigger can be changed.
+- Modifiers must match exactly: `F13` does not fire while Ctrl is held, `Ctrl+F13` does not fire under Ctrl+Alt. A trigger must differ from the Morse key, the dash key and the two shortcuts, and from every other active slot. Esc, the modifier keys and plain typing keys (letters, digits, Space, Enter, Backspace, Tab, punctuation, numpad without Ctrl, Alt or Win) are refused as triggers, because the hook would otherwise fire on normal typing; a right or middle click is refused only while it is swallowed and has no modifier.
+- `swallow` (default on) hides the trigger key from the focused app. A key without a slot is never touched. On Linux the hook can only watch, so triggers always reach the app.
+- Before the macro types, the program waits up to 3 seconds for Ctrl, Alt, Shift and Win to be let go; otherwise typed text would turn into shortcuts. One macro runs at a time, a second trigger meanwhile is ignored. Keys sent by the program itself never fire a slot, so a macro containing `{F13}` does not start itself.
+- Pressing Esc twice within 500 ms stops any running macro, also those of Morse letters. Esc itself still reaches the app.
+
+**The Function keys page** lists all 100 slots with type (real or virtual), trigger, label or macro and status; the switch "Only assigned" and the search box narrow the list. Select a slot to edit its macro, label, trigger (click the trigger button, press the keys; "Default" restores the standard one), "Active" and "Swallow the key". The macro is checked while you type and a mistake is shown in red; "Save" is available once the slot is valid and installs it right away. "Test" runs the saved macro after 3 seconds, so you can click into the target window first, and "Reset" returns the slot to its default trigger with an empty macro. For a virtual slot, set the Stream Deck button to send the combination shown in the Trigger column. Esc, Esc stops a running macro.
+
 ## Security
 
 - **Network paths are refused** in `{File …}`. Merely checking whether `\\server\share\x` exists makes Windows log in at that server and hand over the user's NTLM hash, so a smiley set from a stranger could leak it. Local drives and mapped drives (`Z:\`) work.
@@ -303,6 +327,7 @@ An end-to-end run was also done on Linux with a virtual X display (Xvfb) and `xd
 | `hooks.rs` | One global hook thread per process, routed to the current worker | `rdev::listen` blocks forever and cannot be cancelled, so start and stop only change the route. The callback performs only a lock, a comparison and a `send`, because Windows silently removes low-level hooks that respond too slowly. Timestamps use `Instant` (monotonic) rather than `SystemTime` (which jumps on NTP adjustments). |
 | `injector.rs` | `inject_text`, `inject_backspaces` via enigo | `KEYEVENTF_UNICODE` types every character independently of the keyboard layout. Backspaces are needed for dakuten (カ→ガ) and telecodes. A short hook lock prevents feedback, for example when the space bar is the key and a space is injected. |
 | `trigger.rs` | Permitted keys as a separate enum | Configuration and tests do not depend on rdev. |
+| `function_keys.rs` | Slot table with a queue of fired slots, Esc-Esc detector | Both are state machines that take event, modifiers and time as arguments. The hook callback only writes the slot number into a queue of 64; Python runs the macro. |
 | `python.rs` | PyO3 class `MorseEngine` and functions | `stop()` releases the GIL before the `join` (`py.detach`). Otherwise a deadlock occurs when the worker is waiting for the GIL. Exceptions in callbacks go to `sys.unraisablehook` instead of killing the worker. |
 
 Cargo features: `native-io` (hooks and injection, enabled by default) and `python` (PyO3, set by maturin). This allows `cargo test` to run without Python.

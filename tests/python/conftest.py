@@ -25,6 +25,11 @@ class FakeEngine:
         self.block_shortcut = ""
         self.cycle_shortcut = ""
         self.cycle_count = 0
+        self.function_keys: list[tuple[int, str, bool]] = []
+        self.fired_slots: list[int] = []  # slot numbers ``poll_function_key`` hands out
+        self.modifiers_released = True
+        self.abort_requested = False
+        self.set_function_keys_error: str | None = None
         self.callback: Callable[[str, str], None] | None = None
         self.configure_calls: list[tuple[int, int, int]] = []
         self.reset_calls = 0
@@ -46,6 +51,24 @@ class FakeEngine:
 
     def reset(self) -> None:
         self.reset_calls += 1
+
+    def set_function_keys(self, entries: list[tuple[int, str, bool]]) -> None:
+        if self.set_function_keys_error:
+            raise ValueError(self.set_function_keys_error)
+        self.function_keys = list(entries)
+
+    def clear_function_keys(self) -> None:
+        self.function_keys = []
+
+    def poll_function_key(self) -> int | None:
+        return self.fired_slots.pop(0) if self.fired_slots else None
+
+    def function_key_modifiers_released(self) -> bool:
+        return self.modifiers_released
+
+    def poll_abort(self) -> bool:
+        aborted, self.abort_requested = self.abort_requested, False
+        return aborted
 
     # test api
     def emit(self, kind: str, payload: str = "") -> None:
