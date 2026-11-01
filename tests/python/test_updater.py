@@ -56,16 +56,16 @@ def serving(routes: dict[str, bytes]):
 @pytest.mark.parametrize(
     ("tag", "current", "newer"),
     [
-        ("v0.1.4", "0.1.3", True),
-        ("v.0.1.4", "0.1.3", True),  # the real tags look like this: v.0.1.2
-        ("v.0.1.2", "0.1.3", False),
+        ("v0.1.5", "0.1.4", True),
+        ("v.0.1.5", "0.1.4", True),  # the real tags look like this: v.0.1.2
+        ("v.0.1.3", "0.1.4", False),
         ("0.2.0", "0.1.9", True),
         ("v1.0", "0.9.9", True),
-        ("v0.1.3", "0.1.3", False),
-        ("v0.1.2", "0.1.3", False),
+        ("v0.1.4", "0.1.4", False),
+        ("v0.1.3", "0.1.4", False),
         ("v0.1", "0.1.0", False),  # missing parts count as 0
         ("v0.10.0", "0.9.0", True),  # numbers, not text: 10 > 9
-        ("v0.1.3-beta", "0.1.3", False),
+        ("v0.1.4-beta", "0.1.4", False),
     ],
 )
 def test_is_newer(tag, current, newer):
@@ -78,8 +78,8 @@ def test_parse_version_rejects_text_without_a_version(bad):
         updater.parse_version(bad)
 
 
-def test_this_is_version_0_1_3():
-    assert __version__ == "0.1.3"
+def test_this_is_version_0_1_4():
+    assert __version__ == "0.1.4"
 
 
 # --- looking at the latest release ---
