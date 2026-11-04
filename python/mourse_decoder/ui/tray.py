@@ -38,7 +38,10 @@ class TrayApp:
         dictionaries: DictionaryManager,
         store: SettingsStore,
         start_hidden: bool = False,
+        hook_error: Callable[[], str | None] | None = None,
     ) -> None:
+        self._hook_error = hook_error  # the native ``hook_error``: text once the keyboard hook has died
+        self._hook_error_shown = False
         self._controller = controller
         self._dictionaries = dictionaries
         self._store = store
@@ -83,10 +86,27 @@ class TrayApp:
                 func()
             except Exception:  # noqa: BLE001
                 log.exception("Fehler in UI-Aufgabe")
-        self._poll_block()
-        self._poll_cycle()
-        self._poll_function_keys()
-        self._root.after(POLL_INTERVAL_MS, self._drain_queue)
+        try:
+            # one failing poll must not stop the others, and the loop must be scheduled again in any case
+            for poll in (self._poll_block, self._poll_cycle, self._poll_function_keys, self._poll_hook):
+                try:
+                    poll()
+                except Exception:  # noqa: BLE001
+                    log.exception("Abfrage %s fehlgeschlagen", poll.__name__)
+        finally:
+            self._root.after(POLL_INTERVAL_MS, self._drain_queue)
+
+    def _poll_hook(self) -> None:
+        """Once the keyboard hook has died, Morse input is gone: say so one time."""
+        if self._hook_error is None or self._hook_error_shown:
+            return
+        error = self._hook_error()
+        if error is None:
+            return
+        self._hook_error_shown = True
+        log.error("Tastatur-Hook ausgefallen: %s", error)
+        self._icon.notify(error, tr("tray.error"))
+        self._toast.show(error, False)
 
     def _poll_block(self) -> None:
         """The hook's shortcut can turn Morse input on or off; mirror that into the settings."""

@@ -111,7 +111,7 @@ class RecordingInjector:
     def check_shortcut(self, combo: str) -> None:
         # rough stand-in for the Rust parser: known modifiers, then one key
         *modifiers, key = (part.strip().lower() for part in combo.split("+"))
-        known_key = (len(key) == 1 and key.isalnum()) or key in {"enter", "end", "esc", "tab", "delete", "f5"}
+        known_key = (len(key) == 1 and key.isalnum()) or key in {"enter", "end", "esc", "tab", "delete", "f5", "backspace", "space"}
         if any(m not in {"ctrl", "strg", "alt", "shift", "win"} for m in modifiers) or not known_key:
             raise ValueError(f"keine Tastenkombination: {combo!r}")
 
@@ -199,3 +199,16 @@ def telecode_db(tmp_path: Path) -> Path:
     path = tmp_path / "telecode.sqlite"
     build_database(parse_unihan(UNIHAN_SAMPLE.splitlines()), path)
     return path
+
+
+@pytest.fixture(scope="session")
+def tk_root():
+    """One Tk root for all UI tests; a second tk.Tk() in one process sometimes fails to initialise Tcl."""
+    import tkinter as tk
+
+    try:
+        window = tk.Tk()
+    except tk.TclError:
+        pytest.skip("kein Display")
+    yield window
+    window.destroy()

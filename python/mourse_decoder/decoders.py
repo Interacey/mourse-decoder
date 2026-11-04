@@ -72,6 +72,9 @@ class AlphabetDecoder:
     def reset(self) -> None:
         self._last_char = None
 
+    def close(self) -> None:
+        """Nothing to release; here so every decoder can be closed the same way."""
+
 
 class TelecodeDecoder:
     """Decoder for four-digit Chinese telegraph codes."""
@@ -108,6 +111,10 @@ class TelecodeDecoder:
 
     def reset(self) -> None:
         self._buffer = ""
+
+    def close(self) -> None:
+        """Close the SQLite connection; the decoder must not be used afterwards."""
+        self._store.close()
 
 
 def create_decoder(manager: DictionaryManager, alphabet_id: str) -> Decoder:

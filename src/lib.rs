@@ -8,7 +8,7 @@
 //! | [`trigger`] | Which key or mouse button is the Morse key?      | `std`      |
 //! | [`engine`]  | Worker thread that handles events and pauses     | `std`      |
 //! | `hooks`     | Global low-level hooks (feature `native-io`)     | `rdev`     |
-//! | `function_keys` | Function-key slots, Esc-Esc abort (`native-io`) | `rdev`     |
+//! | `function_keys` | Function-key slots, Esc abort (`native-io`) | `rdev`     |
 //! | `injector`  | Type text into the active app (`native-io`)      | `enigo`    |
 //! | `python`    | PyO3 bindings (feature `python`)                 | `pyo3`     |
 //!

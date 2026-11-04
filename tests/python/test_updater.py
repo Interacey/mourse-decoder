@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import http.client
 import io
 import json
+import ssl
 import subprocess
 import sys
 import urllib.error
@@ -13,7 +15,16 @@ from pathlib import Path
 
 import pytest
 from mourse_decoder import __version__, updater
+from mourse_decoder.i18n import set_language
 from mourse_decoder.updater import Release, UpdateError
+
+
+@pytest.fixture(autouse=True)
+def english():
+    set_language("en")  # the error texts come from the language files
+    yield
+    set_language("en")
+
 
 GH = "https://github.com/Interacey/mourse-decoder/releases/download/v9.9.9/"
 EXE = b"MZ" + b"\x00" * 1000
@@ -78,8 +89,12 @@ def test_parse_version_rejects_text_without_a_version(bad):
         updater.parse_version(bad)
 
 
-def test_this_is_version_0_1_4():
-    assert __version__ == "0.1.4"
+def test_parse_version_ignores_case_of_the_v():
+    assert updater.parse_version("V.1.2") == (1, 2)
+
+
+def test_this_is_version_0_1_5():
+    assert __version__ == "0.1.5"
 
 
 # --- looking at the latest release ---
@@ -101,11 +116,11 @@ def test_release_without_notes_or_checksum_still_loads():
 @pytest.mark.parametrize(
     ("routes", "message"),
     [
-        ({}, "Keine Verbindung"),
-        ({"latest": b"<html>kaputt"}, "Keine Verbindung"),
+        ({}, "No connection to GitHub"),
+        ({"latest": b"<html>kaputt"}, "No connection to GitHub"),
         ({"latest": b"[]"}, "Unerwartete"),
         ({"latest": json.dumps(release_json(tag="kein-tag")).encode()}, "Unerwartete"),
-        ({"latest": json.dumps(release_json(assets=["Anderes.zip"])).encode()}, "keine MourseDecoder.exe"),
+        ({"latest": json.dumps(release_json(assets=["Anderes.zip"])).encode()}, "contains no MourseDecoder.exe"),
     ],
 )
 def test_fetch_latest_reports_problems(routes, message):
@@ -132,8 +147,8 @@ def test_download_checks_the_checksum(tmp_path):
         ({"MourseDecoder.exe": EXE + b"x", "MourseDecoder.exe.sha256": SHA.encode()}, "passt nicht"),
         ({"MourseDecoder.exe": EXE, "MourseDecoder.exe.sha256": b"keine summe"}, "ungültig"),
         ({"MourseDecoder.exe": EXE, "MourseDecoder.exe.sha256": b""}, "ungültig"),
-        ({"MourseDecoder.exe.sha256": SHA.encode()}, "Keine Verbindung"),
-        ({"MourseDecoder.exe": EXE}, "Keine Verbindung"),
+        ({"MourseDecoder.exe.sha256": SHA.encode()}, "No connection to GitHub"),
+        ({"MourseDecoder.exe": EXE}, "No connection to GitHub"),
     ],
 )
 def test_bad_download_leaves_nothing_behind(tmp_path, routes, message):
@@ -143,7 +158,7 @@ def test_bad_download_leaves_nothing_behind(tmp_path, routes, message):
 
 
 def test_release_without_checksum_is_refused(tmp_path):
-    with pytest.raises(UpdateError, match="Prüfsumme"):
+    with pytest.raises(UpdateError, match="no checksum"):
         updater.download(release(sha_url=None), tmp_path, serving({"MourseDecoder.exe": EXE}))
 
 
@@ -430,3 +445,188 @@ def test_a_bad_checksum_never_starts_the_swap(tmp_path, monkeypatch):
     with pytest.raises(UpdateError, match="passt nicht"):
         updater.install(release(), serving(routes), lambda *a, **kw: pytest.fail("darf nichts starten"))
     assert fake_exe.read_bytes() == b"ALT"
+
+
+# --- update problems on a machine without git or an account ---
+
+
+def failing(exc):
+    def urlopen(request, timeout=None):
+        raise exc
+
+    return urlopen
+
+
+def http_error(code):
+    return urllib.error.HTTPError("https://api.github.com/x", code, "x", {}, None)
+
+
+class Broken(FakeResponse):
+    def read(self, n=-1):
+        raise http.client.IncompleteRead(b"x")
+
+
+@pytest.mark.parametrize(
+    ("exc", "message"),
+    [
+        (http_error(403), "limited the requests"),  # anonymous rate limit
+        (http_error(429), "limited the requests"),
+        (http_error(404), "error 404"),
+        (urllib.error.URLError(ssl.SSLCertVerificationError("kaputt")), "secure connection"),
+        (ssl.SSLError("handshake"), "secure connection"),
+        (TimeoutError("timed out"), r"No connection to GitHub \(timed out"),
+        (http.client.RemoteDisconnected("weg"), "No connection to GitHub"),
+    ],
+)
+def test_network_problems_say_what_happened_and_offer_the_page(exc, message):
+    with pytest.raises(UpdateError, match=message) as caught:
+        updater.fetch_latest(failing(exc))
+    assert caught.value.open_page
+
+
+def test_an_answer_that_breaks_off_while_reading_is_reported():
+    with pytest.raises(UpdateError, match="No connection") as caught:
+        updater.fetch_latest(lambda request, timeout=None: Broken(b""))
+    assert caught.value.open_page
+
+
+def test_a_download_that_breaks_off_is_deleted_and_offers_the_page(tmp_path):
+    def urlopen(request, timeout=None):
+        return FakeResponse(SHA.encode()) if request.full_url.endswith(".sha256") else Broken(b"")
+
+    with pytest.raises(UpdateError, match="Download fehlgeschlagen") as caught:
+        updater.download(release(), tmp_path, urlopen)
+    assert caught.value.open_page and list(tmp_path.iterdir()) == []
+
+
+def test_missing_checksum_or_exe_offers_the_page_and_still_refuses(tmp_path):
+    with pytest.raises(UpdateError, match="no checksum") as caught:
+        updater.download(release(sha_url=None), tmp_path, serving({"MourseDecoder.exe": EXE}))
+    assert caught.value.open_page and list(tmp_path.iterdir()) == []
+    with pytest.raises(UpdateError, match="contains no MourseDecoder.exe") as caught:
+        updater.fetch_latest(serving({"latest": json.dumps(release_json(assets=["x.zip"])).encode()}))
+    assert caught.value.open_page
+
+
+def test_a_wrong_checksum_does_not_send_the_user_to_download_by_hand(tmp_path):
+    routes = {"MourseDecoder.exe": EXE + b"x", "MourseDecoder.exe.sha256": SHA.encode()}
+    with pytest.raises(UpdateError, match="passt nicht") as caught:
+        updater.download(release(), tmp_path, serving(routes))
+    assert not caught.value.open_page
+
+
+def test_can_write_tells_a_writable_folder_from_a_missing_one(tmp_path):
+    assert updater._can_write(tmp_path) and list(tmp_path.iterdir()) == []
+    assert not updater._can_write(tmp_path / "gibt-es-nicht")
+
+
+def frozen_at(monkeypatch, exe):
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(sys, "executable", str(exe))
+
+
+def test_install_stops_before_downloading_when_the_exe_folder_is_not_writable(tmp_path, monkeypatch):
+    frozen_at(monkeypatch, tmp_path / "MourseDecoder.exe")
+    monkeypatch.setattr(updater, "_can_write", lambda folder: False)
+    with pytest.raises(UpdateError, match="No permission to write") as caught:
+        updater.install(release(), failing(AssertionError("darf nicht laden")), lambda *a, **kw: pytest.fail("start"))
+    assert caught.value.open_page and str(tmp_path) in str(caught.value)
+
+
+def test_powershell_that_cannot_start_is_reported_and_the_download_removed(tmp_path, monkeypatch):
+    frozen_at(monkeypatch, tmp_path / "MourseDecoder.exe")
+    made = []
+    real_mkdtemp = updater.tempfile.mkdtemp
+    monkeypatch.setattr(updater.tempfile, "mkdtemp", lambda **kw: made.append(real_mkdtemp(**kw)) or made[-1])
+
+    def blocked(*a, **kw):
+        raise PermissionError("durch Richtlinie gesperrt")
+
+    routes = {"MourseDecoder.exe": EXE, "MourseDecoder.exe.sha256": SHA.encode()}
+    with pytest.raises(UpdateError, match="PowerShell could not be started") as caught:
+        updater.install(release(), serving(routes), blocked)
+    assert caught.value.open_page and made and not Path(made[0]).exists()
+
+
+def test_powershell_is_started_by_full_path_when_it_exists(tmp_path, monkeypatch):
+    shell = tmp_path / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    shell.parent.mkdir(parents=True)
+    shell.write_bytes(b"")
+    monkeypatch.setenv("SystemRoot", str(tmp_path))
+    calls = []
+    updater.run_after_exit("exit 0", lambda *a, **kw: calls.append(a))
+    assert calls[0][0][0] == str(shell)
+    monkeypatch.setenv("SystemRoot", str(tmp_path / "nichts"))  # no such file: fall back to the PATH lookup
+    updater.run_after_exit("exit 0", lambda *a, **kw: calls.append(a))
+    assert calls[1][0][0] == "powershell.exe"
+
+
+# --- uninstall with the question about the own files ---
+
+
+def test_uninstall_without_data_returns_no_folders_but_still_checks_the_name(tmp_path):
+    assert updater.uninstall_targets(tmp_path / "MourseDecoder", delete_data=False) == []
+    with pytest.raises(UpdateError, match="gehört nicht zum Programm"):
+        updater.uninstall_targets(tmp_path / "Documents", delete_data=False)
+    with pytest.raises(UpdateError):
+        updater.uninstall(tmp_path / "Documents", lambda *a, **kw: pytest.fail("start"), delete_data=False)
+
+
+def test_uninstall_script_without_folders_deletes_only_the_exe():
+    script = updater.uninstall_script(Path("C:/App/MourseDecoder.exe"), [])
+    assert "Remove-Item -LiteralPath $exe" in script and "-Recurse" not in script
+
+
+def test_uninstall_script_with_folders_deletes_them_too():
+    script = updater.uninstall_script(Path("C:/App/MourseDecoder.exe"), [Path("C:/Users/x/AppData/Roaming/MourseDecoder")])
+    assert "-Recurse" in script and "MourseDecoder'" in script
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="PowerShell")
+def test_uninstall_script_keeps_the_data_when_given_no_folders(tmp_path):
+    exe, config = tmp_path / "MourseDecoder.exe", tmp_path / "MourseDecoder"
+    exe.write_bytes(b"x")
+    config.mkdir()
+    (config / "settings.json").write_text("{}")
+    assert powershell(updater.uninstall_script(exe, [], delay_s=0)) == 0
+    assert not exe.exists() and (config / "settings.json").exists()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="nur Windows nutzt das Skript")
+def test_uninstall_from_the_exe_can_keep_the_data(tmp_path, monkeypatch):
+    frozen_at(monkeypatch, tmp_path / "MourseDecoder.exe")
+    calls = []
+    updater.uninstall(tmp_path / "MourseDecoder", lambda *a, **kw: calls.append(a), delete_data=False)
+    script = decoded(calls[0][0])
+    assert "$exe" in script and "-Recurse" not in script and "PolyglotMorse" not in script
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="nur Windows nutzt das Skript")
+def test_uninstall_from_the_exe_with_data_removes_both_folders(tmp_path, monkeypatch):
+    frozen_at(monkeypatch, tmp_path / "MourseDecoder.exe")
+    calls = []
+    updater.uninstall(tmp_path / "MourseDecoder", lambda *a, **kw: calls.append(a))
+    script = decoded(calls[0][0])
+    assert "$exe" in script and "PolyglotMorse'" in script and script.count("-Recurse") == 2
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="nur Windows nutzt das Skript")
+def test_uninstall_from_a_checkout_without_data_starts_nothing(tmp_path, monkeypatch):
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    updater.uninstall(tmp_path / "MourseDecoder", lambda *a, **kw: pytest.fail("nichts zu tun"), delete_data=False)
+
+
+def test_uninstall_refuses_when_the_exe_cannot_be_deleted(tmp_path, monkeypatch):
+    frozen_at(monkeypatch, tmp_path / "MourseDecoder.exe")
+    monkeypatch.setattr(updater, "_can_write", lambda folder: False)
+    with pytest.raises(UpdateError, match="No permission to write"):
+        updater.uninstall(tmp_path / "MourseDecoder", lambda *a, **kw: pytest.fail("start"))
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Nicht-Windows löscht direkt")
+def test_uninstall_elsewhere_keeps_the_data_on_request(tmp_path):
+    config = tmp_path / "mourse-decoder"
+    config.mkdir()
+    updater.uninstall(config, delete_data=False)
+    assert config.exists()

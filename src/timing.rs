@@ -615,4 +615,29 @@ mod tests {
         let err = TimingConfig::from_millis(200, 600, 500).unwrap_err();
         assert!(err.to_string().contains("word_gap_ms (500)"));
     }
+
+    #[test]
+    fn second_key_pressed_while_the_first_is_down_adds_no_symbol() {
+        // what the hook delivers for separate dot/dash keys: the refused second key never
+        // reaches the timer, but a stray press or release must not corrupt the sequence either
+        let mut timer = MorseTimer::new(TimingConfig::default());
+        let t0 = Instant::now();
+        timer.on_press(t0);
+        timer.on_press(t0 + ms(20)); // second key, treated as key repeat
+        assert_eq!(
+            timer.on_release_as(t0 + ms(50), Symbol::Dot),
+            Some(Symbol::Dot)
+        );
+        assert_eq!(
+            timer.on_release_as(t0 + ms(60), Symbol::Dash),
+            None,
+            "the second key's release has no press left"
+        );
+        timer.on_press(t0 + ms(100));
+        assert_eq!(
+            timer.on_release_as(t0 + ms(130), Symbol::Dot),
+            Some(Symbol::Dot)
+        );
+        assert_eq!(timer.pending_sequence(), "..");
+    }
 }

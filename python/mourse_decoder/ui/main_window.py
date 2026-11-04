@@ -303,7 +303,15 @@ class MainWindow:
                 page.refresh()
         self._update_status()
 
+    def _update_busy(self) -> bool:
+        page = self._pages.get("update")
+        # UpdatePanel should expose ``busy``; until then its private flag is read
+        return page is not None and bool(getattr(page, "busy", getattr(page, "_busy", False)))
+
     def _rebuild(self) -> None:
+        if self._update_busy():  # destroying the panel mid-download would lose the install result
+            self._root.after(1000, self._rebuild)
+            return
         self._rebuild_pending = False
         self._build()
         self._on_alphabets_changed()  # tray menu in the new language

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import tkinter as tk
 
 import pytest
 from mourse_decoder import function_keys as fk
@@ -112,17 +111,11 @@ def test_function_keys_strings_exist_in_every_language():
 
 
 @pytest.fixture(scope="module")
-def root():
-    try:
-        window = tk.Tk()
-    except tk.TclError:
-        pytest.skip("kein Display")
+def root(tk_root):
     from mourse_decoder.ui import theme
 
-    theme.apply_theme(window, "light")
-    yield window
-    window.destroy()
-    theme._images.clear()  # cached images belong to this root; a later test with another root would hit them
+    theme.apply_theme(tk_root, "light")
+    return tk_root
 
 
 class FakeToast:

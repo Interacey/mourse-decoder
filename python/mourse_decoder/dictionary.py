@@ -18,14 +18,15 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from . import jsontext
 from .smileys import BUILTIN_SMILEY_DIR, SmileySetInfo, list_smiley_sets, load_smiley_codes
 
 BUILTIN_ALPHABET_DIR = Path(__file__).with_name("alphabets")
 
 # dots and dashes only, 1-32 symbols (32 = MAX_SEQUENCE_LEN in the Rust core)
-_CODE_PATTERN = re.compile(r"^[.-]{1,32}$")
+_CODE_PATTERN = re.compile(r"^[.-]{1,32}\Z")
 # ids double as file names
-_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]*\Z")
 
 
 class AlphabetError(ValueError):
@@ -79,12 +80,11 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 def _read_json(path: Path) -> dict[str, Any]:
     try:
-        with path.open(encoding="utf-8") as fh:
-            # strict=False: hand-edited files may hold raw line breaks inside strings
-            data = json.load(fh, object_pairs_hook=_reject_duplicate_keys, strict=False)
+        # utf-8-sig: editors add a BOM; jsontext: hand-edited files may hold raw line breaks and stray quotes
+        data = jsontext.loads(path.read_text(encoding="utf-8-sig"), _reject_duplicate_keys)
     except AlphabetError as exc:
         raise AlphabetError(f"{path.name}: {exc}") from None
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise AlphabetError(f"{path.name}: nicht lesbar ({exc})") from exc
     if not isinstance(data, dict):
         raise AlphabetError(f"{path.name}: Wurzelelement muss ein Objekt sein")
@@ -140,7 +140,7 @@ def load_alphabet(alphabet_id: str, directory: Path | Sequence[Path] = BUILTIN_A
         candidates = [d / f"{current}.json" for d in directories]
         path = next((p for p in candidates if p.is_file()), None)
         if path is None:
-            raise AlphabetError(f"Alphabet '{current}' nicht gefunden ({candidates[0]})")
+            raise AlphabetError(f"Alphabet '{current}' nicht gefunden ({candidates[-1]})")
         data, _ = _read_info(path)
         data["_path"] = path
         chain.append(data)

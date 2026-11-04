@@ -130,7 +130,12 @@ def _put(fmt: int, data: bytes) -> None:
     handle = _kernel32.GlobalAlloc(GMEM_MOVEABLE, max(len(data), 1))
     if not handle:
         raise ctypes.WinError(ctypes.get_last_error())
-    ctypes.memmove(_kernel32.GlobalLock(handle), data, len(data))
+    pointer = _kernel32.GlobalLock(handle)
+    if not pointer:
+        error = ctypes.WinError(ctypes.get_last_error())
+        _kernel32.GlobalFree(handle)
+        raise error
+    ctypes.memmove(pointer, data, len(data))
     _kernel32.GlobalUnlock(handle)
     if not _user32.SetClipboardData(fmt, handle):
         _kernel32.GlobalFree(handle)  # only freed on failure, on success Windows owns it

@@ -349,8 +349,7 @@ impl PyMorseEngine {
         }
     }
 
-    /// True once if Esc was pressed twice within 500 ms since the last call (reads and
-    /// clears the flag).
+    /// True once if Esc was pressed since the last call (reads and clears the flag).
     fn poll_abort(&self) -> bool {
         #[cfg(feature = "native-io")]
         {

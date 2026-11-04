@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import tkinter as tk
-
 import pytest
 from mourse_decoder.ui import key_capture
 from mourse_decoder.ui.key_capture import CAPTURE_TIMEOUT_S, ShortcutCaptureButton
@@ -28,13 +26,8 @@ class FakeBackend:
 
 
 @pytest.fixture(scope="module")
-def root():
-    try:
-        window = tk.Tk()
-    except tk.TclError:
-        pytest.skip("kein Display")
-    yield window
-    window.destroy()
+def root(tk_root):
+    return tk_root
 
 
 @pytest.fixture

@@ -128,4 +128,25 @@ def test_form_keeps_untouched_fields():
 
 def test_every_trigger_is_valid():
     for name in TRIGGER_NAMES:
-        assert Settings(trigger=name).validate() == []
+        assert Settings(trigger=name, block_shortcut="").validate() == []  # Pause clashes with Ctrl+Shift+Pause
+
+
+def test_old_file_with_clashing_shortcut_keeps_settings(tmp_path):
+    """Saved before the clash check: trigger Pause fires with Ctrl+Shift+Pause. Load clears the shortcut only."""
+    store = SettingsStore(tmp_path)
+    data = Settings().to_dict()
+    data.update(trigger="Pause", separate_dash_key=True, dash_trigger="F9", dot_threshold_ms=222, alphabet="morse")
+    data["block_shortcut"] = "Ctrl+Shift+Pause"
+    (tmp_path / "settings.json").write_text(json.dumps(data), encoding="utf-8")
+    loaded = store.load()
+    assert loaded.block_shortcut == ""
+    assert (loaded.trigger, loaded.dot_threshold_ms, loaded.alphabet) == ("Pause", 222, "morse")
+    assert not (tmp_path / "settings.json.bak").exists()  # file kept, not moved away
+
+
+def test_clash_without_shortcut_cause_still_falls_back(tmp_path):
+    data = Settings().to_dict()
+    data.update(trigger="F9", separate_dash_key=True, dash_trigger="F9")
+    (tmp_path / "settings.json").write_text(json.dumps(data), encoding="utf-8")
+    assert SettingsStore(tmp_path).load() == Settings()
+    assert (tmp_path / "settings.json.bak").exists()

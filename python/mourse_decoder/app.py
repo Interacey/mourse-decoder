@@ -8,14 +8,21 @@ import os
 import sys
 import time
 
-from . import desktop
+from . import desktop, updater
 from ._native import load_native
 from .controller import MorseController, NativeInjector
-from .dictionary import DictionaryManager
+from .dictionary import AlphabetError, DictionaryManager
 from .function_keys import FunctionKeysStore
-from .settings import SettingsStore
+from .i18n import set_language, tr
+from .settings import Settings, SettingsStore
+from .telecode import TelecodeError
 
 log = logging.getLogger("mourse_decoder")
+
+FALLBACK_ALPHABET = "latin"
+MUTEX_NAME = "Local\\MourseDecoder"
+_ERROR_ALREADY_EXISTS = 183
+_mutex_handles: list[int] = []  # kept open for the life of the process
 
 
 class _ConsoleListener:
@@ -29,6 +36,75 @@ class _ConsoleListener:
 
     def on_error(self, message: str) -> None:
         print(f"Fehler: {message}", file=sys.stderr, flush=True)
+
+
+def build_controller(engine, injector, dictionaries, settings: Settings, listener=None):
+    """Controller for ``settings``; if the alphabet cannot be loaded, the default one is used.
+
+    Returns (controller, warnings). The settings file is not touched; only the running
+    controller uses the fallback.
+    """
+    try:
+        return MorseController(engine, injector, dictionaries, settings, listener=listener), []
+    except (AlphabetError, TelecodeError) as exc:
+        fallback = settings.replace(alphabet=FALLBACK_ALPHABET)
+        warning = tr("startup.alphabet_fallback", id=settings.alphabet, msg=exc)
+        return MorseController(engine, injector, dictionaries, fallback, listener=listener), [warning]
+
+
+def acquire_single_instance(name: str = MUTEX_NAME) -> bool:
+    """True if this is the only instance (named mutex, Windows only; other systems always True)."""
+    if sys.platform != "win32":
+        return True
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        handle = kernel32.CreateMutexW(None, False, name)
+        if not handle:
+            return True  # no mutex, no guard: better a second instance than none
+        _mutex_handles.append(handle)
+        return ctypes.get_last_error() != _ERROR_ALREADY_EXISTS
+    except (AttributeError, OSError):
+        return True
+
+
+def show_update_result(directory, show=None) -> None:
+    """Tell once what became of the last update or uninstall; reading removes the result file."""
+    message = updater.read_update_result(directory)
+    if not message:
+        return
+    if show is None:
+        from tkinter import messagebox
+
+        show = messagebox.showwarning
+    show(tr("update.result.title"), message)
+
+
+def _tell_already_running() -> None:
+    message = tr("app.already_running")
+    print(message, file=sys.stderr, flush=True)
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            ctypes.windll.user32.MessageBoxW(None, message, "Mourse Decoder", 0x40)
+        except (AttributeError, OSError):
+            pass
+
+
+def _tolerate_unencodable_output() -> None:
+    """A redirected stdout may be cp1252 and could not print → or Japanese text; replace instead of raising."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(errors="replace")
+            except (ValueError, OSError):
+                pass
 
 
 def _start_function_keys(controller: MorseController, directory, injector) -> list[str]:
@@ -78,6 +154,7 @@ def _prepare_windows() -> None:
     for name in ("stdout", "stderr"):
         if getattr(sys, name) is None:
             setattr(sys, name, open(os.devnull, "w"))  # noqa: SIM115 - lives as long as the process
+    _tolerate_unencodable_output()
     if sys.platform == "win32":
         try:
             import ctypes
@@ -134,6 +211,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(levelname)s %(message)s")
 
+    if not args.dry_run and not acquire_single_instance():
+        _tell_already_running()
+        return 3
+
     try:
         native = load_native()
     except RuntimeError as exc:
@@ -142,6 +223,7 @@ def main(argv: list[str] | None = None) -> int:
 
     store = SettingsStore()
     settings = store.load()
+    set_language(settings.language, store.directory / "languages")  # startup warnings use it
     dictionaries = DictionaryManager(
         telecode_db=store.directory / "telecode.sqlite",
         user_directory=store.directory / "alphabets",
@@ -151,9 +233,9 @@ def main(argv: list[str] | None = None) -> int:
     injector = _PrintInjector() if args.dry_run else NativeInjector(native)
 
     if args.headless:
-        controller = MorseController(engine, injector, dictionaries, settings, listener=_ConsoleListener())
+        controller, startup_warnings = build_controller(engine, injector, dictionaries, settings, _ConsoleListener())
         controller.start()
-        for warning in _start_function_keys(controller, store.directory, injector):
+        for warning in startup_warnings + _start_function_keys(controller, store.directory, injector):
             print(f"Warnung: {warning}", file=sys.stderr, flush=True)
         print(f"Morse-Decoder läuft (Taster: {settings.trigger}, Alphabet: {settings.alphabet}). Strg+C beendet.")
         try:
@@ -172,12 +254,13 @@ def main(argv: list[str] | None = None) -> int:
     # imported here so headless mode never loads tkinter or pystray
     from .ui.tray import TrayApp
 
-    controller = MorseController(engine, injector, dictionaries, settings)
-    tray = TrayApp(controller, dictionaries, store, start_hidden=args.minimized)
+    controller, startup_warnings = build_controller(engine, injector, dictionaries, settings)
+    tray = TrayApp(controller, dictionaries, store, start_hidden=args.minimized, hook_error=native.hook_error)
     controller.set_listener(tray)  # breaks the tray <-> controller cycle
     controller.start()
-    for warning in _start_function_keys(controller, store.directory, injector):
+    for warning in startup_warnings + _start_function_keys(controller, store.directory, injector):
         tray.on_error(warning)
+    show_update_result(store.directory)
     try:
         tray.run()
     finally:

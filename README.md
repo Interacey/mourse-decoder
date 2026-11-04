@@ -25,7 +25,7 @@ The program has a hybrid architecture: **Rust** handles everything time-critical
 
 `MourseDecoder.exe` is attached to each release on GitHub. Download it and double-click to run; neither Python nor Rust is required. The file `MourseDecoder.exe.sha256` next to it allows verifying the download. Windows SmartScreen warns about unknown, unsigned programs; choose "More info" → "Run anyway".
 
-The **Update** page of the program shows the notes of the latest release, downloads its `MourseDecoder.exe`, checks it against the published SHA-256 and replaces itself (the program closes and starts again). The same page removes the program completely: the exe, the settings, your own alphabets, smiley sets and languages (`%APPDATA%\MourseDecoder`, and the old `PolyglotMorse` folder). Nothing else is touched.
+The **Update** page of the program shows the notes of the latest release, downloads its `MourseDecoder.exe`, checks it against the published SHA-256 and replaces itself (the program closes and starts again). If the update cannot run by itself (GitHub's request limit, no connection, no checksum file in the release, an exe folder you cannot write to, PowerShell blocked), the page shows the reason and a button "Open download page" so you can download the exe by hand (nothing opens by itself); a checksum that does not match never opens it. The same page uninstalls the program: after one confirmation it asks whether your own files (settings, cache, JSON files, alphabets, smiley sets and languages in `%APPDATA%\MourseDecoder`, and the old `PolyglotMorse` folder) should be deleted too. Yes deletes the exe and these folders, No deletes only the exe, Cancel or closing the question deletes nothing. Nothing else is touched.
 
 To build the executable yourself (after the quick start below), run `pip install pyinstaller` and `python packaging/build.py`. The result is placed in `dist/`.
 
@@ -107,6 +107,8 @@ Edge cases:
 - Counter values are put in after all escapes were handled and are never searched for escapes or brackets again.
 
 Modifiers: `Ctrl`/`Strg`, `Alt`, `Shift`/`Umschalt`, `Win`/`Windows`. Keys: one character, `F1`–`F12`, `Enter`/`Eingabe`, `Tab`, `Esc`, `Backspace`/`Rücktaste`, `Delete`/`Entf`, `Space`/`Leertaste`, `Home`/`Pos1`, `End`/`Ende`, `PageUp`/`BildAuf`, `PageDown`/`BildAb`, `Up`/`Hoch`, `Down`/`Runter`, `Left`/`Links`, `Right`/`Rechts`. The commands have German names too: `{Warte 500}`, `{WarteFenster …}`, `{Schleife 3}…{SchleifenEnde}`.
+
+`{Backspace 5}` presses a key several times (count 1 to 1000 after a space, e.g. `{Space 18}`, `{Ctrl+End 2}`).
 
 Protection against mistakes:
 - The whole macro is checked first. A typo such as `{Crtl+C}` stops it with a message, and nothing is typed. Braces without letters or digits, such as `{^_^}`, are typed as text.
@@ -288,17 +290,17 @@ Copy `python/mourse_decoder/locales/en.json` as a template and translate the val
 - Modifiers must match exactly: `F13` does not fire while Ctrl is held, `Ctrl+F13` does not fire under Ctrl+Alt. A trigger must differ from the Morse key, the dash key and the two shortcuts, and from every other active slot. Esc, the modifier keys and plain typing keys (letters, digits, Space, Enter, Backspace, Tab, punctuation, numpad without Ctrl, Alt or Win) are refused as triggers, because the hook would otherwise fire on normal typing; a right or middle click is refused only while it is swallowed and has no modifier.
 - `swallow` (default on) hides the trigger key from the focused app. A key without a slot is never touched. On Linux the hook can only watch, so triggers always reach the app.
 - Before the macro types, the program waits up to 3 seconds for Ctrl, Alt, Shift and Win to be let go; otherwise typed text would turn into shortcuts. One macro runs at a time, a second trigger meanwhile is ignored. Keys sent by the program itself never fire a slot, so a macro containing `{F13}` does not start itself.
-- Pressing Esc twice within 500 ms stops any running macro, also those of Morse letters. Esc itself still reaches the app.
+- Pressing Esc stops any running macro, also those of Morse letters. Esc itself still reaches the app.
 
-**The Function keys page** lists all 100 slots with type (real or virtual), trigger, label or macro and status; the switch "Only assigned" and the search box narrow the list. Select a slot to edit its macro, label, trigger (click the trigger button, press the keys; "Default" restores the standard one), "Active" and "Swallow the key". The macro is checked while you type and a mistake is shown in red; "Save" is available once the slot is valid and installs it right away. "Test" runs the saved macro after 3 seconds, so you can click into the target window first, and "Reset" returns the slot to its default trigger with an empty macro. For a virtual slot, set the Stream Deck button to send the combination shown in the Trigger column. Esc, Esc stops a running macro.
+**The Function keys page** lists all 100 slots with type (real or virtual), trigger, label or macro and status; the switch "Only assigned" and the search box narrow the list. Select a slot to edit its macro, label, trigger (click the trigger button, press the keys; "Default" restores the standard one), "Active" and "Swallow the key". The macro is checked while you type and a mistake is shown in red; "Save" is available once the slot is valid and installs it right away. "Test" runs the saved macro after 3 seconds, so you can click into the target window first, and "Reset" returns the slot to its default trigger with an empty macro. For a virtual slot, set the Stream Deck button to send the combination shown in the Trigger column. Esc stops a running macro.
 
 ## Security
 
 - **Network paths are refused** in `{File …}`. Merely checking whether `\\server\share\x` exists makes Windows log in at that server and hand over the user's NTLM hash, so a smiley set from a stranger could leak it. Local drives and mapped drives (`Z:\`) work.
 - **Warning before an import:** if a file you import holds commands that do something when keyed (`{Win+R}`, `{Enter}`, `{File …}`, `{Clipboard}`), you are asked once, with the list. Waiting, loops and plain text never ask, and neither do the files that ship with the app. Saving in the editor and typing stay silent.
-- **Updates:** only `https://github.com/…` links, a redirect to plain `http` is refused, the answer is capped at 1 MB and the download at 200 MB, the SHA-256 must match, and the file must start like a Windows program (`MZ`). Nothing is installed without a published checksum. The checksum comes from the same release as the exe, so it protects against a damaged download, not against a hijacked release (that would need a signature).
-- **Uninstall** deletes only folders named `MourseDecoder`, `mourse-decoder` or `PolyglotMorse`, whatever `APPDATA` says.
-- **PowerShell helper:** no `-ExecutionPolicy Bypass`, the script is passed encoded and every path is quoted. Its exit code says what happened (0 done, 1 file stayed busy, 2 replaced but did not start), and the temporary download folder is removed.
+- **Updates:** only `https://github.com/…` links; every hop of a redirect must be `https` on `github.com`, `api.github.com` or `*.githubusercontent.com`, anything else is refused; the answer is capped at 1 MB and the download at 200 MB, the SHA-256 must match, and the file must start like a Windows program (`MZ`). Nothing is installed without a published checksum. The checksum comes from the same release as the exe, so it protects against a damaged download, not against a hijacked release (that would need a signature).
+- **Uninstall** (the data part, if you choose it) deletes only folders named `MourseDecoder`, `mourse-decoder` or `PolyglotMorse`, whatever `APPDATA` says, and skips such a folder if it is a junction or symlink.
+- **PowerShell helper:** no `-ExecutionPolicy Bypass`, the script is passed encoded and every path is quoted (also against the typographic quotes `‘ ’ ‚ ‛`, which PowerShell treats like `'`) and used literally (`[ ]` are no wildcards). Its exit code says what happened (0 done, 1 file stayed busy, 2 replaced but did not start). If the exe stays locked for about a minute, the old program is started again, the temporary download folder is removed and `update-result.txt` in the settings folder gets a one-word reason, which the next start shows once and deletes.
 - **Language files** from your folder may only use plain `{names}` as placeholders. `{msg.__class__.__init__.__globals__}` and similar are shown as text instead of reading anything.
 - **Passwords:** `{Clipboard}` is typed, never logged, never shown on the Live page, and never printed in dry-run mode.
 
@@ -309,8 +311,8 @@ Started in the tray, the app uses about 29 MB of private memory (it was 40 MB). 
 ## Tests
 
 ```bash
-cargo test                 # 67 Rust tests (timing, worker, trigger, hook routing)
-pytest                     # 614 Python tests (some of them against the real Rust module and the real Windows clipboard)
+cargo test                 # 107 Rust tests (timing, worker, trigger, hook routing)
+pytest                     # 1068 Python tests (some of them against the real Rust module and the real Windows clipboard)
 ruff check python tests
 ```
 
@@ -327,7 +329,7 @@ An end-to-end run was also done on Linux with a virtual X display (Xvfb) and `xd
 | `hooks.rs` | One global hook thread per process, routed to the current worker | `rdev::listen` blocks forever and cannot be cancelled, so start and stop only change the route. The callback performs only a lock, a comparison and a `send`, because Windows silently removes low-level hooks that respond too slowly. Timestamps use `Instant` (monotonic) rather than `SystemTime` (which jumps on NTP adjustments). |
 | `injector.rs` | `inject_text`, `inject_backspaces` via enigo | `KEYEVENTF_UNICODE` types every character independently of the keyboard layout. Backspaces are needed for dakuten (カ→ガ) and telecodes. A short hook lock prevents feedback, for example when the space bar is the key and a space is injected. |
 | `trigger.rs` | Permitted keys as a separate enum | Configuration and tests do not depend on rdev. |
-| `function_keys.rs` | Slot table with a queue of fired slots, Esc-Esc detector | Both are state machines that take event, modifiers and time as arguments. The hook callback only writes the slot number into a queue of 64; Python runs the macro. |
+| `function_keys.rs` | Slot table with a queue of fired slots, Esc detector | Both are state machines that take event, modifiers and time as arguments. The hook callback only writes the slot number into a queue of 64; Python runs the macro. |
 | `python.rs` | PyO3 class `MorseEngine` and functions | `stop()` releases the GIL before the `join` (`py.detach`). Otherwise a deadlock occurs when the worker is waiting for the GIL. Exceptions in callbacks go to `sys.unraisablehook` instead of killing the worker. |
 
 Cargo features: `native-io` (hooks and injection, enabled by default) and `python` (PyO3, set by maturin). This allows `cargo test` to run without Python.

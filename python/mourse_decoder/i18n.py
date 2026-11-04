@@ -79,6 +79,17 @@ class _PlainFormatter(string.Formatter):
             raise ValueError(f"Platzhalter {field_name!r} nicht erlaubt")
         return kwargs[field_name], field_name
 
+    def convert_field(self, value: object, conversion: str | None) -> object:
+        if conversion:
+            raise ValueError("Umwandlung im Platzhalter nicht erlaubt")
+        return value
+
+    def format_field(self, value: object, format_spec: str) -> str:
+        # a spec such as {n:>999999999} would allocate gigabytes
+        if format_spec:
+            raise ValueError("Formatangabe im Platzhalter nicht erlaubt")
+        return str(value)
+
 
 _formatter = _PlainFormatter()
 

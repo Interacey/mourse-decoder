@@ -54,11 +54,18 @@ class UpdatePanel(tk.Frame):
         self._check_btn.pack(side="left", padx=(0, 8))
         self._install_btn.pack(side="left")
         self._install_btn.set_enabled(False)
+        self._page_btn = Button(buttons, tr("update.open_page"), self._open_page, min_width=170)  # shown after a failure
+        self._page: str = updater.RELEASES_URL
 
         label(self, tr("uninstall.section"), size=9, weight="bold", muted=True).grid(row=5, column=0, sticky="w", pady=(24, 8))
         removal = Card(self)
         removal.grid(row=6, column=0, sticky="ew")
         Button(removal.add_row(tr("uninstall.title"), tr("uninstall.hint")), tr("uninstall.button"), self._uninstall).pack()
+
+    @property
+    def busy(self) -> bool:
+        """True while a check, download or install runs; the page must not be rebuilt then."""
+        return self._busy
 
     def refresh(self) -> None:
         """Nothing to reload: the page only talks to GitHub when a button is pressed."""
@@ -69,6 +76,7 @@ class UpdatePanel(tk.Frame):
             return
         self._busy = True
         self._status.set(status)
+        self._page_btn.pack_forget()
         self._check_btn.set_enabled(False)
         self._install_btn.set_enabled(False)
 
@@ -79,7 +87,8 @@ class UpdatePanel(tk.Frame):
                 if not isinstance(exc, updater.UpdateError):
                     log.exception("Update")
                 message = str(exc)  # `exc` is gone once this block ends, the UI thread runs the lambda later
-                self._results.put(lambda: self._failed(message))
+                open_page = getattr(exc, "open_page", False)
+                self._results.put(lambda: self._failed(message, open_page))
 
         threading.Thread(target=run, daemon=True, name="update").start()
         self.after(POLL_MS, self._poll)
@@ -88,15 +97,33 @@ class UpdatePanel(tk.Frame):
         try:
             show = self._results.get_nowait()
         except queue.Empty:
-            self.after(POLL_MS, self._poll)
+            try:
+                self.after(POLL_MS, self._poll)
+            except tk.TclError:  # the window is gone
+                pass
             return
         self._busy = False
-        self._check_btn.set_enabled(True)
-        show()
+        try:
+            if self.winfo_exists():
+                self._check_btn.set_enabled(True)
+        except tk.TclError:
+            pass
+        try:
+            show()  # also when the page is gone: after an install it quits the app, which the script waits for
+        except tk.TclError:
+            log.debug("Update page closed before the result arrived")
 
-    def _failed(self, message: str) -> None:
+    def _failed(self, message: str, open_page: bool = False) -> None:
         self._status.set(tr("update.error", msg=message))
+        if open_page:  # the update cannot run by itself: offer the page that has the exe to load by hand
+            self._page = self._release.page if self._release else updater.RELEASES_URL
+            self._page_btn.pack(side="left", padx=(8, 0))
+        else:
+            self._page_btn.pack_forget()
         self._install_btn.set_enabled(self._release is not None and updater.is_newer(self._release.tag))
+
+    def _open_page(self) -> None:
+        webbrowser.open(self._page)
 
     def _check(self) -> None:
         def job() -> Callable[[], None]:
@@ -133,10 +160,19 @@ class UpdatePanel(tk.Frame):
 
     def _uninstall(self) -> None:
         folder = default_config_dir()
-        if not messagebox.askyesno(tr("uninstall.confirm.title"), tr("uninstall.confirm", folder=folder), parent=self):
+        if not messagebox.askyesno(tr("uninstall.confirm.title"), tr("uninstall.confirm"), parent=self):
             return
         try:
-            updater.uninstall(folder)
+            folders = updater.uninstall_targets(folder)
+            shown = [f for f in folders if f.exists()] or folders[:1]
+            # Cancel or closing the dialog returns None: nothing is deleted at all
+            names = "\n".join(map(str, shown))
+            delete_data = messagebox.askyesnocancel(
+                tr("uninstall.data.title"), tr("uninstall.data", folders=names), parent=self
+            )
+            if delete_data is None:
+                return
+            updater.uninstall(folder, delete_data=delete_data)
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror(tr("uninstall.confirm.title"), tr("uninstall.error", msg=exc), parent=self)
             return

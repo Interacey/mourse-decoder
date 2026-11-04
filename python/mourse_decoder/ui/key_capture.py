@@ -22,8 +22,9 @@ POLL_MS = 30
 # After capturing, ignore clicks briefly: releasing the mouse button that was just
 # assigned (e.g. Mouse 1) must not restart the wait.
 REARM_SECONDS = 0.4
-# Nobody pressing anything for this long: stop waiting, so the global hook doesn't keep
-# swallowing the next key the user types somewhere else. A shortcut is then removed.
+# Nobody pressing anything for this long: stop waiting. The hook passes the captured key
+# on to the focused app while waiting, so nothing is swallowed; the wait just must not
+# stay armed and grab a key the user types later. A shortcut is then removed.
 CAPTURE_TIMEOUT_S = 8.0
 
 

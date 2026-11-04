@@ -20,8 +20,8 @@ from . import jsontext
 
 BUILTIN_SMILEY_DIR = Path(__file__).with_name("smiley_sets")
 
-_CODE_PATTERN = re.compile(r"^[.-]{1,32}$")
-_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+_CODE_PATTERN = re.compile(r"^[.-]{1,32}\Z")
+_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]*\Z")
 
 
 class SmileyError(ValueError):
@@ -141,7 +141,7 @@ def import_smiley_file(source: Path, builtin_dir: Path, user_dir: Path) -> Smile
     validate_codes(data)
     user_dir.mkdir(parents=True, exist_ok=True)
     target = user_dir / f"{set_id}.json"
-    target.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    jsontext.write_atomic(target, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
     return SmileySetInfo(set_id, str(data.get("name") or set_id), str(data.get("description") or ""), target, True)
 
 

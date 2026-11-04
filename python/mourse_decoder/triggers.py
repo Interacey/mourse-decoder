@@ -11,8 +11,8 @@ import re
 
 from .i18n import tr
 
-_VK = re.compile(r"^VK(\d+)$", re.IGNORECASE)
-_MOUSE = re.compile(r"^Mouse(\d+)$", re.IGNORECASE)
+_VK = re.compile(r"^VK([0-9]+)\Z", re.IGNORECASE)
+_MOUSE = re.compile(r"^Mouse([0-9]+)\Z", re.IGNORECASE)
 
 # Esc (VK27) cancels while waiting for input, so it can't be a trigger
 CANCEL_TOKEN = "VK27"

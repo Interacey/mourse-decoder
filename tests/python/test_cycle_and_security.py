@@ -230,7 +230,7 @@ def test_commands_that_do_something_are_listed(tmp_path):
         {"--..--..": "Hallo Welt"},
         {"--..--..": "{Wait 500}{Loop 3}x{EndLoop}{WaitWindow Editor}"},  # waiting and loops do nothing by themselves
         {"--..--..": "{^_^} { } {}"},  # braces that are only text
-        {"--..--..": "😀\n\n\ttext"},
+        {"--..--..": "😀 text"},  # raw line breaks and tabs are reported, see test_review_b_macros
     ],
 )
 def test_harmless_files_give_no_warning(tmp_path, codes):

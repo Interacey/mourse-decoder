@@ -18,7 +18,7 @@ from typing import TextIO
 
 # e.g. "U+4E2D<TAB>kMainlandTelegraph<TAB>0022"
 _UNIHAN_LINE = re.compile(r"^U\+([0-9A-F]{4,6})\t(kMainlandTelegraph|kTaiwanTelegraph)\t(\d{4})\s*$")
-_CODE_PATTERN = re.compile(r"^\d{4}$")
+_CODE_PATTERN = re.compile(r"^[0-9]{4}\Z")
 
 UNIHAN_FILE = "Unihan_OtherMappings.txt"
 SCHEMA = """
