@@ -130,8 +130,7 @@ def test_busy_is_true_from_start_of_work_until_the_result_is_shown(panel, root):
         if not panel.busy:
             break
         time.sleep(0.05)
-    threads = [t.name for t in threading.enumerate()]
-    assert panel.busy is False and done == [True], (threads, panel._results.qsize(), root.tk.call("after", "info"), root.tk.call("info", "tclversion"), release.is_set())
+    assert panel.busy is False and done == [True]
 
 
 def test_a_result_arriving_after_the_page_was_destroyed_is_harmless(root, tmp_path, monkeypatch):
