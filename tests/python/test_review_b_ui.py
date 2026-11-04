@@ -7,8 +7,11 @@ from types import SimpleNamespace
 
 import pytest
 
-tray_mod = pytest.importorskip("mourse_decoder.ui.tray")
-main_mod = pytest.importorskip("mourse_decoder.ui.main_window")
+try:
+    import mourse_decoder.ui.main_window as main_mod
+    import mourse_decoder.ui.tray as tray_mod
+except Exception as exc:  # pystray raises Xlib's DisplayNameError (not ImportError) without an X display
+    pytest.skip(f"UI modules not importable here: {exc!r}", allow_module_level=True)
 
 
 class Root:
