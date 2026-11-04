@@ -55,15 +55,13 @@ import dataclasses
 import itertools
 import json
 import logging
-import os
-import shutil
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from . import jsontext, macros
-from .settings import Settings, default_config_dir, is_valid_binding, normalize_binding, same_binding
+from .settings import Settings, default_config_dir, fires_with, is_valid_binding, normalize_binding, same_binding
 from .triggers import binding_label
 
 log = logging.getLogger(__name__)
@@ -222,7 +220,7 @@ class FunctionKeys:
             if not is_valid_binding(slot.trigger):
                 continue
             for what, spec in reserved:
-                if spec and is_valid_binding(spec) and _fires_with(spec, slot.trigger):
+                if spec and is_valid_binding(spec) and fires_with(spec, slot.trigger):
                     errors.append(f"{slot.name} ({slot.trigger}) kollidiert mit {what} ({spec}).")
         return errors
 
@@ -237,18 +235,11 @@ class FunctionKeys:
         return {**self.extra, "schema_version": SCHEMA_VERSION, "slots": changed}
 
 
-def _fires_with(reserved: str, slot_trigger: str) -> bool:
-    """True if ``reserved`` (extra modifiers allowed) also fires when ``slot_trigger`` is pressed."""
-    *r_mods, r_key = normalize_binding(reserved).split("+")
-    *s_mods, s_key = normalize_binding(slot_trigger).split("+")
-    return r_key == s_key and set(r_mods) <= set(s_mods)
-
-
 # Virtual-key codes: Shift, Ctrl, Alt, Caps Lock, both Windows keys, left/right Shift, Ctrl, Alt.
 _MODIFIER_VKS = frozenset({16, 17, 18, 20, 91, 92, 160, 161, 162, 163, 164, 165})
 # Backspace, Tab, Enter, digits, letters, numpad, punctuation
 _TYPING_VKS = frozenset(
-    {8, 9, 13, *range(48, 58), *range(65, 91), *range(96, 112), *range(186, 193), *range(219, 223), 226}
+    {8, 9, 13, 32, *range(48, 58), *range(65, 91), *range(96, 112), *range(186, 193), *range(219, 223), 226}
 )
 
 
@@ -256,7 +247,7 @@ def _unusable_trigger(trigger: str, swallow: bool) -> str:
     """Why ``trigger`` must not start a slot ("" if it may). Same rules as ``unusable_reason`` in src/function_keys.rs.
 
     The hook sees every key of the user: a slot on Esc, a modifier or a typing key without Ctrl, Alt or Win
-    would fire (and, swallowing, hide) normal typing, and Esc is needed for Esc, Esc.
+    would fire (and, swallowing, hide) normal typing, and Esc stops a running macro.
     """
     *modifiers, key = normalize_binding(trigger).split("+")
     shortcut = bool({"Ctrl", "Alt", "Win"} & set(modifiers))
@@ -264,7 +255,7 @@ def _unusable_trigger(trigger: str, swallow: bool) -> str:
     if key in ("ControlRight", "AltGr") or code in _MODIFIER_VKS:
         return "die Modifikatortasten"
     if code == 27:
-        return "Esc und das Abbrechen mit Esc, Esc"
+        return "Esc und das Abbrechen mit Esc"
     if (key == "Space" or code in _TYPING_VKS) and not shortcut:
         return "normales Tippen"
     if key in ("MouseRight", "MouseMiddle") and swallow and not shortcut and "Shift" not in modifiers:
@@ -274,13 +265,21 @@ def _unusable_trigger(trigger: str, swallow: bool) -> str:
 
 def _slot_errors(slot: Slot, check_shortcut: Callable[[str], None] | None) -> list[str]:
     errors: list[str] = []
-    if not isinstance(slot.trigger, str) or (slot.trigger.strip() and not is_valid_binding(slot.trigger)):
+    # a switched-off slot never reaches the hook, so its trigger and macro length must not block the table
+    off = slot.enabled is False
+    if not isinstance(slot.trigger, str):
+        errors.append(f"Ungültiger Auslöser '{slot.trigger}'.")
+    elif off:
+        pass
+    elif slot.trigger.strip() and not is_valid_binding(slot.trigger):
         errors.append(f"Ungültiger Auslöser '{slot.trigger}'.")
     elif slot.trigger.strip() and (why := _unusable_trigger(slot.trigger, slot.swallow is not False)):
         errors.append(f"{normalize_binding(slot.trigger)} ist als Auslöser nicht erlaubt (stört {why}).")
     if not isinstance(slot.macro, str):
         return [*errors, "Das Makro muss ein Text sein."]
-    if len(slot.macro) > MAX_MACRO_LENGTH:
+    if off:
+        pass
+    elif len(slot.macro) > MAX_MACRO_LENGTH:
         errors.append(f"Das Makro ist länger als {MAX_MACRO_LENGTH} Zeichen.")
     elif check_shortcut is not None and slot.macro.strip() and slot.enabled:
         try:
@@ -402,16 +401,7 @@ class FunctionKeysStore:
         if errors:
             raise ValueError("; ".join(errors))
         self.directory.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(keys.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, self.path)
+        jsontext.write_atomic(self.path, json.dumps(keys.to_dict(), indent=2, ensure_ascii=False))
 
     def _backup(self, move: bool) -> None:
-        target = self.path.with_suffix(".json.bak")
-        try:
-            if move:
-                os.replace(self.path, target)
-            else:
-                shutil.copy2(self.path, target)
-        except OSError:
-            pass
+        jsontext.backup_file(self.path, move)

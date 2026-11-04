@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import jsontext
+
 log = logging.getLogger(__name__)
 
 # Must match TriggerKey::ALL in src/trigger.rs (test_native checks it). It's duplicated
@@ -32,10 +34,11 @@ THEME_MODES: tuple[str, ...] = ("system", "light", "dark")
 
 # Any key (Windows virtual-key code) and extra mouse buttons from Mouse4 on.
 # Keep in sync with TriggerKey::from_str in src/trigger.rs.
-_VK_PATTERN = re.compile(r"^VK(\d{1,3})$", re.IGNORECASE)
-_MOUSE_PATTERN = re.compile(r"^Mouse(\d{1,2})$", re.IGNORECASE)
+# [0-9] and \Z instead of \d and $: Unicode digits and a trailing newline must not pass (Rust rejects them)
+_VK_PATTERN = re.compile(r"^VK([0-9]{1,3})\Z", re.IGNORECASE)
+_MOUSE_PATTERN = re.compile(r"^Mouse([0-9]{1,2})\Z", re.IGNORECASE)
 # F13..F24 are keys of their own (virtual-key codes 124..135); VK124 is the same key as F13
-_EXTRA_F_PATTERN = re.compile(r"^F(1[3-9]|2[0-4])$", re.IGNORECASE)
+_EXTRA_F_PATTERN = re.compile(r"^F(1[3-9]|2[0-4])\Z", re.IGNORECASE)
 _F13_VK = 124
 
 
@@ -119,13 +122,37 @@ def same_binding(first: str, second: str) -> bool:
     return normalize_binding(first).lower() == normalize_binding(second).lower() or _loose(first) == _loose(second)
 
 
+def fires_with(reserved: str, other: str) -> bool:
+    """True if ``reserved`` (extra modifiers allowed) also fires when ``other`` is pressed.
+
+    Same key, and ``reserved`` needs no modifier that ``other`` lacks; see ``KeyBinding::fires_with``
+    in src/trigger.rs. Both specs must be valid.
+    """
+    *r_mods, r_key = normalize_binding(reserved).split("+")
+    *o_mods, o_key = normalize_binding(other).split("+")
+    return r_key == o_key and set(r_mods) <= set(o_mods)
+
+
+def keys_clash(first: str, second: str) -> bool:
+    """True if one of two valid bindings also fires when the other is pressed."""
+    return fires_with(first, second) or fires_with(second, first)
+
+
+# Esc aborts typing and a running macro, so it can't be a Morse key (with any modifiers)
+_ESC_KEYS = ("VK27",)
+
+
+def _is_esc(spec: str) -> bool:
+    return normalize_binding(spec).split("+")[-1] in _ESC_KEYS
+
+
 def _loose(spec: str) -> tuple[frozenset[str], str]:
     *modifiers, key = (part.strip().lower() for part in spec.split("+"))
     return frozenset(modifiers), key
 
 
 # same shape as an alphabet id (which is also its file name), see dictionary.py
-_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]*\Z")
 MAX_CYCLE_ALPHABETS = 64
 
 # UI limits in ms: below 50 nobody can tell dot from dash on purpose, above 5 s it isn't morsing
@@ -194,6 +221,7 @@ class Settings:
                 errors.append(f"Ungültiges Tastenkürzel '{spec}'.")
         if self.block_shortcut and self.cycle_shortcut and same_binding(self.block_shortcut, self.cycle_shortcut):
             errors.append("Die beiden Kürzel (Ein/Aus und Umschalten) müssen verschieden sein.")
+        errors.extend(self._shortcut_clash_errors())
         errors.extend(self._cycle_errors())
         return errors
 
@@ -212,9 +240,46 @@ class Settings:
             return ["'separate_dash_key' muss true oder false sein."]
         if not is_valid_binding(self.dash_trigger):
             return [f"Unbekannte Strich-Taste '{self.dash_trigger}'."]
+        if _is_esc(self.trigger) or (self.separate_dash_key and _is_esc(self.dash_trigger)):
+            return ["Esc bricht die Eingabe ab und kann keine Morse-Taste sein."]
         if self.separate_dash_key and same_binding(self.trigger, self.dash_trigger):
             return ["Punkt- und Strich-Taste müssen verschieden sein."]
+        if self.separate_dash_key and keys_clash(self.trigger, self.dash_trigger):
+            return [
+                f"Punkt-Taste ({self.trigger}) und Strich-Taste ({self.dash_trigger}) stören sich: "
+                "eine löst auch die andere aus."
+            ]
         return []
+
+    def _shortcut_clash_errors(self) -> list[str]:
+        """Shortcuts that a Morse key also fires on, or that fire on a Morse key press."""
+        morse = [("Punkt-Taste", self.trigger)]
+        if self.separate_dash_key:
+            morse.append(("Strich-Taste", self.dash_trigger))
+        errors = []
+        shortcuts = (("Ein/Aus-Kürzel", self.block_shortcut), ("Umschalt-Kürzel", self.cycle_shortcut))
+        for shortcut_label, shortcut in shortcuts:
+            if not shortcut or not is_valid_binding(shortcut):
+                continue
+            for key_label, key in morse:
+                if is_valid_binding(key) and keys_clash(shortcut, key):
+                    errors.append(
+                        f"{key_label} ({key}) und {shortcut_label} ({shortcut}) stören sich: "
+                        "eine Taste löst auch die andere aus."
+                    )
+        return errors
+
+    def without_clashing_shortcuts(self) -> Settings:
+        """Copy with every shortcut cleared that clashes with a Morse key."""
+        keys = [self.trigger] + ([self.dash_trigger] if self.separate_dash_key else [])
+
+        def keep(shortcut: str) -> str:
+            clash = shortcut and is_valid_binding(shortcut) and any(
+                is_valid_binding(k) and keys_clash(shortcut, k) for k in keys
+            )
+            return "" if clash else shortcut
+
+        return self.replace(block_shortcut=keep(self.block_shortcut), cycle_shortcut=keep(self.cycle_shortcut))
 
     @property
     def engine_dash_trigger(self) -> str:
@@ -287,13 +352,18 @@ class SettingsStore:
         if not self.path.is_file():
             return Settings()
         try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
+            data = jsontext.loads(self.path.read_text(encoding="utf-8-sig"), dict)
             if not isinstance(data, dict):
                 raise ValueError("Wurzelelement ist kein Objekt")
             settings = Settings.from_dict(data)
             errors = settings.validate()
             if errors:
-                raise ValueError("; ".join(errors))
+                # files saved before the key/shortcut clash check: keep the rest, drop the clashing shortcut
+                relaxed = settings.without_clashing_shortcuts()
+                if relaxed == settings or relaxed.validate():
+                    raise ValueError("; ".join(errors))
+                log.warning("Tastenkürzel gelöscht, weil es mit einer Morse-Taste kollidiert (%s)", "; ".join(errors))
+                settings = relaxed
             return settings
         except (OSError, ValueError, TypeError) as exc:
             log.warning("Einstellungen ungültig (%s) – verwende Standardwerte", exc)
@@ -306,12 +376,7 @@ class SettingsStore:
             raise ValueError("; ".join(errors))
         self.directory.mkdir(parents=True, exist_ok=True)
         # write to a temp file and rename so a crash can't leave half a JSON file
-        tmp = self.path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(settings.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, self.path)
+        jsontext.write_atomic(self.path, json.dumps(settings.to_dict(), indent=2, ensure_ascii=False))
 
     def _backup_broken_file(self) -> None:
-        try:
-            os.replace(self.path, self.path.with_suffix(".json.bak"))
-        except OSError:
-            pass
+        jsontext.backup_file(self.path, move=True)

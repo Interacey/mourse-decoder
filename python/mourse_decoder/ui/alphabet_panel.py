@@ -11,7 +11,7 @@ import os
 import tkinter as tk
 from collections.abc import Callable
 from pathlib import Path
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
 
 from ..alphabet_files import (
     delete_alphabet,
@@ -19,6 +19,7 @@ from ..alphabet_files import (
     import_alphabet_file,
     new_alphabet_text,
     parse_alphabet_text,
+    pretty_alphabet_text,
     read_alphabet_text,
     save_alphabet_text,
     slugify,
@@ -29,6 +30,12 @@ from ..i18n import tr
 from ..settings import Settings
 from . import theme
 from .theme import Button, boxed, confirm_commands, list_box, text_box
+
+
+def _tr_or(key: str, default: str) -> str:
+    """tr(key), or ``default`` while the language files have no such key."""
+    text = tr(key)
+    return default if text == key else text
 
 
 class AlphabetPanel(tk.Frame):
@@ -79,7 +86,10 @@ class AlphabetPanel(tk.Frame):
             right, textvariable=self._title, bg=theme.P.bg, fg=theme.P.text, font=theme.font(11, "bold"), anchor="w"
         ).grid(row=0, column=0, sticky="w", pady=(0, 8))
 
-        editor, self._text = boxed(right, text_box, pad=4, wrap="none", width=40, height=10)
+        editor, self._text = boxed(right, text_box, pad=4, wrap="char", width=40, height=10)
+        bar = ttk.Scrollbar(editor.body, orient="vertical", command=self._text.yview)
+        self._text.configure(yscrollcommand=bar.set)
+        bar.pack(side="right", fill="y", padx=(0, 6), pady=6, before=self._text)
         editor.grid(row=1, column=0, sticky="nsew")
 
         self._status = tk.StringVar()
@@ -159,7 +169,7 @@ class AlphabetPanel(tk.Frame):
     def _show(self, info: AlphabetInfo) -> None:
         self._selected = info
         try:
-            self._set_text(read_alphabet_text(info))
+            self._set_text(pretty_alphabet_text(read_alphabet_text(info)))
         except OSError as exc:
             self._set_text("")
             self._status.set(tr("alpha.status.unreadable", msg=exc))
@@ -195,11 +205,11 @@ class AlphabetPanel(tk.Frame):
             messagebox.showerror(tr("alpha.err.copy"), str(exc), parent=self)
             return
         taken = {i.id for i in self._infos}
-        base = slugify(f"{self._selected.id}-eigen")
+        base = slugify(f"{self._selected.id}{_tr_or('alpha.copy.id_suffix', '-copy')}")
         new_id, n = base, 2
         while new_id in taken:
             new_id, n = f"{base}-{n}", n + 1
-        data = {**data, "id": new_id, "name": f"{data.get('name', self._selected.id)} (Copy)"}
+        data = {**data, "id": new_id, "name": f"{data.get('name', self._selected.id)}{_tr_or('alpha.copy.name_suffix', ' (Copy)')}"}
         data.pop("abstract", None)
         self._start_draft(
             json.dumps(data, indent=2, ensure_ascii=False) + "\n",
@@ -221,10 +231,16 @@ class AlphabetPanel(tk.Frame):
         text = self._text.get("1.0", "end")
         replacing = self._selected.id if self._selected else None
         active = self._controller.settings
+        fixes: list[str] = []
         try:
-            info = save_alphabet_text(self._dictionaries, text, replacing=replacing)
-            if active.alphabet == replacing and replacing != info.id:
-                self._apply_settings(active.replace(alphabet=info.id))  # renamed: move the active alphabet along
+            info = save_alphabet_text(self._dictionaries, text, replacing=replacing, fixes=fixes)
+            # renamed: move the active alphabet and the cycle list along
+            moved = active.replace(
+                alphabet=info.id if active.alphabet == replacing else active.alphabet,
+                cycle_alphabets=tuple(info.id if a == replacing else a for a in active.cycle_alphabets),
+            )
+            if replacing and replacing != info.id and moved != active:
+                self._apply_settings(moved)
             else:
                 self._controller.reload_alphabet()
         except Exception as exc:  # noqa: BLE001 - AlphabetError, ValueError, OSError
@@ -235,7 +251,15 @@ class AlphabetPanel(tk.Frame):
         self._selected = None  # refresh reselects by id
         self.refresh(select_id=info.id)
         self._on_changed()
-        self._status.set("")  # saving is silent, only errors are reported
+        # saving is silent, only repairs and errors are reported
+        self._status.set(self._fixed_message(fixes))
+
+    @staticmethod
+    def _fixed_message(fixes: list[str]) -> str:
+        if not fixes:
+            return ""
+        what = ", ".join(fixes)
+        return tr("alpha.status.repaired", fixes=what)
 
     def _activate(self) -> None:
         if self._selected is None:

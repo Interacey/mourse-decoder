@@ -562,7 +562,7 @@ def test_a_slot_gives_up_when_the_modifiers_stay_down(fake_engine, injector, lis
     assert not controller._macro_lock.locked()
 
 
-def test_double_esc_aborts_a_running_slot_macro(fake_engine, injector, listener, monkeypatch):
+def test_esc_aborts_a_running_slot_macro(fake_engine, injector, listener, monkeypatch):
     controller = make_controller(fake_engine, injector, listener=listener)
     controller.apply_function_keys(macro_keys(F13="vorher{Warte 99999}danach"))
     monkeypatch.setattr(controller_module.time, "sleep", lambda s: setattr(fake_engine, "abort_requested", True))
@@ -572,7 +572,33 @@ def test_double_esc_aborts_a_running_slot_macro(fake_engine, injector, listener,
     assert not controller._macro_lock.locked()
 
 
-def test_double_esc_also_aborts_morse_output(fake_engine, injector, listener, monkeypatch):
+def test_esc_in_the_middle_of_a_long_text_stops_after_that_block(fake_engine, injector, listener):
+    controller = make_controller(fake_engine, injector, listener=listener)
+    long_text = "x" * (3 * controller.TYPE_CHUNK)
+    controller.apply_function_keys(macro_keys(F13=long_text + "{Enter}"))
+    real_inject = injector.inject_text
+
+    def inject_then_esc(text: str) -> None:
+        real_inject(text)
+        fake_engine.abort_requested = True  # the user presses Esc while this block is typed
+
+    injector.inject_text = inject_then_esc
+    controller.run_slot(13, block=True)
+    assert injector.buffer == "x" * controller.TYPE_CHUNK and ("keys", "Enter") not in injector.calls
+    assert listener.errors == []
+    assert controller.typed_text == "", "a stopped text is not added to the history"
+
+
+def test_esc_during_a_short_text_stops_before_the_next_step(fake_engine, injector):
+    controller = make_controller(fake_engine, injector)
+    controller.apply_function_keys(macro_keys(F13="ab{Enter}"))
+    real_inject = injector.inject_text
+    injector.inject_text = lambda text: (real_inject(text), setattr(fake_engine, "abort_requested", True))
+    controller.run_slot(13, block=True)
+    assert injector.calls == [("text", "ab")]
+
+
+def test_esc_also_aborts_morse_output(fake_engine, injector, listener, monkeypatch):
     controller = make_controller(fake_engine, injector, listener=listener)
     controller._decoder = type("D", (), {"decode": lambda s, q: controller_module.Emission("a{Warte 99999}b"), "word_gap": lambda s: None})()
     monkeypatch.setattr(controller_module.time, "sleep", lambda s: setattr(fake_engine, "abort_requested", True))
@@ -580,7 +606,7 @@ def test_double_esc_also_aborts_morse_output(fake_engine, injector, listener, mo
     assert injector.buffer == "a" and listener.errors == []
 
 
-def test_an_old_double_esc_does_not_abort_the_next_macro(fake_engine, injector):
+def test_an_old_esc_does_not_abort_the_next_macro(fake_engine, injector):
     controller = make_controller(fake_engine, injector)
     controller.apply_function_keys(macro_keys(F13="a{Ctrl+C}b"))
     fake_engine.abort_requested = True  # pressed while nothing ran

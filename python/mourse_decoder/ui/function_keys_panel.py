@@ -27,6 +27,7 @@ log = logging.getLogger(__name__)
 VALIDATE_DELAY_MS = 250  # check the editor once typing pauses
 TEST_DELAY_MS = 3000     # the test types into the window in front: time to click into the target
 EXAMPLE_MACRO = "{Loop 3 i}[i] {EndLoop}"  # types 0 1 2
+REPEAT_EXAMPLES = ("{Backspace 5}", "{Space 18}")  # key name plus count
 ESCAPED_BRACE = "\\{"  # how a literal "{" is written in a macro
 _COLUMNS = ("slot", "kind", "trigger", "text", "status")
 _WIDTHS = {"slot": 56, "kind": 72, "trigger": 200, "text": 120, "status": 84}
@@ -137,7 +138,11 @@ class FunctionKeysPanel(tk.Frame):
         self._error.grid(row=1, column=0, sticky="w", padx=8, pady=(0, 8))
         self._error.grid_remove()
         self._wrapped.append(self._error)
-        help_text = f"{tr('functionkeys.macro.help', example=EXAMPLE_MACRO)} {tr('functionkeys.macro.escape', brace=ESCAPED_BRACE)}"
+        help_text = " ".join((
+            tr("functionkeys.macro.help", example=EXAMPLE_MACRO),
+            tr("functionkeys.macro.repeat", first=REPEAT_EXAMPLES[0], second=REPEAT_EXAMPLES[1]),
+            tr("functionkeys.macro.escape", brace=ESCAPED_BRACE),
+        ))
         macro_help = label(body, help_text, size=9, muted=True, justify="left")
         macro_help.grid(row=5, column=0, sticky="w", padx=8, pady=(8, 0))
         self._wrapped.append(macro_help)

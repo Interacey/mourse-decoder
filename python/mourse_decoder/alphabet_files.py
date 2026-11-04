@@ -54,8 +54,26 @@ def parse_alphabet_text(text: str) -> dict:
     return data
 
 
+def repair_alphabet_text(text: str) -> tuple[str, list[str]]:
+    """Repair unambiguous JSON slips (see jsontext.repair); unchanged text and no fixes if not possible."""
+    try:
+        return jsontext.repair(text)
+    except json.JSONDecodeError:
+        return text, []
+
+
+def pretty_alphabet_text(text: str, max_line: int = 100) -> str:
+    """Indented JSON for display if a line is longer than ``max_line``; text that doesn't parse stays as is."""
+    if all(len(line) <= max_line for line in text.splitlines()):
+        return text
+    try:
+        return json.dumps(parse_alphabet_text(text), indent=2, ensure_ascii=False) + "\n"
+    except AlphabetError:
+        return text
+
+
 def read_alphabet_text(info: AlphabetInfo) -> str:
-    return info.path.read_text(encoding="utf-8")
+    return info.path.read_text(encoding="utf-8-sig")
 
 
 def _require_user_directory(manager: DictionaryManager) -> Path:
@@ -64,15 +82,21 @@ def _require_user_directory(manager: DictionaryManager) -> Path:
     return manager.user_directory
 
 
-def save_alphabet_text(manager: DictionaryManager, text: str, replacing: str | None = None) -> AlphabetInfo:
+def save_alphabet_text(
+    manager: DictionaryManager, text: str, replacing: str | None = None, fixes: list[str] | None = None
+) -> AlphabetInfo:
     """Save ``text`` as a user alphabet and validate it completely.
 
     ``replacing`` is the old id when editing; if the id changed, the old file is
-    removed (a rename). The file is written first, then fully validated with
-    load_alphabet (extends included), and rolled back on failure so a broken
+    removed (a rename). If ``fixes`` is a list, JSON slips with one possible
+    reading are repaired first and what was fixed is appended to it. The file is written first,
+    then fully validated with load_alphabet (extends included), and rolled back on failure so a broken
     file never stays behind.
     """
     directory = _require_user_directory(manager)
+    if fixes is not None:
+        text, found = repair_alphabet_text(text)
+        fixes.extend(found)
     data = parse_alphabet_text(text)
     alphabet_id = data.get("id")
     if not isinstance(alphabet_id, str) or not _ID_PATTERN.match(alphabet_id):
@@ -83,16 +107,19 @@ def save_alphabet_text(manager: DictionaryManager, text: str, replacing: str | N
         raise AlphabetError(f"Es gibt bereits ein eigenes Alphabet mit der ID '{alphabet_id}'.")
 
     directory.mkdir(parents=True, exist_ok=True)
+    if replacing and replacing != alphabet_id:
+        # other alphabets still point to the old id; refuse instead of leaving them broken
+        _refuse_if_extended(directory, replacing, "Kann nicht umbenannt werden")
     target = directory / f"{alphabet_id}.json"
     previous = target.read_bytes() if target.exists() else None
-    target.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    jsontext.write_atomic(target, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
     try:
         load_alphabet(alphabet_id, [manager.directory, directory])
     except AlphabetError:
         if previous is None:
             target.unlink(missing_ok=True)
         else:
-            target.write_bytes(previous)
+            jsontext.write_atomic(target, previous)
         raise
 
     if replacing and replacing != alphabet_id:
@@ -129,20 +156,26 @@ def _remove_user_file(manager: DictionaryManager, alphabet_id: str) -> None:
     (directory / f"{alphabet_id}.json").unlink(missing_ok=True)
 
 
+def _refuse_if_extended(directory: Path, alphabet_id: str, what: str) -> None:
+    """AlphabetError if another user alphabet extends ``alphabet_id`` (deleting or renaming would break it)."""
+    path = directory / f"{alphabet_id}.json"
+    for other in sorted(directory.glob("*.json")):
+        if other == path:
+            continue
+        try:
+            extends = parse_alphabet_text(other.read_text(encoding="utf-8-sig")).get("extends")
+        except (OSError, UnicodeDecodeError, AlphabetError):
+            continue  # a broken neighbour doesn't block it
+        if extends == alphabet_id:
+            raise AlphabetError(f"{what}: '{other.stem}' erweitert dieses Alphabet.")
+
+
 def delete_alphabet(manager: DictionaryManager, alphabet_id: str) -> None:
     """Delete a user alphabet, unless another one still extends it."""
     directory = _require_user_directory(manager)
     path = directory / f"{alphabet_id}.json"
     if not path.is_file():
         raise AlphabetError(f"'{alphabet_id}' ist kein eigenes Alphabet und kann nicht gelöscht werden.")
-    for other in sorted(directory.glob("*.json")):
-        if other == path:
-            continue
-        try:
-            extends = parse_alphabet_text(other.read_text(encoding="utf-8")).get("extends")
-        except (OSError, AlphabetError):
-            continue  # a broken neighbour doesn't block deleting
-        if extends == alphabet_id:
-            raise AlphabetError(f"Kann nicht gelöscht werden: '{other.stem}' erweitert dieses Alphabet.")
+    _refuse_if_extended(directory, alphabet_id, "Kann nicht gelöscht werden")
     os.remove(path)
     manager.invalidate()
