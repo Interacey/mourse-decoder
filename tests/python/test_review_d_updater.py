@@ -97,7 +97,7 @@ def test_failed_update_script_restarts_cleans_up_and_reports():
     failure = script.split("if (-not $done) {")[1].split("exit 1")[0]
     assert "Report 'busy'" in failure
     assert "Start-Process -FilePath $target" in failure
-    assert "Remove-Item -LiteralPath 'C:\\Temp\\mourse-update-ab'" in failure.replace("C:/Temp", "C:\\Temp")
+    assert "Remove-Item -LiteralPath 'C:\\Temp\\mourse-update-ab'" in failure.replace("/", "\\")
 
 
 def test_failed_update_without_start_does_not_start_anything():
