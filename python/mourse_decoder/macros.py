@@ -4,6 +4,7 @@
     "{Win+R}{WaitWindow Run}notepad"     wait until the Run window is in front
     "{Loop 3}Hi{Wait 500}{EndLoop}"      repeat, may be nested
     "{Loop 3 n}[n] [= n*2+1]{EndLoop}"   counter n counts from 0 (name optional, default i); [= …] calculates
+    "{Backspace 5}{Space 18}"            a key several times (count 1 to 1000, after a space)
     "{Clipboard}"                        type what is on the clipboard (e.g. a KeePass copy)
     "{File C:\\Users\\me\\doc.pdf}"        paste the file or folder (several: path|path)
 
@@ -14,6 +15,7 @@ work too ({Warte 500}, {Schleife 3}…{SchleifenEnde}, {Zwischenablage}, {Datei 
 
 from __future__ import annotations
 
+import ntpath
 import os
 import re
 from collections.abc import Callable
@@ -30,14 +32,17 @@ _CLIPBOARD = re.compile(r"\s*(?:clipboard|zwischenablage)\s*", _I)
 _FILES = re.compile(r"\s*(?:file|files|datei|dateien|folder|ordner)\s+(.+?)\s*", _I)
 _LOOP = re.compile(r"\s*(?:loop|schleife)\s+(\d{1,5})(?:\s+([A-Za-z_][A-Za-z0-9_]*))?\s*", _I)
 _END_LOOP = re.compile(r"\s*(?:endloop|schleifenende)\s*", _I)
+_REPEAT = re.compile(r"(.*\S)\s+(\d+)")
 _CALC = re.compile(r"\s*=(.*)", re.DOTALL)
 _CALC_TOKEN = re.compile(r"\s*(?:([0-9]+)|([A-Za-z_][A-Za-z0-9_]*)|(.))", re.DOTALL)
 # [x] is a counter, [= …] a calculation; any other brackets stay text
 _BRACKETS = re.compile(r"\[([^\[\]]*)\]")
 
 MAX_LOOP_COUNT = 1000
+MAX_KEY_REPEAT = 1000
 # nested loops multiply, so cap the result before it eats the memory
 MAX_EXPANDED_LENGTH = 1_000_000
+MAX_TOTAL_WAIT_S = 600  # all {Wait} of one macro together, loops included
 DEFAULT_COUNTER = "i"
 MAX_CALC_LENGTH = 200
 MAX_CALC_DEPTH = 32  # parentheses inside each other
@@ -63,18 +68,22 @@ def resolve_path(raw: str) -> str:
     over the user's NTLM hash, so a macro from a stranger must never get that far.
     """
     expanded = os.path.expandvars(os.path.expanduser(raw))
-    # looked at before abspath: only Windows reads a backslash as a separator, and a path that starts
-    # with two of them must be refused whatever system the check runs on
-    if expanded.startswith(("\\\\", "//")):
+    # Windows reads "/" as a separator too, so "/\server" and "\/server" are UNC paths; this also
+    # covers \\?\UNC\ and \\.\. Checked on every system, before abspath
+    if expanded.replace("/", "\\").startswith("\\\\"):
         raise MacroError(f"Netzwerkpfade sind nicht erlaubt: {raw}. Nichts getippt.")
-    return os.path.abspath(expanded)
+    result = os.path.abspath(expanded)
+    if ntpath.splitdrive(result)[0].startswith("\\\\"):
+        raise MacroError(f"Netzwerkpfade sind nicht erlaubt: {raw}. Nichts getippt.")
+    return result
 
 
 def commands_in_file(path: Path) -> list[str]:
     """Commands in the texts of an alphabet or smiley file that DO something when keyed.
 
-    Key combinations (``Win+R``), ``File`` and ``Clipboard``. Waiting and loops are harmless, plain
-    text too. An unreadable file gives [] because importing it reports that anyway.
+    Key combinations (``Win+R``), ``File`` and ``Clipboard``, and text with a raw line break or tab:
+    the injector types those as Return and Tab (reported as ``{Enter}`` and ``{Tab}``). Waiting and
+    loops are harmless, plain text too. An unreadable file gives [] because importing it reports that anyway.
     """
     try:
         data = jsontext.loads(Path(path).read_text(encoding="utf-8-sig"), dict)
@@ -92,6 +101,11 @@ def commands_in_file(path: Path) -> list[str]:
                 found[f"{{{value}}}"] = None
             elif kind in ("files", "clipboard"):
                 found["{File …}" if kind == "files" else "{Clipboard}"] = None
+            elif kind == "text":
+                if "\n" in value or "\r" in value:
+                    found["{Enter}"] = None
+                if "\t" in value:
+                    found["{Tab}"] = None
     return list(found)
 
 
@@ -300,11 +314,17 @@ def _build(text: str, check_shortcut: Callable[[str], None]) -> list[tuple]:
         elif not any(c.isalnum() for c in part):
             body.append(("step", ("text", f"{{{part}}}")))  # {^_^} or { } is text, not a command
         else:
+            combo, times = part.strip(), 1
+            if repeat := _REPEAT.fullmatch(combo):  # {Backspace 5}: the key five times, one step each
+                combo, digits = repeat[1], repeat[2]
+                times = int(digits) if len(digits) <= 6 else MAX_KEY_REPEAT + 1
+                if not 1 <= times <= MAX_KEY_REPEAT:
+                    raise _fail(f"{{{part.strip()}}}: Die Anzahl muss zwischen 1 und {MAX_KEY_REPEAT} liegen.")
             try:
-                check_shortcut(part)
+                check_shortcut(combo)
             except ValueError as exc:
                 raise MacroError(f"Unbekannter Befehl {{{part.strip()}}}: {exc}. Nichts getippt.") from None
-            body.append(("step", ("keys", part.strip())))
+            body.extend([("step", ("keys", combo))] * times)
     if open_loops:
         raise _fail("Zu jedem {Loop …} gehört genau ein {EndLoop}.")
     return root
@@ -314,12 +334,19 @@ def _expand(tree: list[tuple]) -> list[Step]:
     """Write out the loops. Counter values go in as plain text and are never read as commands."""
     out: list[tuple[str, object, bool]] = []  # (kind, value, plain text that may join its neighbours)
     spent = 0  # characters and loop rounds so far, so a huge result is stopped before it is built
+    waited = 0.0
 
     def spend(amount: int) -> None:
         nonlocal spent
         spent += amount
         if spent > MAX_EXPANDED_LENGTH:
             raise _fail("Die Schleifen ergeben zu viel Text.")
+
+    def wait(seconds: float) -> None:
+        nonlocal waited
+        waited += seconds
+        if waited > MAX_TOTAL_WAIT_S:
+            raise _fail(f"Die Wartezeit des Makros ist länger als {MAX_TOTAL_WAIT_S // 60} Minuten.")
 
     def run(nodes: list[tuple], env: dict[str, int]) -> None:
         for node in nodes:
@@ -329,6 +356,8 @@ def _expand(tree: list[tuple]) -> list[Step]:
                     run(node[3], {**env, node[2]: n})
             elif node[0] == "step":
                 spend(8)
+                if node[1][0] == "wait":
+                    wait(node[1][1])
                 out.append((*node[1], False))
             else:
                 if node[0] == "text":

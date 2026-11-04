@@ -54,7 +54,7 @@ class EngineLike(Protocol):
     def function_key_modifiers_released(self) -> bool:
         """True if no Ctrl, Alt, Shift or Win key is held."""
     def poll_abort(self) -> bool:
-        """True once after Esc was pressed twice within 500 ms; reading clears it."""
+        """True once after Esc was pressed since the last call; reading clears it."""
 
 
 class InjectorLike(Protocol):
@@ -89,7 +89,7 @@ class NativeInjector:
     # typing takes about 20 ms per character (2000 characters are 40 seconds)
     PASTE_FROM = 2000
     # the app reads the clipboard only after Ctrl+V arrives, restoring earlier pastes the old content
-    PASTE_SETTLE_S = 0.3
+    PASTE_SETTLE_S = 0.5
     # Explorer and mail clients read the file list while they copy, so they need longer
     PASTE_FILES_SETTLE_S = 1.0
 
@@ -101,10 +101,13 @@ class NativeInjector:
         # shortcut: Windows only, other systems type everything
         return len(text) >= self.PASTE_FROM and self._clipboard.available()
 
+    def try_paste(self, text: str) -> bool:
+        """Paste ``text`` through the clipboard. False if the clipboard was busy and nothing happened."""
+        return self._with_saved_clipboard(lambda: self._clipboard.set_text(_crlf(text)), self.PASTE_SETTLE_S)
+
     def inject_text(self, text: str) -> None:
-        if self.pastes(text):
-            if self._with_saved_clipboard(lambda: self._clipboard.set_text(_crlf(text)), self.PASTE_SETTLE_S):
-                return
+        if self.pastes(text) and self.try_paste(text):
+            return
         self._native.inject_text(text)
 
     def type_text(self, text: str) -> None:
@@ -177,6 +180,7 @@ class MorseController:
         self._use_hook = use_hook
         self._lock = threading.RLock()
         self._running = False
+        self._stopping = False  # set by stop() so a running macro ends before the engine is joined
         self._cycle_seen = 0
         self._settings = settings
         self._function_keys = FunctionKeys()
@@ -206,6 +210,7 @@ class MorseController:
         with self._lock:
             if self._running:
                 return
+            self._stopping = False
             s = self._settings
             self._engine.configure(s.dot_threshold_ms, s.letter_gap_ms, s.word_gap_ms)
             self._apply_keys(s)
@@ -225,6 +230,7 @@ class MorseController:
             if not self._running:
                 return
             self._running = False
+            self._stopping = True
         self._engine.block_input = False  # never leave the key blocked behind
         self._engine.clear_function_keys()
         self._engine.stop()
@@ -243,7 +249,9 @@ class MorseController:
                 except Exception:
                     self._dictionaries.set_smileys(old.smileys)
                     raise
+                replaced = self._decoder
                 self._decoder = decoder
+                self._close_decoder(replaced)
                 self._engine.reset()  # a half-keyed sequence belongs to the old alphabet
             timing_changed = (old.dot_threshold_ms, old.letter_gap_ms, old.word_gap_ms) != (
                 new.dot_threshold_ms,
@@ -371,7 +379,7 @@ class MorseController:
     def _run_slot_locked(self, slot: Slot) -> None:
         """Body of a slot run; the caller holds ``_macro_lock``, released here."""
         try:
-            self._engine.poll_abort()  # an Esc, Esc from before does not count
+            self._engine.poll_abort()  # an Esc from before does not count
             self._wait_for_modifiers_released()
             self._emit_steps(Emission(slot.macro))
         except macros.MacroStopped as exc:
@@ -395,8 +403,21 @@ class MorseController:
         """Reload the active alphabet after its file changed."""
         with self._lock:
             self._dictionaries.invalidate()
-            self._decoder = self._decoder_factory(self._dictionaries, self._settings.alphabet)
+            decoder = self._decoder_factory(self._dictionaries, self._settings.alphabet)  # raises: old decoder stays
+            replaced = self._decoder
+            self._decoder = decoder
+            self._close_decoder(replaced)
             self._engine.reset()
+
+    @staticmethod
+    def _close_decoder(old) -> None:
+        """Release what a replaced decoder holds (e.g. a database handle); never raises."""
+        close = getattr(old, "close", None)
+        if close is not None:
+            try:
+                close()
+            except Exception:
+                log.exception("Decoder konnte nicht geschlossen werden")
 
     # engine events arrive on the Rust worker thread
     def _on_engine_event(self, kind: str, payload: str) -> None:
@@ -439,12 +460,23 @@ class MorseController:
         # one macro at a time: output of a Morse letter that arrives while a function key types is dropped
         if not self._macro_lock.acquire(blocking=False):
             log.info("Ausgabe verworfen, weil gerade ein Makro tippt")
+            self._reset_decoder()  # its state moved on for a letter that never came out
             return
         try:
-            self._engine.poll_abort()  # an Esc, Esc from before does not count
+            self._engine.poll_abort()  # an Esc from before does not count
             self._emit_steps(emission)
+        except BaseException:
+            self._reset_decoder()  # stopped or failed half way: the decoder must not build on it
+            raise
         finally:
             self._macro_lock.release()
+
+    def _reset_decoder(self) -> None:
+        try:
+            with self._lock:
+                self._decoder.reset()
+        except Exception:  # noqa: BLE001 - must not hide the error that got us here
+            log.exception("Decoder konnte nicht zurückgesetzt werden")
 
     def _emit_steps(self, emission: Emission) -> None:
         # typing takes a few ms, so do it outside the lock to not block apply_settings
@@ -459,6 +491,7 @@ class MorseController:
                 self._stop_if_switched_off()
                 if kind == "text":
                     self._type(value, self._injector.inject_text)
+                    self._stop_if_switched_off()  # Esc during the text: the injector stopped early
                     self.history.extend(value)
                 elif kind == "keys":
                     self._injector.press_shortcut(value)
@@ -487,9 +520,16 @@ class MorseController:
 
         Text that gets pasted goes in whole, pasting is over in an instant.
         """
-        if len(text) <= self.TYPE_CHUNK or (not always and self._injector.pastes(text)):
+        if len(text) <= self.TYPE_CHUNK:
             inject(text)
             return
+        if not always and self._injector.pastes(text):
+            try_paste = getattr(self._injector, "try_paste", None)
+            if try_paste is None or try_paste(text):
+                if try_paste is None:
+                    inject(text)
+                return
+            # clipboard busy: type it in pieces below, so the off switch and Esc are looked at
         start = 0
         while start < len(text):
             end = min(start + self.TYPE_CHUNK, len(text))
@@ -509,11 +549,13 @@ class MorseController:
                         raise macros.MacroError(f"Datei oder Ordner nicht gefunden: {path}. Nichts getippt.")
 
     def _stop_if_switched_off(self) -> None:
+        if self._stopping:
+            raise macros.MacroStopped("Makro gestoppt, weil das Programm beendet wird.")
         # the on/off shortcut flips engine.active right away, also while a macro runs
         if not self._engine.active:
             raise macros.MacroStopped("Makro gestoppt, weil die Morse-Eingabe ausgeschaltet wurde.")
-        if self._engine.poll_abort():  # Esc, Esc
-            raise macros.MacroStopped("Makro abgebrochen (zweimal Esc).")
+        if self._engine.poll_abort():  # Esc; the injector already stopped typing on it
+            raise macros.MacroStopped("Makro abgebrochen (Esc).")
 
     def _sleep(self, seconds: float) -> None:
         """time.sleep in small steps, so switching Morse input off stops a long wait."""
