@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import time
-import tkinter as tk
 
 import pytest
 from mourse_decoder import updater
@@ -12,16 +11,10 @@ from mourse_decoder.ui import theme, update_panel
 
 
 @pytest.fixture(scope="module")
-def root():
-    try:
-        window = tk.Tk()
-    except tk.TclError:
-        pytest.skip("kein Display")
-    window.withdraw()
-    theme.apply_theme(window, "light")
-    yield window
-    window.destroy()
-    theme._images.clear()
+def root(tk_root):
+    tk_root.withdraw()
+    theme.apply_theme(tk_root, "light")
+    return tk_root
 
 
 @pytest.fixture

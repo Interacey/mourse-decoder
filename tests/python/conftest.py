@@ -199,3 +199,16 @@ def telecode_db(tmp_path: Path) -> Path:
     path = tmp_path / "telecode.sqlite"
     build_database(parse_unihan(UNIHAN_SAMPLE.splitlines()), path)
     return path
+
+
+@pytest.fixture(scope="session")
+def tk_root():
+    """One Tk root for all UI tests; a second tk.Tk() in one process sometimes fails to initialise Tcl."""
+    import tkinter as tk
+
+    try:
+        window = tk.Tk()
+    except tk.TclError:
+        pytest.skip("kein Display")
+    yield window
+    window.destroy()
