@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import time
 
 import pytest
@@ -26,6 +27,9 @@ def panel(root, tmp_path, monkeypatch):
     widget.quits = quits
     yield widget
     widget.destroy()
+    # Tk variables of the dead page must be freed here: if the garbage collector frees them inside a worker
+    # thread of a later test, that thread calls Tk while no mainloop runs and hangs (seen on Linux, Python 3.10)
+    gc.collect()
 
 
 def answers(monkeypatch, confirm, data):
