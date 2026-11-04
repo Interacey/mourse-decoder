@@ -1,4 +1,4 @@
-//! Function-key slots and the Esc-Esc abort, both fed by the hook callback.
+//! Function-key slots and the Esc abort, both fed by the hook callback.
 //!
 //! A slot is a key binding the user (or a Stream Deck) presses to run a macro. The hook
 //! only records WHICH slot fired in a small queue; Python polls it and runs the macro.
@@ -20,8 +20,13 @@ use crate::trigger::{KeyBinding, ModifierMask, TriggerKey, ALT, CTRL, SHIFT, WIN
 pub const MAX_SLOT: u16 = 100;
 /// Fired slots waiting for Python; the oldest is dropped when it is full.
 pub const QUEUE_LIMIT: usize = 64;
-/// Two Esc presses within this time abort a running macro.
-pub const ABORT_WINDOW: Duration = Duration::from_millis(500);
+
+/// A key that was held down when the table was replaced or capture started. Its repeats and
+/// release are still ours to handle, so the app sees no key-up for a press it never got.
+struct Orphan {
+    key: TriggerKey,
+    swallowed: bool,
+}
 
 struct Slot {
     id: u16,
@@ -39,6 +44,7 @@ struct Slot {
 pub struct SlotTable {
     slots: Vec<Slot>,
     queue: VecDeque<u16>,
+    orphans: Vec<Orphan>,
 }
 
 impl SlotTable {
@@ -46,11 +52,18 @@ impl SlotTable {
         Self {
             slots: Vec::new(),
             queue: VecDeque::new(),
+            orphans: Vec::new(),
         }
     }
 
-    /// Replaces the whole table; fired slots still in the queue are dropped.
+    /// Replaces the whole table; fired slots still in the queue are dropped. Keys held
+    /// right now keep being swallowed (or ignored) until they are released.
     pub fn set(&mut self, entries: Vec<(u16, KeyBinding, bool)>) {
+        let held = self.slots.iter().filter(|s| s.down).map(|s| Orphan {
+            key: s.binding.key,
+            swallowed: s.swallowed,
+        });
+        self.orphans.extend(held);
         self.slots = entries
             .into_iter()
             .map(|(id, binding, swallow)| Slot {
@@ -69,7 +82,21 @@ impl SlotTable {
     /// `may_fire` is false while our own typing is suppressed or Morse input is off:
     /// presses are then ignored, but a release still ends a press accepted earlier.
     pub fn handle(&mut self, event: &EventType, held: ModifierMask, may_fire: bool) -> bool {
-        let Self { slots, queue } = self;
+        let Self {
+            slots,
+            queue,
+            orphans,
+        } = self;
+        if let Some(i) = orphans
+            .iter()
+            .position(|o| route_event(o.key, event).is_some())
+        {
+            let swallowed = orphans[i].swallowed;
+            if route_event(orphans[i].key, event) == Some(Edge::Release) {
+                orphans.remove(i);
+            }
+            return swallowed;
+        }
         let mut swallow = false;
         for slot in slots.iter_mut() {
             let Some(edge) = route_event(slot.binding.key, event) else {
@@ -106,37 +133,21 @@ impl SlotTable {
     }
 }
 
-/// Recognizes two Esc presses within [`ABORT_WINDOW`].
+/// Turns Esc presses into abort requests. One press is enough; key repeat of a held Esc is
+/// the same press.
 #[derive(Default)]
 pub struct AbortDetector {
-    last_press: Option<Instant>,
     down: bool,
 }
 
 impl AbortDetector {
     pub const fn new() -> Self {
-        Self {
-            last_press: None,
-            down: false,
-        }
+        Self { down: false }
     }
 
-    /// True on the second Esc press of a pair. Key repeat of a held Esc counts as one press,
-    /// and a third quick press starts a new pair.
-    pub fn press(&mut self, now: Instant) -> bool {
-        if std::mem::replace(&mut self.down, true) {
-            return false;
-        }
-        match self.last_press {
-            Some(first) if now.saturating_duration_since(first) <= ABORT_WINDOW => {
-                self.last_press = None;
-                true
-            }
-            _ => {
-                self.last_press = Some(now);
-                false
-            }
-        }
+    /// True on a fresh press, false on key repeat.
+    pub fn press(&mut self) -> bool {
+        !std::mem::replace(&mut self.down, true)
     }
 
     pub fn release(&mut self) {
@@ -156,9 +167,14 @@ const MODIFIER_VKS: [u16; 12] = [16, 17, 18, 20, 91, 92, 160, 161, 162, 163, 164
 /// (`_unusable_trigger` in function_keys.py) has the same rules.
 fn unusable_reason(binding: &KeyBinding, swallow: bool) -> Option<&'static str> {
     let shortcut = binding.requires(CTRL) || binding.requires(ALT) || binding.requires(WIN);
-    match binding.key {
+    // VK32 is the space bar, same as `Space`
+    let key = match binding.key {
+        TriggerKey::Vk(32) => TriggerKey::Space,
+        other => other,
+    };
+    match key {
         TriggerKey::ControlRight | TriggerKey::AltGr => Some("die Modifikatortasten"),
-        TriggerKey::Vk(27) => Some("Esc und das Abbrechen mit Esc, Esc"),
+        TriggerKey::Vk(27) => Some("Esc und das Abbrechen mit Esc"),
         TriggerKey::Vk(code) if MODIFIER_VKS.contains(&code) => Some("die Modifikatortasten"),
         TriggerKey::Space => (!shortcut).then_some("normales Tippen"),
         // Backspace, Tab, Enter, digits, letters, numpad and punctuation
@@ -214,17 +230,36 @@ pub fn parse_entries(
 static TABLE: Mutex<SlotTable> = Mutex::new(SlotTable::new());
 static ESC: Mutex<AbortDetector> = Mutex::new(AbortDetector::new());
 static ABORT: AtomicBool = AtomicBool::new(false);
+/// Esc events before this moment come from our own `{Esc}` key press, not from the user.
+static OWN_ESC_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// The injector calls this around sending Esc, so a macro with `{Esc}` doesn't abort itself.
+/// Esc typed by the user while we type is not ignored: stopping a long text is what it is for.
+pub fn ignore_esc_for(duration: Duration) {
+    let until = Instant::now() + duration;
+    let mut guard = lock_or_recover(&OWN_ESC_UNTIL);
+    if guard.is_none_or(|current| current < until) {
+        *guard = Some(until);
+    }
+}
+
+/// True while an abort was requested and not yet read; the injector stops typing on it.
+pub fn abort_requested() -> bool {
+    ABORT.load(Ordering::SeqCst)
+}
 
 pub fn with_table<R>(f: impl FnOnce(&mut SlotTable) -> R) -> R {
     f(&mut lock_or_recover(&TABLE))
 }
 
-/// Hook entry point: slot routing and Esc-Esc detection for one input event.
+/// Hook entry point: slot routing and Esc detection for one input event.
 /// Returns true if the event must be hidden from other apps.
 ///
 /// `suppressed` is true while our own typing is in flight (see `hooks::suppress_for`):
-/// those events can't fire a slot or count as Esc. `active` is false while Morse input
-/// is switched off; slots do nothing then.
+/// those events can't fire a slot. Esc is the exception, because the guard is renewed with
+/// every typed character and the user's Esc must still get through; our own `{Esc}` is
+/// filtered by `ignore_esc_for`. `active` is false while Morse input is switched off;
+/// slots do nothing then.
 pub fn on_event(
     event: &EventType,
     held: ModifierMask,
@@ -233,8 +268,8 @@ pub fn on_event(
     active: bool,
 ) -> bool {
     match event {
-        EventType::KeyPress(Key::Escape) if !suppressed => {
-            if lock_or_recover(&ESC).press(now) {
+        EventType::KeyPress(Key::Escape) if !own_esc(now) => {
+            if lock_or_recover(&ESC).press() {
                 ABORT.store(true, Ordering::SeqCst);
             }
         }
@@ -242,6 +277,10 @@ pub fn on_event(
         _ => {}
     }
     with_table(|table| table.handle(event, held, !suppressed && active))
+}
+
+fn own_esc(now: Instant) -> bool {
+    lock_or_recover(&OWN_ESC_UNTIL).is_some_and(|until| now < until)
 }
 
 /// Reads and clears the abort flag.
@@ -255,6 +294,7 @@ pub fn reset() {
     *lock_or_recover(&TABLE) = SlotTable::new();
     *lock_or_recover(&ESC) = AbortDetector::new();
     ABORT.store(false, Ordering::SeqCst);
+    *lock_or_recover(&OWN_ESC_UNTIL) = None;
 }
 
 #[cfg(test)]
@@ -485,34 +525,23 @@ mod tests {
     }
 
     #[test]
-    fn esc_twice_within_the_window_aborts() {
-        let t0 = Instant::now();
+    fn one_esc_press_aborts_and_key_repeat_counts_once() {
         let mut esc = AbortDetector::new();
-        assert!(!esc.press(t0));
+        assert!(esc.press());
+        assert!(!esc.press(), "key repeat of the held key");
+        assert!(!esc.press());
         esc.release();
-        assert!(esc.press(t0 + Duration::from_millis(300)));
-        esc.release();
-        assert!(
-            !esc.press(t0 + Duration::from_millis(400)),
-            "pair was used up"
-        );
+        assert!(esc.press(), "next press");
     }
 
     #[test]
-    fn esc_outside_the_window_or_held_does_not_abort() {
-        let t0 = Instant::now();
-        let mut esc = AbortDetector::new();
-        esc.press(t0);
-        esc.release();
-        assert!(!esc.press(t0 + Duration::from_millis(501)));
-        esc.release();
-        // exactly on the limit still counts
-        assert!(esc.press(t0 + Duration::from_millis(501) + ABORT_WINDOW));
-        esc.release();
-        // key repeat of a held Esc is one press
-        let mut esc = AbortDetector::new();
-        assert!(!esc.press(t0));
-        assert!(!esc.press(t0 + Duration::from_millis(30)));
-        assert!(!esc.press(t0 + Duration::from_millis(60)));
+    fn vk32_is_the_space_bar_and_needs_a_shortcut_modifier() {
+        let entry = |text: &str| vec![(1u16, text.to_string(), true)];
+        assert!(parse_entries(&entry("VK32"), &[]).is_err());
+        assert!(parse_entries(&entry("Space"), &[]).is_err());
+        assert!(parse_entries(&entry("Shift+VK32"), &[]).is_err());
+        for ok in ["Ctrl+VK32", "Alt+VK32", "Win+VK32"] {
+            assert!(parse_entries(&entry(ok), &[]).is_ok(), "{ok}");
+        }
     }
 }

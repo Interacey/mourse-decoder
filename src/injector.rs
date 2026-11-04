@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use enigo::{Direction, Enigo, Key, Keyboard, Settings};
 
+use crate::function_keys;
 use crate::hooks;
 use crate::trigger;
 
@@ -161,6 +162,31 @@ mod win {
         }
     }
 
+    /// Taps the unassigned virtual key 0xE8, so Windows no longer sees a lone Win or Alt
+    /// tap (Start menu, menu bar) when the keys pressed meanwhile were swallowed.
+    #[cfg_attr(test, allow(dead_code))]
+    pub fn menu_mask() {
+        let key = |up: bool| INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VIRTUAL_KEY(0xE8),
+                    wScan: 0,
+                    dwFlags: if up {
+                        KEYEVENTF_KEYUP
+                    } else {
+                        KEYBD_EVENT_FLAGS(0)
+                    },
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+        let events = [key(false), key(true)];
+        // SAFETY: `events` is a valid slice of initialised INPUT structs
+        unsafe { SendInput(&events, size_of::<INPUT>() as i32) };
+    }
+
     pub fn type_char(c: char) -> Result<(), InjectError> {
         let mut buffer = [0u16; 2];
         let units = c.encode_utf16(&mut buffer);
@@ -186,6 +212,13 @@ mod win {
     }
 }
 
+/// Sends the mask key (VK 0xE8) so a swallowed key under Win or Alt does not leave a lone
+/// Win/Alt tap. Windows only; never sends anything in unit tests.
+pub fn menu_mask() {
+    #[cfg(all(windows, not(test)))]
+    win::menu_mask();
+}
+
 /// Types `text` into the active app, one character at a time.
 pub fn inject_text(text: &str) -> Result<(), InjectError> {
     if text.is_empty() {
@@ -197,6 +230,9 @@ pub fn inject_text(text: &str) -> Result<(), InjectError> {
             match segment {
                 Segment::Text(part) => {
                     for c in part.chars() {
+                        if function_keys::abort_requested() {
+                            return Ok(()); // Esc: Python sees the flag and stops the macro
+                        }
                         type_char(enigo, c)?;
                         pause(CHAR_DELAY);
                     }
@@ -218,7 +254,26 @@ pub fn inject_text(text: &str) -> Result<(), InjectError> {
 /// Parses a key combination such as `Ctrl+Shift+T` or `Enter`: modifiers, then one key
 /// (a single character or a key name).
 pub fn parse_combo(combo: &str) -> Result<(Vec<Key>, Key), String> {
-    let parts: Vec<&str> = combo.split('+').map(str::trim).collect();
+    // a trailing `+` is the plus key itself: "+", "Ctrl++"
+    let combo = combo.trim();
+    let (head, plus_key) = match combo.strip_suffix('+') {
+        Some("") => ("", true),
+        Some(head) => (
+            head.trim_end()
+                .strip_suffix('+')
+                .ok_or_else(|| "Taste nach dem letzten '+' fehlt".to_string())?,
+            true,
+        ),
+        None => (combo, false),
+    };
+    let mut parts: Vec<&str> = if head.is_empty() && plus_key {
+        Vec::new()
+    } else {
+        head.split('+').map(str::trim).collect()
+    };
+    if plus_key {
+        parts.push("+");
+    }
     let (last, modifiers) = parts.split_last().ok_or("leere Tastenkombination")?;
     let modifiers = modifiers
         .iter()
@@ -297,6 +352,9 @@ fn key_by_name(name: &str) -> Result<Key, String> {
 /// Holds `modifiers`, clicks `key`, then lets go of the modifiers again.
 pub fn press_keys(modifiers: &[Key], key: Key) -> Result<(), InjectError> {
     hooks::suppress_for(SELF_INPUT_GUARD);
+    if key == Key::Escape {
+        function_keys::ignore_esc_for(SELF_INPUT_GUARD); // not the user's Esc
+    }
     let result = with_enigo(|enigo| {
         let mut held = Vec::new();
         let mut result = Ok(());
@@ -413,6 +471,19 @@ mod tests {
             Ok((vec![Key::Meta], Key::UpArrow))
         );
         assert_eq!(parse_combo("RÜCKTASTE"), Ok((vec![], Key::Backspace)));
+    }
+
+    #[test]
+    fn trailing_plus_is_the_plus_key() {
+        let plus = Key::Unicode('+');
+        assert_eq!(parse_combo("+"), Ok((vec![], plus)));
+        assert_eq!(parse_combo("Ctrl++"), Ok((vec![Key::Control], plus)));
+        assert_eq!(
+            parse_combo("Ctrl+Shift++"),
+            Ok((vec![Key::Control, Key::Shift], plus))
+        );
+        assert_eq!(parse_combo(" strg + + "), Ok((vec![Key::Control], plus)));
+        assert!(parse_combo("Ctrl+").is_err());
     }
 
     #[test]

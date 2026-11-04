@@ -229,6 +229,11 @@ impl KeyBinding {
             .all(|&(group, _)| self.required & group == 0 || held & group != 0)
     }
 
+    /// Number of required modifier groups; more means a more specific binding.
+    pub fn specificity(&self) -> u32 {
+        self.required.count_ones()
+    }
+
     pub fn requires_caps_lock(&self) -> bool {
         self.required & CAPS_LOCK != 0
     }

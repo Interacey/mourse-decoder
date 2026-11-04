@@ -41,14 +41,18 @@ pub enum Edge {
 }
 
 /// One routed key per Morse key; with a separate dash key each gets its fixed symbol.
+/// The binding with more required modifiers comes first, so `F8` as dot and `Ctrl+F8` as dash
+/// both work (a binding matches with extra modifiers held, the first match wins).
 fn routed(keys: MorseKeys) -> Vec<RoutedKey> {
-    match keys.dash_key {
+    let mut out = match keys.dash_key {
         None => vec![RoutedKey::new(keys.key, None)],
         Some(dash_key) => vec![
             RoutedKey::new(keys.key, Some(Symbol::Dot)),
             RoutedKey::new(dash_key, Some(Symbol::Dash)),
         ],
-    }
+    };
+    out.sort_by_key(|k| std::cmp::Reverse(k.binding.specificity()));
+    out
 }
 
 /// A Morse key together with the state of its current press.
@@ -60,6 +64,16 @@ struct RoutedKey {
     down: bool,
     /// The press was swallowed, so its release is swallowed too (no stuck key).
     swallowed: bool,
+    /// The press belongs to this key but was refused (see [`Self::message`]); its repeats
+    /// and its release are refused too.
+    ignored: bool,
+}
+
+/// What a key edge means for the worker.
+enum Verdict {
+    Send(WorkerMessage),
+    /// The edge belongs to this key but does not count; it is still hidden or not like any other.
+    Skip,
 }
 
 impl RoutedKey {
@@ -69,29 +83,53 @@ impl RoutedKey {
             symbol,
             down: false,
             swallowed: false,
+            ignored: false,
         }
     }
 
-    /// Message for the worker, or `None` if the edge doesn't count (a modifier is
-    /// missing, or a release without an accepted press).
-    fn message(&mut self, edge: Edge, held: ModifierMask, at: Instant) -> Option<WorkerMessage> {
+    /// Verdict for an edge of this key, or `None` if it is not ours (a modifier is missing,
+    /// or a release without a press).
+    ///
+    /// `refuse_new` is true while a new press must not start: the other Morse key is held
+    /// (the timer has one press state, so a rolled second key would be read as a repeat and
+    /// its release as the wrong symbol), or our own typing is in flight.
+    fn message(
+        &mut self,
+        edge: Edge,
+        held: ModifierMask,
+        at: Instant,
+        refuse_new: bool,
+    ) -> Option<Verdict> {
         match edge {
             Edge::Press => {
                 // key repeat of an accepted press counts even if a modifier was let go meanwhile
-                if !self.down && !self.binding.modifiers_held(held) {
+                if self.down {
+                    return Some(Verdict::Send(WorkerMessage::Press(at)));
+                }
+                if self.ignored {
+                    return Some(Verdict::Skip);
+                }
+                if !self.binding.modifiers_held(held) {
                     return None;
+                }
+                if refuse_new {
+                    self.ignored = true;
+                    return Some(Verdict::Skip);
                 }
                 self.down = true;
-                Some(WorkerMessage::Press(at))
+                Some(Verdict::Send(WorkerMessage::Press(at)))
             }
             Edge::Release => {
-                if !std::mem::take(&mut self.down) {
-                    return None;
+                if std::mem::take(&mut self.down) {
+                    Some(Verdict::Send(match self.symbol {
+                        Some(symbol) => WorkerMessage::ReleaseAs(at, symbol),
+                        None => WorkerMessage::Release(at),
+                    }))
+                } else if std::mem::take(&mut self.ignored) {
+                    Some(Verdict::Skip)
+                } else {
+                    None
                 }
-                Some(match self.symbol {
-                    Some(symbol) => WorkerMessage::ReleaseAs(at, symbol),
-                    None => WorkerMessage::Release(at),
-                })
             }
         }
     }
@@ -136,6 +174,10 @@ impl Route {
 static ROUTE: Mutex<Option<Route>> = Mutex::new(None);
 static HOOK_STARTED: AtomicBool = AtomicBool::new(false);
 static HOOK_ERROR: Mutex<Option<String>> = Mutex::new(None);
+/// A mask key (VK 0xE8) was sent since Alt/Win were last pressed (see `needs_menu_mask`).
+static MASK_SENT: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static TEST_MASKS: AtomicU32 = AtomicU32::new(0);
 /// Trigger events are ignored until this moment (see [`suppress_for`]).
 static SUPPRESS_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
 
@@ -155,24 +197,25 @@ static CYCLE_SHORTCUT: Mutex<Option<KeyBinding>> = Mutex::new(None);
 static CYCLE_DOWN: AtomicBool = AtomicBool::new(false);
 static CYCLE_COUNT: AtomicU32 = AtomicU32::new(0);
 
-/// True on the first press of a shortcut's key while its modifiers are held. Holding the key
-/// sends repeated presses (`down` remembers it), which must not count again.
+/// `Some(true)` on the first press of a shortcut's key while its modifiers are held,
+/// `Some(false)` on its key repeats (`down` remembers the press, so they must not count
+/// again), `None` for everything else. The caller keeps `Some` events away from the Morse keys.
 fn shortcut_pressed(
     slot: &Mutex<Option<KeyBinding>>,
     down: &AtomicBool,
     event_type: &EventType,
     held: ModifierMask,
-) -> bool {
-    let Some(shortcut) = *lock_or_recover(slot) else {
-        return false;
-    };
+) -> Option<bool> {
+    let shortcut = (*lock_or_recover(slot))?;
     match route_event(shortcut.key, event_type) {
-        Some(Edge::Press) => shortcut.modifiers_held(held) && !down.swap(true, Ordering::SeqCst),
+        Some(Edge::Press) => shortcut
+            .modifiers_held(held)
+            .then(|| !down.swap(true, Ordering::SeqCst)),
         Some(Edge::Release) => {
             down.store(false, Ordering::SeqCst);
-            false
+            None
         }
-        None => false,
+        None => None,
     }
 }
 
@@ -190,6 +233,57 @@ fn modifier_bit(key: Key) -> Option<ModifierMask> {
         Key::CapsLock => Some(CAPS_LOCK),
         _ => None,
     }
+}
+
+/// Virtual-key codes of the modifier keys behind the bits of `modifier_bit`.
+const MODIFIER_KEY_CODES: [(ModifierMask, i32); 8] = [
+    (1, 0xA2),   // left Ctrl
+    (2, 0xA3),   // right Ctrl
+    (4, 0xA4),   // left Alt
+    (8, 0xA5),   // right Alt / AltGr
+    (16, 0xA0),  // left Shift
+    (32, 0xA1),  // right Shift
+    (64, 0x5B),  // left Windows key
+    (128, 0x5C), // right Windows key
+];
+
+/// `held` corrected by what the keyboard really reports (`is_down` per virtual-key code).
+/// The hook only sees key events, so a modifier released while another desktop had the
+/// input (Win+L, Ctrl+Alt+Del, UAC) would stay "held" forever.
+#[cfg_attr(not(all(windows, not(test))), allow(dead_code))]
+fn sync_modifiers(held: ModifierMask, is_down: impl Fn(i32) -> bool) -> ModifierMask {
+    MODIFIER_KEY_CODES.iter().fold(
+        held,
+        |held, &(bit, vk)| {
+            if is_down(vk) {
+                held | bit
+            } else {
+                held & !bit
+            }
+        },
+    )
+}
+
+/// Re-reads the modifier keys from the system (Windows); a no-op elsewhere and in unit
+/// tests, where the real keyboard must not interfere with synthetic events.
+fn resync_modifiers() {
+    #[cfg(all(windows, not(test)))]
+    {
+        use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+        let _ = MODIFIERS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
+            // SAFETY: GetAsyncKeyState has no preconditions
+            Some(sync_modifiers(
+                held,
+                |vk| unsafe { GetAsyncKeyState(vk) } < 0,
+            ))
+        });
+    }
+}
+
+/// True if a swallowed key press needs a mask key: with Alt or Win held and the key hidden,
+/// Windows would see a lone Alt/Win tap on release (menu bar, Start menu). Once per hold.
+fn needs_menu_mask(held: ModifierMask, already_sent: bool) -> bool {
+    !already_sent && held & (ALT | WIN) != 0
 }
 
 /// Blocking is switched on and Morse input is active.
@@ -381,6 +475,23 @@ pub fn take_capture() -> Option<String> {
 
 /// Callback of the hook thread. Returns the event to let it through, `None` to swallow it.
 fn handle_event(event: rdev::Event) -> Option<rdev::Event> {
+    let typing_key =
+        matches!(event.event_type, EventType::KeyPress(key) if modifier_bit(key).is_none());
+    let result = route_input(event);
+    if result.is_none() && typing_key {
+        // a swallowed key with Win or Alt held would leave Windows a lone Win/Alt tap
+        let held = MODIFIERS.load(Ordering::SeqCst);
+        if needs_menu_mask(held, MASK_SENT.load(Ordering::SeqCst)) {
+            MASK_SENT.store(true, Ordering::SeqCst);
+            #[cfg(test)]
+            TEST_MASKS.fetch_add(1, Ordering::SeqCst);
+            crate::injector::menu_mask();
+        }
+    }
+    result
+}
+
+fn route_input(event: rdev::Event) -> Option<rdev::Event> {
     // take the timestamp right away, and monotonic (`Instant`): `event.time` is wall
     // clock time and can jump with NTP corrections
     let now = Instant::now();
@@ -394,11 +505,12 @@ fn handle_event(event: rdev::Event) -> Option<rdev::Event> {
     }
 
     match event.event_type {
-        EventType::KeyPress(key) => {
-            if let Some(bit) = modifier_bit(key) {
+        EventType::KeyPress(key) => match modifier_bit(key) {
+            Some(bit) => {
                 MODIFIERS.fetch_or(bit, Ordering::SeqCst);
             }
-        }
+            None => resync_modifiers(),
+        },
         EventType::KeyRelease(key) => {
             if let Some(bit) = modifier_bit(key) {
                 MODIFIERS.fetch_and(!bit, Ordering::SeqCst);
@@ -408,34 +520,43 @@ fn handle_event(event: rdev::Event) -> Option<rdev::Event> {
     }
 
     let held = MODIFIERS.load(Ordering::SeqCst);
+    if held & (ALT | WIN) == 0 {
+        MASK_SENT.store(false, Ordering::SeqCst);
+    }
 
-    // waiting for input: everything belongs to the key binding, nothing to morsing
+    // waiting for input: everything belongs to the key binding, nothing to morsing. The
+    // captured key itself is not hidden. A slot key held when capture began still gets its
+    // release (and a swallowed one stays swallowed), so it is not stuck as "down".
     {
         let mut capture = lock_or_recover(&CAPTURE);
         if capture.active {
             capture.feed(&event.event_type, held);
-            return Some(event);
+            let hide = function_keys::with_table(|t| t.handle(&event.event_type, held, false));
+            return if hide { None } else { Some(event) };
         }
     }
 
     // the shortcut toggles Morse input, even while our own typing is suppressed. Only the
     // first press counts: holding the key sends repeated presses that would flip it back
-    // and forth
-    if shortcut_pressed(&SHORTCUT, &SHORTCUT_DOWN, &event.event_type, held) {
+    // and forth. The shortcut's key is not a Morse key then.
+    let toggle = shortcut_pressed(&SHORTCUT, &SHORTCUT_DOWN, &event.event_type, held);
+    let cycle = shortcut_pressed(&CYCLE_SHORTCUT, &CYCLE_DOWN, &event.event_type, held);
+    if toggle == Some(true) {
         ACTIVE.fetch_xor(true, Ordering::SeqCst);
     }
-    if shortcut_pressed(&CYCLE_SHORTCUT, &CYCLE_DOWN, &event.event_type, held) {
+    if cycle == Some(true) {
         CYCLE_COUNT.fetch_add(1, Ordering::SeqCst);
     }
+    let shortcut_used = toggle.is_some() || cycle.is_some();
 
-    // function-key slots and Esc-Esc. Own typing (`suppress_for`) can't fire a slot, so a
-    // macro with `{F13}` doesn't start itself; releases are handled even then
+    // function-key slots and the Esc abort. Own typing (`suppress_for`) can't fire a slot, so
+    // a macro with `{F13}` doesn't start itself; releases are handled even then
     let suppressed = is_suppressed(now);
     if function_keys::on_event(&event.event_type, held, now, suppressed, active()) {
         return None;
     }
 
-    if suppressed {
+    if shortcut_used {
         return Some(event);
     }
 
@@ -443,19 +564,26 @@ fn handle_event(event: rdev::Event) -> Option<rdev::Event> {
     let Some(route) = guard.as_mut() else {
         return Some(event);
     };
-    if route.swallows_caps_lock(&event.event_type) {
+    if !suppressed && route.swallows_caps_lock(&event.event_type) {
         return None;
     }
+    // While our own typing is in flight (`suppressed`) new presses of a Morse key are dropped,
+    // since rdev can't tell our synthetic events from the user's. Releases of accepted presses
+    // still get through, and a key that would be hidden stays hidden.
     let Route { keys, tx } = route;
+    let down_count = keys.iter().filter(|k| k.down).count();
     for key in keys.iter_mut() {
         let Some(edge) = route_event(key.binding.key, &event.event_type) else {
             continue;
         };
-        let Some(message) = key.message(edge, held, now) else {
+        let other_down = down_count > usize::from(key.down);
+        let Some(verdict) = key.message(edge, held, now, suppressed || other_down) else {
             continue;
         };
-        // an error means the worker ended, and clear_route removes the route soon
-        let _ = tx.send(message);
+        if let Verdict::Send(message) = verdict {
+            // an error means the worker ended, and clear_route removes the route soon
+            let _ = tx.send(message);
+        }
         return if key.swallow(edge) { None } else { Some(event) };
     }
     Some(event)
@@ -504,8 +632,8 @@ pub fn cycle_count() -> u32 {
 pub fn set_function_keys(entries: &[(u16, String, bool)]) -> Result<(), String> {
     let mut reserved: Vec<Reserved> = Vec::new();
     if let Some(route) = lock_or_recover(&ROUTE).as_ref() {
-        for (i, key) in route.keys.iter().enumerate() {
-            let name = if route.keys.len() == 2 && i == 1 {
+        for key in &route.keys {
+            let name = if key.symbol == Some(Symbol::Dash) {
                 "der Strich-Taste"
             } else {
                 "der Morse-Taste"
@@ -534,8 +662,10 @@ pub fn poll_function_key() -> Option<u16> {
     function_keys::with_table(function_keys::SlotTable::pop)
 }
 
-/// True if no Ctrl, Alt, Shift or Win key is held, as far as the hook has seen.
+/// True if no Ctrl, Alt, Shift or Win key is held (on Windows checked against the real
+/// keyboard state, otherwise as far as the hook has seen).
 pub fn keyboard_modifiers_released() -> bool {
+    resync_modifiers();
     MODIFIERS.load(Ordering::SeqCst) & (CTRL | ALT | SHIFT | WIN) == 0
 }
 
@@ -552,7 +682,20 @@ fn is_suppressed(now: Instant) -> bool {
     guard.is_some_and(|until| now < until)
 }
 
-/// Starts the hook thread exactly once per process.
+/// Called when the hook loop returns, which it only does when the hook is gone: an error
+/// (no X11 display, missing accessibility permission on macOS) or a quit of the message
+/// loop. Python reads the message via `hook_error()` and shows it. The started flag is
+/// cleared so the next `install_route` / `begin_capture` starts a new hook.
+fn record_hook_end<E: std::fmt::Debug>(result: Result<(), E>) {
+    let message = match result {
+        Err(err) => format!("Globaler Input-Hook fehlgeschlagen: {err:?}"),
+        Ok(()) => "Globaler Input-Hook wurde beendet".to_string(),
+    };
+    *lock_or_recover(&HOOK_ERROR) = Some(message);
+    HOOK_STARTED.store(false, Ordering::Release);
+}
+
+/// Starts the hook thread if none is running (once per process unless it ended).
 fn ensure_hook_thread() -> io::Result<()> {
     // compare_exchange instead of OnceLock so a failed spawn can be retried
     if HOOK_STARTED
@@ -561,6 +704,7 @@ fn ensure_hook_thread() -> io::Result<()> {
     {
         return Ok(());
     }
+    *lock_or_recover(&HOOK_ERROR) = None; // a new attempt, the old error is history
     let spawned = thread::Builder::new()
         .name("morse-input-hook".into())
         .spawn(|| {
@@ -571,12 +715,7 @@ fn ensure_hook_thread() -> io::Result<()> {
             let result = rdev::listen(|event| {
                 handle_event(event);
             });
-            if let Err(err) = result {
-                // typical causes: no X11 display on Linux, missing accessibility permission
-                // on macOS. Python reads the error via `hook_error()` and shows it in the tray
-                *lock_or_recover(&HOOK_ERROR) =
-                    Some(format!("Globaler Input-Hook fehlgeschlagen: {err:?}"));
-            }
+            record_hook_end(result);
         });
     if let Err(err) = spawned {
         HOOK_STARTED.store(false, Ordering::Release);
@@ -603,7 +742,18 @@ pub fn clear_route() {
 /// Changes the Morse keys without rebuilding the route.
 pub fn set_keys(keys: MorseKeys) {
     if let Some(route) = lock_or_recover(&ROUTE).as_mut() {
-        route.keys = routed(keys);
+        let mut new = routed(keys);
+        // a key held right now keeps its state, so its release is not lost or leaked to the app
+        for key in &mut new {
+            let same =
+                |old: &&RoutedKey| old.binding.key == key.binding.key && old.symbol == key.symbol;
+            if let Some(old) = route.keys.iter().find(same) {
+                key.down = old.down;
+                key.swallowed = old.swallowed;
+                key.ignored = old.ignored;
+            }
+        }
+        route.keys = new;
     }
 }
 
@@ -1296,23 +1446,305 @@ mod tests {
     }
 
     #[test]
-    fn double_esc_sets_the_abort_flag_and_is_never_swallowed() {
+    fn one_esc_sets_the_abort_flag_and_is_never_swallowed() {
         let _serial = lock_or_recover(&GLOBAL_STATE);
         reset_block_state();
+        assert!(!function_keys::abort_requested());
         assert!(handle_event(press(Key::Escape)).is_some());
         handle_event(release(Key::Escape));
+        assert!(function_keys::abort_requested(), "peek does not clear");
+        assert!(function_keys::take_abort());
+        assert!(!function_keys::take_abort(), "reading clears it");
+        // key repeat of a held Esc is one press
+        handle_event(press(Key::Escape));
+        assert!(function_keys::take_abort());
+        handle_event(press(Key::Escape));
         assert!(!function_keys::take_abort());
+        handle_event(release(Key::Escape));
+        reset_block_state();
+    }
+
+    #[test]
+    fn esc_while_we_type_aborts_but_the_esc_we_send_does_not() {
+        let _serial = lock_or_recover(&GLOBAL_STATE);
+        reset_block_state();
+        // our typing keeps the guard up; the user's Esc must still count
+        suppress_for(Duration::from_millis(500));
         assert!(handle_event(press(Key::Escape)).is_some());
         handle_event(release(Key::Escape));
         assert!(function_keys::take_abort());
-        assert!(!function_keys::take_abort(), "reading clears it");
-        // Esc typed by our own injector doesn't count
-        suppress_for(Duration::from_millis(500));
-        handle_event(press(Key::Escape));
-        handle_event(release(Key::Escape));
+        // an {Esc} from the injector is announced first
+        function_keys::ignore_esc_for(Duration::from_millis(500));
         handle_event(press(Key::Escape));
         handle_event(release(Key::Escape));
         assert!(!function_keys::take_abort());
+        reset_block_state();
+    }
+
+    /// Short names of what the worker received: P(ress), R(elease), D(ot) / S(trich) release.
+    fn kinds(rx: &std::sync::mpsc::Receiver<WorkerMessage>) -> String {
+        rx.try_iter()
+            .map(|m| match m {
+                WorkerMessage::Press(_) => 'P',
+                WorkerMessage::Release(_) => 'R',
+                WorkerMessage::ReleaseAs(_, Symbol::Dot) => 'D',
+                WorkerMessage::ReleaseAs(_, Symbol::Dash) => 'S',
+                _ => '?',
+            })
+            .collect()
+    }
+
+    #[test]
+    fn hook_end_is_recorded_and_allows_a_restart() {
+        let _serial = lock_or_recover(&GLOBAL_STATE);
+        for result in [Ok(()), Err("kein Display")] {
+            HOOK_STARTED.store(true, Ordering::SeqCst);
+            *lock_or_recover(&HOOK_ERROR) = None;
+            record_hook_end(result);
+            let message = hook_error().expect("every end is an error");
+            assert!(message.contains("Input-Hook"), "{message}");
+            assert!(!HOOK_STARTED.load(Ordering::SeqCst), "can be started again");
+        }
+        assert!(hook_error().unwrap().contains("kein Display"));
+        *lock_or_recover(&HOOK_ERROR) = None;
+    }
+
+    #[test]
+    fn modifier_sync_follows_the_real_keyboard() {
+        let (ctrl_l, shift_l, win_r) = (1, 16, 128);
+        // Win+L left Win and Ctrl "held" in our bits; the keyboard says only Shift is down
+        let held = ctrl_l | win_r | CAPS_LOCK;
+        let synced = sync_modifiers(held, |vk| vk == 0xA0);
+        assert_eq!(synced, shift_l | CAPS_LOCK, "Caps Lock is not touched");
+        assert_eq!(sync_modifiers(0, |vk| vk == 0x5C), win_r, "also adds");
+        assert_eq!(sync_modifiers(held, |_| true), 0xFF | CAPS_LOCK);
+    }
+
+    #[test]
+    fn menu_mask_is_needed_once_per_alt_or_win_hold() {
+        assert!(needs_menu_mask(ALT, false));
+        assert!(needs_menu_mask(WIN | SHIFT, false));
+        assert!(!needs_menu_mask(ALT, true), "already sent");
+        assert!(!needs_menu_mask(CTRL | SHIFT, false), "no Start/menu risk");
+        assert!(!needs_menu_mask(0, false));
+    }
+
+    #[test]
+    fn swallowed_slot_key_under_win_or_alt_sends_one_mask() {
+        let _serial = lock_or_recover(&GLOBAL_STATE);
+        reset_block_state();
+        MASK_SENT.store(false, Ordering::SeqCst);
+        slots(&[(13, "Win+F13", true), (14, "F14", false)]);
+        let before = TEST_MASKS.load(Ordering::SeqCst);
+        handle_event(press(Key::MetaLeft));
+        assert!(handle_event(press(F13)).is_none());
+        handle_event(press(F13)); // key repeat
+        handle_event(release(F13));
+        assert!(handle_event(press(F13)).is_none());
+        handle_event(release(F13));
+        assert_eq!(TEST_MASKS.load(Ordering::SeqCst), before + 1);
+        handle_event(release(Key::MetaLeft));
+        // a key that is not swallowed needs none, and neither does a hold without Win/Alt
+        handle_event(press(Key::Unknown(125)));
+        handle_event(release(Key::Unknown(125)));
+        assert_eq!(TEST_MASKS.load(Ordering::SeqCst), before + 1);
+        handle_event(press(Key::Alt));
+        slots(&[(13, "Alt+F13", true)]);
+        handle_event(press(F13));
+        assert_eq!(TEST_MASKS.load(Ordering::SeqCst), before + 2, "new hold");
+        handle_event(release(F13));
+        handle_event(release(Key::Alt));
+        clear_function_keys();
+        reset_block_state();
+    }
+
+    #[test]
+    fn rolled_presses_of_two_keys_give_the_symbol_of_the_first() {
+        let _serial = lock_or_recover(&GLOBAL_STATE);
+        reset_block_state();
+        let rx = route_keys("F11", Some("F12"));
+        handle_event(press(Key::F11)); // dot down
+        handle_event(press(Key::F12)); // dash rolled in: refused
+        handle_event(release(Key::F11)); // dot
+        handle_event(press(Key::F12)); // key repeat of the refused press: still refused
+        handle_event(press(Key::F11)); // dot again
+        handle_event(release(Key::F12)); // refused press ends, no symbol
+        handle_event(release(Key::F11)); // second dot
+        clear_route();
+        assert_eq!(kinds(&rx), "PDPD");
+        reset_block_state();
+    }
+
+    #[test]
+    fn refused_rolled_key_is_still_hidden_when_blocking() {
+        let _serial = lock_or_recover(&GLOBAL_STATE);
+        reset_block_state();
+        let _rx = route_keys("F11", Some("F12"));
+        set_blocking(true);
+        assert!(handle_event(press(Key::F11)).is_none());
+        assert!(handle_event(press(Key::F12)).is_none());
+        assert!(handle_event(release(Key::F11)).is_none());
+        assert!(
+            handle_event(release(Key::F12)).is_none(),
+            "no orphan key-up"
+        );
+        clear_route();
+        reset_block_state();
+    }
+
+    #[test]
+    fn dash_key_with_modifier_is_not_shadowed_by_a_plain_dot_key() {
+        let _serial = lock_or_recover(&GLOBAL_STATE);
+        reset_block_state();
+        let rx = route_keys("F8", Some("Ctrl+F8"));
+        handle_event(press(Key::ControlLeft));
+        handle_event(press(Key::F8));
+        handle_event(release(Key::F8));
+        handle_event(release(Key::ControlLeft));
+        handle_event(press(Key::F8));
+        handle_event(release(Key::F8));
+        clear_route();
+        assert_eq!(kinds(&rx), "PSPD");
+        // the same with the dot key given as the specific one
+        let rx = route_keys("Ctrl+F8", Some("F8"));
+        handle_event(press(Key::ControlLeft));
+        handle_event(press(Key::F8));
+        handle_event(release(Key::F8));
+        handle_event(release(Key::ControlLeft));
+        clear_route();
+        assert_eq!(kinds(&rx), "PD");
+        reset_block_state();
+    }
+
+    #[test]
+    fn shortcut_key_is_not_also_a_morse_key() {
+        let _serial = lock_or_recover(&GLOBAL_STATE);
+        reset_block_state();
+        let rx = route_keys("F11", Some("Pause"));
+        set_shortcut("Ctrl+Shift+Pause").unwrap();
+        handle_event(press(Key::ControlLeft));
+        handle_event(press(Key::ShiftLeft));
+        handle_event(press(Key::Pause));
+        handle_event(press(Key::Pause)); // key repeat
+        handle_event(release(Key::Pause));
+        assert!(!active(), "the shortcut fired");
+        assert_eq!(kinds(&rx), "", "no stray dash");
+        handle_event(release(Key::ShiftLeft));
+        handle_event(release(Key::ControlLeft));
+        // without the modifiers it is the dash key again
+        handle_event(press(Key::Pause));
+        handle_event(release(Key::Pause));
+        assert_eq!(kinds(&rx), "PS");
+        set_shortcut("").unwrap();
+        clear_route();
+        reset_block_state();
+    }
+
+    #[test]
+    fn release_of_an_accepted_press_survives_own_typing() {
+        let _serial = lock_or_recover(&GLOBAL_STATE);
+        reset_block_state();
+        let rx = route_keys("F12", None);
+        handle_event(press(Key::F12));
+        suppress_for(Duration::from_millis(500));
+        handle_event(release(Key::F12)); // falls into the guard window of a typed character
+        assert_eq!(kinds(&rx), "PR", "press is not left open");
+        // a new press inside the window is dropped (it may be our own input) ...
+        handle_event(press(Key::F12));
+        assert_eq!(kinds(&rx), "");
+        handle_event(release(Key::F12));
+        assert_eq!(kinds(&rx), "");
+        // ... and works again afterwards, nothing stayed "down"
+        *lock_or_recover(&SUPPRESS_UNTIL) = None;
+        handle_event(press(Key::F12));
+        handle_event(release(Key::F12));
+        assert_eq!(kinds(&rx), "PR");
+        clear_route();
+        reset_block_state();
+    }
+
+    #[test]
+    fn blocked_key_stays_hidden_while_own_typing_runs() {
+        let _serial = lock_or_recover(&GLOBAL_STATE);
+        reset_block_state();
+        let rx = route_keys("F12", None);
+        set_blocking(true);
+        suppress_for(Duration::from_millis(500));
+        assert!(
+            handle_event(press(Key::F12)).is_none(),
+            "user press, hidden"
+        );
+        *lock_or_recover(&SUPPRESS_UNTIL) = None;
+        assert!(
+            handle_event(release(Key::F12)).is_none(),
+            "no orphan key-up"
+        );
+        assert_eq!(kinds(&rx), "", "but not counted as Morse input");
+        // a press accepted before the window keeps its swallowed release in it
+        handle_event(press(Key::F12));
+        suppress_for(Duration::from_millis(500));
+        assert!(handle_event(release(Key::F12)).is_none());
+        assert_eq!(kinds(&rx), "PR");
+        clear_route();
+        reset_block_state();
+    }
+
+    #[test]
+    fn slot_key_released_during_capture_is_not_left_down() {
+        let _serial = lock_or_recover(&GLOBAL_STATE);
+        reset_block_state();
+        slots(&[(13, "F13", true)]);
+        handle_event(press(F13));
+        begin_test_capture();
+        assert!(
+            handle_event(release(F13)).is_none(),
+            "swallowed press, swallowed release"
+        );
+        assert_eq!(take_capture(), None, "a release is not a capture");
+        cancel_capture();
+        handle_event(press(F13)); // a new press, not a repeat
+        assert_eq!(fired_slots(), vec![13, 13]);
+        handle_event(release(F13));
+        clear_function_keys();
+        reset_block_state();
+    }
+
+    #[test]
+    fn replacing_the_slots_while_a_key_is_held_keeps_its_release_hidden() {
+        let _serial = lock_or_recover(&GLOBAL_STATE);
+        reset_block_state();
+        slots(&[(13, "F13", true)]);
+        assert!(handle_event(press(F13)).is_none());
+        slots(&[(14, "F14", true)]); // F13 is gone from the table
+        assert!(
+            handle_event(press(F13)).is_none(),
+            "repeat of the old press"
+        );
+        assert!(handle_event(release(F13)).is_none(), "no orphan key-up");
+        assert!(handle_event(press(F13)).is_some(), "the hold is over");
+        assert!(fired_slots().is_empty());
+        handle_event(release(F13));
+        clear_function_keys();
+        reset_block_state();
+    }
+
+    #[test]
+    fn changing_morse_keys_while_held_keeps_the_press_state() {
+        let _serial = lock_or_recover(&GLOBAL_STATE);
+        reset_block_state();
+        let rx = route_keys("F12", None);
+        set_blocking(true);
+        assert!(handle_event(press(Key::F12)).is_none());
+        set_keys(MorseKeys {
+            key: "F12".parse().unwrap(),
+            dash_key: None,
+        });
+        assert!(
+            handle_event(release(Key::F12)).is_none(),
+            "no orphan key-up"
+        );
+        assert_eq!(kinds(&rx), "PR", "release still ends the press");
+        clear_route();
         reset_block_state();
     }
 }
