@@ -17,9 +17,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: X11 headers (Linux only, for rdev/enigo)
+      - name: X11 headers (Linux only, for rdev/enigo) and xvfb (display for the Tk tests)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxtst-dev libxi-dev
+        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxtst-dev libxi-dev xvfb
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -43,4 +43,4 @@ jobs:
           pip install maturin pytest ruff
           maturin develop --release
           ruff check python tests
-          pytest -q
+          if [ "$RUNNER_OS" = "Linux" ]; then xvfb-run -a pytest -q; else pytest -q; fi
