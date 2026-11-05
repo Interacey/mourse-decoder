@@ -577,6 +577,29 @@ fn inject_backspaces(py: Python<'_>, count: u32) -> PyResult<()> {
     }
 }
 
+/// Largest absolute wheel step per call.
+const MAX_WHEEL_NOTCHES: i32 = 10;
+
+/// Turns the mouse wheel by `notches` clicks (positive = down).
+#[pyfunction]
+fn scroll_wheel(py: Python<'_>, notches: i32) -> PyResult<()> {
+    if notches.abs() > MAX_WHEEL_NOTCHES {
+        return Err(PyValueError::new_err(format!(
+            "notches muss zwischen -{MAX_WHEEL_NOTCHES} und {MAX_WHEEL_NOTCHES} liegen"
+        )));
+    }
+    #[cfg(feature = "native-io")]
+    {
+        py.detach(move || crate::injector::scroll_wheel(notches))
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+    #[cfg(not(feature = "native-io"))]
+    {
+        let _ = py;
+        Err(PyRuntimeError::new_err("Ohne Feature 'native-io' gebaut"))
+    }
+}
+
 /// Module init. The name must match `module-name` in pyproject.toml.
 #[pymodule]
 #[pyo3(name = "_morse_core")]
@@ -590,6 +613,7 @@ fn morse_core_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(poll_capture, m)?)?;
     m.add_function(wrap_pyfunction!(inject_text, m)?)?;
     m.add_function(wrap_pyfunction!(inject_backspaces, m)?)?;
+    m.add_function(wrap_pyfunction!(scroll_wheel, m)?)?;
     m.add_function(wrap_pyfunction!(press_shortcut, m)?)?;
     m.add_function(wrap_pyfunction!(check_shortcut, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;

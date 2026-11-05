@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use std::fmt;
 use std::time::Duration;
 
-use enigo::{Direction, Enigo, Key, Keyboard, Settings};
+use enigo::{Axis, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 
 use crate::function_keys;
 use crate::hooks;
@@ -400,6 +400,21 @@ pub fn inject_backspaces(count: u32) -> Result<(), InjectError> {
     result
 }
 
+/// Turns the mouse wheel by `notches` clicks (positive = down, negative = up).
+pub fn scroll_wheel(notches: i32) -> Result<(), InjectError> {
+    if notches == 0 {
+        return Ok(());
+    }
+    // No hooks::suppress_for here: while suppressed the hook drops new presses of the
+    // Morse key, so at up to 25 notches/s the stop code could not be keyed any more.
+    // Wheel events never reach the Morse routing (route_input returns early for them).
+    with_enigo(|enigo| {
+        enigo
+            .scroll(notches, Axis::Vertical)
+            .map_err(|e| InjectError(format!("{e:?}")))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,6 +430,11 @@ mod tests {
     #[test]
     fn zero_backspaces_is_a_no_op() {
         assert!(inject_backspaces(0).is_ok());
+    }
+
+    #[test]
+    fn zero_notches_is_a_no_op() {
+        assert!(scroll_wheel(0).is_ok());
     }
 
     #[test]

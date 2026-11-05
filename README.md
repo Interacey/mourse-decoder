@@ -106,7 +106,7 @@ Edge cases:
 - A command ends at the first `}`. `\}` inside a command (`{Wait 100\}`) does not keep it open; it ends the command, which is then reported as an error.
 - Counter values are put in after all escapes were handled and are never searched for escapes or brackets again.
 
-Modifiers: `Ctrl`/`Strg`, `Alt`, `Shift`/`Umschalt`, `Win`/`Windows`. Keys: one character, `F1`–`F12`, `Enter`/`Eingabe`, `Tab`, `Esc`, `Backspace`/`Rücktaste`, `Delete`/`Entf`, `Space`/`Leertaste`, `Home`/`Pos1`, `End`/`Ende`, `PageUp`/`BildAuf`, `PageDown`/`BildAb`, `Up`/`Hoch`, `Down`/`Runter`, `Left`/`Links`, `Right`/`Rechts`. The commands have German names too: `{Warte 500}`, `{WarteFenster …}`, `{Schleife 3}…{SchleifenEnde}`.
+Modifiers: `Ctrl`/`Strg`, `Alt`, `Shift`/`Umschalt`, `Win`/`Windows`. Keys: one character, `F1`–`F12`, `Enter`/`Eingabe`, `Tab`, `Esc`, `Backspace`/`Rücktaste`, `Delete`/`Entf`, `Space`/`Leertaste`, `Home`/`Pos1`, `End`/`Ende`, `PageUp`/`BildAuf`, `PageDown`/`BildAb`, `Up`/`Hoch`, `Down`/`Runter`, `Left`/`Links`, `Right`/`Rechts`. The commands have German names too: `{Warte 500}`, `{WarteFenster …}`, `{Schleife 3}…{SchleifenEnde}`, `{Scroll Runter}`, `{Scroll Hoch}`, `{Scroll Stopp}`.
 
 `{Backspace 5}` presses a key several times (count 1 to 1000 after a space, e.g. `{Space 18}`, `{Ctrl+End 2}`).
 
@@ -128,6 +128,24 @@ Everything is typed like keyboard input: text, line breaks, tabs and emoji. On W
 "--..-.--": "Hello,{Enter}here is the report:{Enter}{File %USERPROFILE%\\Documents\\report.pdf}",
 "--..-..-": "{Clipboard}{Enter}"
 ```
+
+#### Scrolling
+
+`{Scroll Down}`, `{Scroll Up}` and `{Scroll Stop}` turn the mouse wheel. Spaces are optional and case is ignored (`{ScrollDown}`). German: `{Scroll Runter}`, `{Scroll Hoch}`, `{Scroll Stopp}`; `{Scroll End}` and `{Scroll Ende}` mean the same as Stop. There are no default Morse codes for them. Bind them like any macro, in your own alphabet or smiley set or on a function-key slot (Stream Deck):
+
+```json
+{"id": "scroll", "name": "Scroll", "codes": {
+  "--.-.--.": "{Scroll Down}",
+  "--.-.-.-": "{Scroll Up}",
+  "--.--.-.": "{Scroll Stop}"
+}}
+```
+
+Keying `{Scroll Down}` starts turning the wheel down at once and keeps going. Each further `{Scroll Down}` makes it faster: 3, 5, 8, 12, 18, 25 notches per second; more triggers stay at 25. One notch is one wheel click, 3 lines with the Windows default. `{Scroll Up}` while scrolling down reverses at the slowest speed, and the other way round.
+
+Scrolling ends on `{Scroll Stop}`, on Esc, when Morse input is switched off with the on/off shortcut, when the program ends, on an injection error (with a message), and by itself after 10 minutes (with a message). Morse letters keep working while it scrolls, which is how the speed-up and stop codes get through; other letters are typed normally meanwhile.
+
+The wheel turns the window under the mouse pointer (Windows 10/11 default), which is not always the window with the keyboard focus. In the Chinese telecode mode only a function key can scroll, because the telecode decoder reads digits only. `{Scroll Down 3}` is an error; to start at speed 3 write `{Loop 3}{Scroll Down}{EndLoop}`. No space follows a scroll code (the word gap after a macro is dropped, as for every macro longer than one character).
 
 ### Chinese telecodes (optional)
 
@@ -157,7 +175,7 @@ General rules for all kinds of file:
 - The `id` is also the file name: `id` `mein-alphabet` lives in `mein-alphabet.json`. Allowed: `a-z`, `0-9`, `-`, `_`, starting with a letter or digit.
 - Files you write by hand may hold raw line breaks inside texts and a stray `"` (`"NIV"`). The app accepts them and saves strict JSON back. A broken file is skipped with a message, it never stops the program.
 - Files are size-unlimited on purpose, but a text of several 100 KB takes minutes to type; see "Emoji and long texts".
-- Importing: the Import buttons copy any JSON file into the right folder, take a missing `id` from the file name, and check it completely. If the file holds commands that do something when keyed (`{Win+R}`, `{File …}`, `{Clipboard}`) you are asked first.
+- Importing: the Import buttons copy any JSON file into the right folder, take a missing `id` from the file name, and check it completely. If the file holds commands that do something when keyed (`{Win+R}`, `{File …}`, `{Clipboard}`, `{Scroll …}`) you are asked first.
 
 ### settings.json
 
@@ -290,14 +308,14 @@ Copy `python/mourse_decoder/locales/en.json` as a template and translate the val
 - Modifiers must match exactly: `F13` does not fire while Ctrl is held, `Ctrl+F13` does not fire under Ctrl+Alt. A trigger must differ from the Morse key, the dash key and the two shortcuts, and from every other active slot. Esc, the modifier keys and plain typing keys (letters, digits, Space, Enter, Backspace, Tab, punctuation, numpad without Ctrl, Alt or Win) are refused as triggers, because the hook would otherwise fire on normal typing; a right or middle click is refused only while it is swallowed and has no modifier.
 - `swallow` (default on) hides the trigger key from the focused app. A key without a slot is never touched. On Linux the hook can only watch, so triggers always reach the app.
 - Before the macro types, the program waits up to 3 seconds for Ctrl, Alt, Shift and Win to be let go; otherwise typed text would turn into shortcuts. One macro runs at a time, a second trigger meanwhile is ignored. Keys sent by the program itself never fire a slot, so a macro containing `{F13}` does not start itself.
-- Pressing Esc stops any running macro, also those of Morse letters. Esc itself still reaches the app.
+- Pressing Esc stops any running macro, also those of Morse letters, and ends scrolling. Esc itself still reaches the app.
 
 **The Function keys page** lists all 100 slots with type (real or virtual), trigger, label or macro and status; the switch "Only assigned" and the search box narrow the list. Select a slot to edit its macro, label, trigger (click the trigger button, press the keys; "Default" restores the standard one), "Active" and "Swallow the key". The macro is checked while you type and a mistake is shown in red; "Save" is available once the slot is valid and installs it right away. "Test" runs the saved macro after 3 seconds, so you can click into the target window first, and "Reset" returns the slot to its default trigger with an empty macro. For a virtual slot, set the Stream Deck button to send the combination shown in the Trigger column. Esc stops a running macro.
 
 ## Security
 
 - **Network paths are refused** in `{File …}`. Merely checking whether `\\server\share\x` exists makes Windows log in at that server and hand over the user's NTLM hash, so a smiley set from a stranger could leak it. Local drives and mapped drives (`Z:\`) work.
-- **Warning before an import:** if a file you import holds commands that do something when keyed (`{Win+R}`, `{Enter}`, `{File …}`, `{Clipboard}`), you are asked once, with the list. Waiting, loops and plain text never ask, and neither do the files that ship with the app. Saving in the editor and typing stay silent.
+- **Warning before an import:** if a file you import holds commands that do something when keyed (`{Win+R}`, `{Enter}`, `{File …}`, `{Clipboard}`, `{Scroll …}`), you are asked once, with the list. Waiting, loops and plain text never ask, and neither do the files that ship with the app. Saving in the editor and typing stay silent.
 - **Updates:** only `https://github.com/…` links; every hop of a redirect must be `https` on `github.com`, `api.github.com` or `*.githubusercontent.com`, anything else is refused; the answer is capped at 1 MB and the download at 200 MB, the SHA-256 must match, and the file must start like a Windows program (`MZ`). Nothing is installed without a published checksum. The checksum comes from the same release as the exe, so it protects against a damaged download, not against a hijacked release (that would need a signature).
 - **Uninstall** (the data part, if you choose it) deletes only folders named `MourseDecoder`, `mourse-decoder` or `PolyglotMorse`, whatever `APPDATA` says, and skips such a folder if it is a junction or symlink.
 - **PowerShell helper:** no `-ExecutionPolicy Bypass`, the script is passed encoded and every path is quoted (also against the typographic quotes `‘ ’ ‚ ‛`, which PowerShell treats like `'`) and used literally (`[ ]` are no wildcards). Its exit code says what happened (0 done, 1 file stayed busy, 2 replaced but did not start). If the exe stays locked for about a minute, the old program is started again, the temporary download folder is removed and `update-result.txt` in the settings folder gets a one-word reason, which the next start shows once and deletes.
@@ -311,8 +329,8 @@ Started in the tray, the app uses about 29 MB of private memory (it was 40 MB). 
 ## Tests
 
 ```bash
-cargo test                 # 107 Rust tests (timing, worker, trigger, hook routing)
-pytest                     # 1068 Python tests (some of them against the real Rust module and the real Windows clipboard)
+cargo test                 # 108 Rust tests (timing, worker, trigger, hook routing)
+pytest                     # 1119 Python tests (1117 passed, 2 skipped on Windows; some of them against the real Rust module and the real Windows clipboard)
 ruff check python tests
 ```
 
