@@ -307,6 +307,14 @@ def test_press_shortcut_rejects_unknown_combos():
         core.check_shortcut(good)  # only checks, presses nothing
 
 
+def test_scroll_wheel_zero_is_a_no_op_and_out_of_range_is_rejected():
+    # a real notch would scroll the desktop, so only 0 and the range check are tested
+    assert core.scroll_wheel(0) is None
+    for bad in (11, -11):
+        with pytest.raises(ValueError):
+            core.scroll_wheel(bad)
+
+
 def test_blocking_api_on_the_real_module():
     eng = core.MorseEngine()
     eng.block_input = True

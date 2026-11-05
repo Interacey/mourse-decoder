@@ -224,6 +224,12 @@ def test_commands_that_do_something_are_listed(tmp_path):
     assert macros.commands_in_file(path) == ["{Win+R}", "{Enter}", "{Clipboard}", "{File …}", "{Ctrl+C}", "{ctrl+c}"]
 
 
+def test_scrolling_is_listed(tmp_path):
+    # other spellings are reported by their canonical name, not as typed
+    path = write_set(tmp_path, {"--..--..": "{scrolldown}{Scroll Runter}", "--..-.-.": "{Scroll Ende}"})
+    assert macros.commands_in_file(path) == ["{Scroll Down}", "{Scroll Stop}"]
+
+
 @pytest.mark.parametrize(
     "codes",
     [

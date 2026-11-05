@@ -147,6 +147,9 @@ class _PrintInjector:
     def paste_files(self, paths: list[str]) -> None:
         print(f"[füge ein {paths!r}]", flush=True)
 
+    def scroll(self, notches: int) -> None:
+        print(f"[scrolle {notches:+d}]", flush=True)
+
 
 def _prepare_windows() -> None:
     """Windowed builds have no console (stdout/stderr are None), and the taskbar should show

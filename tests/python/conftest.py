@@ -129,6 +129,9 @@ class RecordingInjector:
     def paste_files(self, paths: list[str]) -> None:
         self.calls.append(("files", paths))
 
+    def scroll(self, notches: int) -> None:
+        self.calls.append(("scroll", notches))
+
 
 class RecordingListener:
     def __init__(self) -> None:

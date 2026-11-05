@@ -4,6 +4,7 @@ A letter flows like this: the Rust worker thread calls ``_on_engine_event``,
 the decoder turns the sequence into an Emission, the injector deletes and types,
 and the listener gets told for UI feedback. Engine and injector are protocols so
 all of this can be tested with fakes, without Rust, a display or real typing.
+Scrolling ({Scroll Down} and friends) runs on its own thread outside the macro lock.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from . import clipboard, desktop, macros
 from .decoders import Decoder, Emission, create_decoder
 from .dictionary import DictionaryManager
 from .function_keys import FunctionKeys, Slot
+from .scroller import DOWN, UP, Scroller
 from .settings import Settings
 
 log = logging.getLogger(__name__)
@@ -72,6 +74,8 @@ class InjectorLike(Protocol):
         """The text on the clipboard right now, None if there is none."""
     def paste_files(self, paths: list[str]) -> None:
         """Paste files or folders into the window in front, as if copied in Explorer."""
+    def scroll(self, notches: int) -> None:
+        """Turn the mouse wheel by ``notches`` clicks; positive is down."""
 
 
 class ControllerListener(Protocol):
@@ -154,6 +158,9 @@ class NativeInjector:
     def foreground_title(self) -> str:
         return desktop.foreground_title()
 
+    def scroll(self, notches: int) -> None:
+        self._native.scroll_wheel(notches)
+
 
 class MorseController:
     HISTORY_LIMIT = 500
@@ -171,6 +178,7 @@ class MorseController:
         listener: ControllerListener | None = None,
         decoder_factory: Callable[[DictionaryManager, str], Decoder] = create_decoder,
         use_hook: bool = True,
+        scroller_factory: Callable[..., Scroller] = Scroller,
     ) -> None:
         self._engine = engine
         self._injector = injector
@@ -186,6 +194,17 @@ class MorseController:
         self._function_keys = FunctionKeys()
         # held while a macro types, whether a Morse letter or a function key started it
         self._macro_lock = threading.Lock()
+        # Esc is read once from the engine; the counter lets the macro still see an Esc that the
+        # scroller thread consumed first
+        self._esc_lock = threading.Lock()
+        self._esc_generation = 0
+        self._macro_esc_mark = 0
+        # lazy wheel: injectors without scroll() work as long as nothing scrolls
+        self._scroller = scroller_factory(
+            wheel=lambda notches: self._injector.scroll(notches),
+            should_stop=self._scroll_stop_reason,
+            on_error=lambda message: self._notify("on_error", message),
+        )
         try:
             dictionaries.set_smileys(settings.smileys)
         except ValueError as exc:  # set deleted or broken: start without smileys instead of crashing
@@ -231,6 +250,7 @@ class MorseController:
                 return
             self._running = False
             self._stopping = True
+        self._scroller.stop()
         self._engine.block_input = False  # never leave the key blocked behind
         self._engine.clear_function_keys()
         self._engine.stop()
@@ -379,7 +399,7 @@ class MorseController:
     def _run_slot_locked(self, slot: Slot) -> None:
         """Body of a slot run; the caller holds ``_macro_lock``, released here."""
         try:
-            self._engine.poll_abort()  # an Esc from before does not count
+            self._begin_macro()
             self._wait_for_modifiers_released()
             self._emit_steps(Emission(slot.macro))
         except macros.MacroStopped as exc:
@@ -463,7 +483,7 @@ class MorseController:
             self._reset_decoder()  # its state moved on for a letter that never came out
             return
         try:
-            self._engine.poll_abort()  # an Esc from before does not count
+            self._begin_macro()
             self._emit_steps(emission)
         except BaseException:
             self._reset_decoder()  # stopped or failed half way: the decoder must not build on it
@@ -507,6 +527,14 @@ class MorseController:
                     if not secret:
                         raise macros.MacroError("Die Zwischenablage enthält keinen Text – nichts getippt.")
                     self._type(secret, self._injector.type_text, always=True)
+                elif kind == "scroll":
+                    # returns at once: the scroller thread does the rest, outside the macro lock
+                    if value == "down":
+                        self._scroller.request(DOWN)
+                    elif value == "up":
+                        self._scroller.request(UP)
+                    else:
+                        self._scroller.stop()
                 else:
                     self._injector.paste_files([macros.resolve_path(p) for p in value])
         finally:
@@ -554,8 +582,47 @@ class MorseController:
         # the on/off shortcut flips engine.active right away, also while a macro runs
         if not self._engine.active:
             raise macros.MacroStopped("Makro gestoppt, weil die Morse-Eingabe ausgeschaltet wurde.")
-        if self._engine.poll_abort():  # Esc; the injector already stopped typing on it
+        self._take_esc()  # Esc; the injector already stopped typing on it
+        with self._esc_lock:
+            pressed = self._esc_generation != self._macro_esc_mark
+        if pressed:  # also true if the scroller thread read the flag first
             raise macros.MacroStopped("Makro abgebrochen (Esc).")
+
+    def _read_esc_locked(self) -> bool:
+        """Read the engine's Esc flag and count it; the caller holds ``_esc_lock``."""
+        pressed = bool(self._engine.poll_abort())
+        if pressed:
+            self._esc_generation += 1
+        return pressed
+
+    def _take_esc(self) -> bool:
+        """Read the Esc flag of the engine (the only place that does) and stop scrolling on it."""
+        with self._esc_lock:
+            pressed = self._read_esc_locked()
+        if pressed:
+            self._scroller.stop()  # outside the lock
+        return pressed
+
+    def _begin_macro(self) -> None:
+        # a pending Esc from before still stops scrolling but does not abort this new macro
+        with self._esc_lock:
+            pressed = self._read_esc_locked()
+            self._macro_esc_mark = self._esc_generation
+        if pressed:
+            self._scroller.stop()
+
+    def _scroll_stop_reason(self) -> str | None:
+        """Why scrolling must end now, None if it goes on. Called from the scroller thread."""
+        if self._stopping:
+            return "Programm wird beendet"
+        if not self._engine.active:
+            return "Morse-Eingabe ausgeschaltet"
+        # While a macro types, Esc is left alone: Rust's injector only peeks the flag to stop typing
+        # within one character, and the macro reads it itself (_stop_if_switched_off), which also
+        # stops the scroller.
+        if not self._macro_lock.locked() and self._take_esc():
+            return "Esc"
+        return None
 
     def _sleep(self, seconds: float) -> None:
         """time.sleep in small steps, so switching Morse input off stops a long wait."""

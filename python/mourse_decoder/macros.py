@@ -7,6 +7,7 @@
     "{Backspace 5}{Space 18}"            a key several times (count 1 to 1000, after a space)
     "{Clipboard}"                        type what is on the clipboard (e.g. a KeePass copy)
     "{File C:\\Users\\me\\doc.pdf}"        paste the file or folder (several: path|path)
+    "{Scroll Down}…{Scroll Stop}"        turn the mouse wheel until {Scroll Stop} or Esc ({Scroll Runter}/{Scroll Hoch})
 
 The whole macro is checked before anything happens, so a typo like {Crtl+C} stops it
 with a message instead of typing half a macro into some window. German command names
@@ -29,6 +30,7 @@ _ESCAPABLE = "[](){}"  # a backslash before one of these is an escape
 _WAIT = re.compile(r"\s*(?:wait|warte|warten)\s*(\d{1,5})\s*", _I)
 _WAIT_WINDOW = re.compile(r"\s*(?:waitwindow|wartefenster)\s+(.+?)\s*", _I)
 _CLIPBOARD = re.compile(r"\s*(?:clipboard|zwischenablage)\s*", _I)
+_SCROLL = re.compile(r"\s*scroll\s*(down|runter|up|hoch|stop|stopp|end|ende)\s*", _I)
 _FILES = re.compile(r"\s*(?:file|files|datei|dateien|folder|ordner)\s+(.+?)\s*", _I)
 _LOOP = re.compile(r"\s*(?:loop|schleife)\s+(\d{1,5})(?:\s+([A-Za-z_][A-Za-z0-9_]*))?\s*", _I)
 _END_LOOP = re.compile(r"\s*(?:endloop|schleifenende)\s*", _I)
@@ -49,7 +51,7 @@ MAX_CALC_DEPTH = 32  # parentheses inside each other
 MAX_VALUE = 10**15  # no number in a calculation, result or not, is larger than this
 
 # ("text", str) | ("keys", combo) | ("wait", seconds) | ("window", title part)
-# | ("clipboard", None) | ("files", [path, ...])
+# | ("clipboard", None) | ("files", [path, ...]) | ("scroll", "down" | "up" | "stop")
 Step = tuple[str, object]
 
 
@@ -81,9 +83,10 @@ def resolve_path(raw: str) -> str:
 def commands_in_file(path: Path) -> list[str]:
     """Commands in the texts of an alphabet or smiley file that DO something when keyed.
 
-    Key combinations (``Win+R``), ``File`` and ``Clipboard``, and text with a raw line break or tab:
-    the injector types those as Return and Tab (reported as ``{Enter}`` and ``{Tab}``). Waiting and
-    loops are harmless, plain text too. An unreadable file gives [] because importing it reports that anyway.
+    Key combinations (``Win+R``), ``File``, ``Clipboard``, ``Scroll`` (reported by kind), and text with a
+    raw line break or tab: the injector types those as Return and Tab (reported as ``{Enter}`` and ``{Tab}``).
+    Waiting and loops are harmless, plain text too. An unreadable file gives [] because importing it
+    reports that anyway.
     """
     try:
         data = jsontext.loads(Path(path).read_text(encoding="utf-8-sig"), dict)
@@ -101,6 +104,8 @@ def commands_in_file(path: Path) -> list[str]:
                 found[f"{{{value}}}"] = None
             elif kind in ("files", "clipboard"):
                 found["{File …}" if kind == "files" else "{Clipboard}"] = None
+            elif kind == "scroll":
+                found[f"{{Scroll {value.capitalize()}}}"] = None
             elif kind == "text":
                 if "\n" in value or "\r" in value:
                     found["{Enter}"] = None
@@ -309,6 +314,11 @@ def _build(text: str, check_shortcut: Callable[[str], None]) -> list[tuple]:
             body.append(("step", ("window", window[1])))
         elif _CLIPBOARD.fullmatch(part):
             body.append(("step", ("clipboard", None)))
+        elif scroll := _SCROLL.fullmatch(part):
+            kind = {"runter": "down", "hoch": "up", "stopp": "stop", "end": "stop", "ende": "stop"}.get(
+                scroll[1].lower(), scroll[1].lower()
+            )
+            body.append(("step", ("scroll", kind)))
         elif files := _FILES.fullmatch(part):
             body.append(("step", ("files", _split_paths(files[1]))))
         elif not any(c.isalnum() for c in part):
