@@ -5,7 +5,7 @@
 //! * `MorseEngine`: starts/stops the worker and the global hook and calls a Python
 //!   callback `callback(kind: str, payload: str)` for every event, where `kind` is
 //!   one of "symbol", "letter", "word_gap".
-//! * `inject_text(text)`, `inject_backspaces(n)`: native text injection.
+//! * `inject_text(text, char_delay_ms=None)`, `inject_backspaces(n)`: native text injection.
 //! * `begin_capture()`, `poll_capture()`, `cancel_capture()`: read the next key or
 //!   mouse button for the key binding.
 //! * `classify_duration(ms, threshold_ms)`, `available_triggers()`, `hook_error()`:
@@ -289,6 +289,33 @@ impl PyMorseEngine {
         }
     }
 
+    /// Shortcut that undoes the last typed output; "" removes it.
+    #[setter]
+    fn set_undo_shortcut(&self, spec: &str) -> PyResult<()> {
+        #[cfg(feature = "native-io")]
+        {
+            crate::hooks::set_undo_shortcut(spec).map_err(PyValueError::new_err)
+        }
+        #[cfg(not(feature = "native-io"))]
+        {
+            let _ = spec;
+            Ok(())
+        }
+    }
+
+    /// How often the undo shortcut was pressed; the UI compares it with the last value it saw.
+    #[getter]
+    fn undo_count(&self) -> u32 {
+        #[cfg(feature = "native-io")]
+        {
+            crate::hooks::undo_count()
+        }
+        #[cfg(not(feature = "native-io"))]
+        {
+            0
+        }
+    }
+
     /// How often the cycle shortcut was pressed; the UI compares it with the last value it saw.
     #[getter]
     fn cycle_count(&self) -> u32 {
@@ -514,17 +541,20 @@ fn hook_error() -> Option<String> {
 }
 
 /// Types text into the active app. Releases the GIL meanwhile because SendInput/X11
-/// can take a few milliseconds.
+/// can take a few milliseconds. `char_delay_ms` is the pause after each character
+/// (0 to 10000, default 20); ValueError outside that range.
 #[pyfunction]
-fn inject_text(py: Python<'_>, text: String) -> PyResult<()> {
+#[pyo3(signature = (text, char_delay_ms=None))]
+fn inject_text(py: Python<'_>, text: String, char_delay_ms: Option<u64>) -> PyResult<()> {
     #[cfg(feature = "native-io")]
     {
-        py.detach(move || crate::injector::inject_text(&text))
+        let delay = crate::injector::char_delay(char_delay_ms).map_err(PyValueError::new_err)?;
+        py.detach(move || crate::injector::inject_text(&text, delay))
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
     #[cfg(not(feature = "native-io"))]
     {
-        let _ = (py, text);
+        let _ = (py, text, char_delay_ms);
         Err(PyRuntimeError::new_err("Ohne Feature 'native-io' gebaut"))
     }
 }

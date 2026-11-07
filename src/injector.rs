@@ -99,9 +99,25 @@ fn segments(text: &str) -> Vec<Segment<'_>> {
 /// into two low surrogates. Asking the app whether it is idle (WM_NULL) did not help, it
 /// answers before it works off its key queue, so only waiting does. 4 ms scrambled plain
 /// text in Notepad, 15 ms is the shortest pause that kept it intact.
-const CHAR_DELAY: Duration = Duration::from_millis(20);
+pub const DEFAULT_CHAR_DELAY_MS: u64 = 20;
+/// Limits for a user-chosen pause, in ms. Keep in sync with `TYPING_DELAY_RANGE` in settings.py.
+/// 0 is allowed on purpose, but see the note above: some programs then scramble the text.
+pub const CHAR_DELAY_RANGE_MS: (u64, u64) = (0, 10_000);
 /// After Return and Tab the app lays out the text and is slow for a moment.
 const LINE_KEY_DELAY: Duration = Duration::from_millis(150);
+
+/// The pause after a typed character for `ms`; `None` is the default. Err (German text) outside the range.
+pub fn char_delay(ms: Option<u64>) -> Result<Duration, String> {
+    let ms = ms.unwrap_or(DEFAULT_CHAR_DELAY_MS);
+    let (min, max) = CHAR_DELAY_RANGE_MS;
+    if (min..=max).contains(&ms) {
+        Ok(Duration::from_millis(ms))
+    } else {
+        Err(format!(
+            "Die Tastenanschlag-Verzögerung muss zwischen {min} und {max} ms liegen."
+        ))
+    }
+}
 
 fn pause(delay: Duration) {
     hooks::suppress_for(SELF_INPUT_GUARD); // typing may outlast the guard set at the start
@@ -219,8 +235,8 @@ pub fn menu_mask() {
     win::menu_mask();
 }
 
-/// Types `text` into the active app, one character at a time.
-pub fn inject_text(text: &str) -> Result<(), InjectError> {
+/// Types `text` into the active app, one character at a time, with `char_delay` after each one.
+pub fn inject_text(text: &str, char_delay: Duration) -> Result<(), InjectError> {
     if text.is_empty() {
         return Ok(());
     }
@@ -234,7 +250,7 @@ pub fn inject_text(text: &str) -> Result<(), InjectError> {
                             return Ok(()); // Esc: Python sees the flag and stops the macro
                         }
                         type_char(enigo, c)?;
-                        pause(CHAR_DELAY);
+                        pause(char_delay);
                     }
                 }
                 Segment::Key(key) => {
@@ -424,7 +440,19 @@ mod tests {
 
     #[test]
     fn empty_text_is_a_no_op() {
-        assert!(inject_text("").is_ok());
+        assert!(inject_text("", Duration::from_millis(20)).is_ok());
+    }
+
+    #[test]
+    fn char_delay_defaults_and_checks_the_range() {
+        assert_eq!(char_delay(None), Ok(Duration::from_millis(20)));
+        assert_eq!(char_delay(Some(0)), Ok(Duration::ZERO));
+        assert_eq!(char_delay(Some(5)), Ok(Duration::from_millis(5)));
+        assert_eq!(char_delay(Some(10_000)), Ok(Duration::from_millis(10_000)));
+        assert!(char_delay(Some(10_001))
+            .unwrap_err()
+            .contains("zwischen 0 und 10000"));
+        assert!(char_delay(Some(u64::MAX)).is_err());
     }
 
     #[test]

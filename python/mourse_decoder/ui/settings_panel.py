@@ -12,7 +12,7 @@ from tkinter import ttk
 from ..controller import MorseController
 from ..dictionary import DictionaryManager
 from ..i18n import available_languages, tr
-from ..settings import THEME_MODES, Settings
+from ..settings import THEME_MODES, TYPING_DELAY_RANGE, Settings
 from . import theme
 from .form import parse_form
 from .key_capture import CaptureBackend, KeyCaptureButton, ShortcutCaptureButton
@@ -22,7 +22,10 @@ _TIMING_FIELDS = (
     ("dot_threshold_ms", "timing.dot"),
     ("letter_gap_ms", "timing.letter"),
     ("word_gap_ms", "timing.word"),
+    ("typing_delay_ms", "timing.typing"),
 )
+# (from, to, step) of the number field; the others take any value up to 15000 and let validation report
+_SPINBOX = {"typing_delay_ms": (*TYPING_DELAY_RANGE, 5)}
 TYPING_DELAY_MS = 450  # apply number fields once typing pauses
 
 
@@ -93,6 +96,13 @@ class SettingsPanel(tk.Frame):
         )
         self._shortcut_button.pack()
 
+        undo_row = card.add_row(tr("settings.undo_shortcut"), tr("settings.undo_shortcut.hint"))
+        self._undo_button = ShortcutCaptureButton(
+            undo_row, controller.settings.undo_shortcut, on_change=lambda _spec: self._changed(),
+            on_hint=self._show_key_hint, backend=capture_backend,
+        )
+        self._undo_button.pack()
+
         self._alphabet_var = tk.StringVar()
         self._alphabet_box = self._combo(card.add_row(tr("settings.alphabet"), tr("settings.alphabet.hint")), self._alphabet_var)
         self._smiley_var = tk.StringVar()
@@ -120,8 +130,9 @@ class SettingsPanel(tk.Frame):
             var.trace_add("write", lambda *_: self._schedule())
             holder = timing.add_row(tr(title), tr(f"{title}.hint"))
             label(holder, tr("unit.ms"), muted=True).pack(side="right", padx=(8, 0))
+            low, high, step = _SPINBOX.get(key, (0, 15000, 50))
             box, _ = field_box(
-                holder, ttk.Spinbox, textvariable=var, from_=0, to=15000, increment=50, width=7
+                holder, ttk.Spinbox, textvariable=var, from_=low, to=high, increment=step, width=7
             )
             box.configure(width=110, height=40)
             box.pack(side="right")
@@ -187,6 +198,7 @@ class SettingsPanel(tk.Frame):
             self._block.set(current.block_input)
             self._notify.set(current.notifications)
             self._shortcut_button.set_shortcut(current.block_shortcut)
+            self._undo_button.set_shortcut(current.undo_shortcut)
 
             infos = self._dictionaries.available()
             self._alphabet_by_label = {a.name: a.id for a in infos}
@@ -245,6 +257,7 @@ class SettingsPanel(tk.Frame):
             notifications=self._notify.get(),
             block_shortcut=self._shortcut_button.shortcut,
             cycle_shortcut=self._cycle_button.shortcut,
+            undo_shortcut=self._undo_button.shortcut,
             cycle_alphabets=tuple(self._cycle_ids[i] for i in self._cycle_list.curselection()),
             smileys=self._smiley_by_label.get(self._smiley_var.get(), current.smileys),
             language=self._language_by_label.get(self._language_var.get(), current.language),

@@ -41,7 +41,11 @@ File
 ``function_keys.json`` next to ``settings.json``::
 
     {"schema_version": 1, "slots": [{"slot": 57, "trigger": "...", "macro": "...",
-                                     "enabled": true, "swallow": true, "label": ""}]}
+                                     "enabled": true, "swallow": true, "label": "",
+                                     "typing_delay_ms": 40}]}
+
+``typing_delay_ms`` is optional (0 to 10000, the pause after each typed character); a slot without it
+types with the global setting, and files from before this field load unchanged.
 
 Only slots that differ from their default are written, so a new default does not need a
 migration. Unknown fields in a slot (or at the top) are kept and written back. A file that cannot
@@ -61,7 +65,15 @@ from pathlib import Path
 from typing import Any
 
 from . import jsontext, macros
-from .settings import Settings, default_config_dir, fires_with, is_valid_binding, normalize_binding, same_binding
+from .settings import (
+    Settings,
+    default_config_dir,
+    fires_with,
+    is_valid_binding,
+    normalize_binding,
+    same_binding,
+    typing_delay_error,
+)
 from .triggers import binding_label
 
 log = logging.getLogger(__name__)
@@ -124,6 +136,7 @@ class Slot:
     macro: str = ""          # text in the macro language of alphabet codes (see macros.py)
     enabled: bool = True     # off = the slot does nothing, whatever trigger and macro it has
     swallow: bool = True     # hide the trigger key from the focused app (Windows only)
+    typing_delay_ms: int | None = None  # pause after each typed character; None = the global setting
     label: str = ""          # free text the user sees in the list
     extra: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)  # unknown fields of the file
 
@@ -214,6 +227,7 @@ class FunctionKeys:
             ("der Strich-Taste", settings.dash_trigger if settings.separate_dash_key else ""),
             ("dem Ein/Aus-Kürzel", settings.block_shortcut),
             ("dem Umschalt-Kürzel", settings.cycle_shortcut),
+            ("dem Rückgängig-Kürzel", settings.undo_shortcut),
         ]
         errors = []
         for slot in self.active_slots():
@@ -228,10 +242,11 @@ class FunctionKeys:
         changed = []
         for slot in self.slots:
             if not slot.is_default():
-                changed.append(
-                    {**slot.extra, "slot": slot.slot, "trigger": slot.trigger, "macro": slot.macro,
-                     "enabled": slot.enabled, "swallow": slot.swallow, "label": slot.label}
-                )
+                entry = {**slot.extra, "slot": slot.slot, "trigger": slot.trigger, "macro": slot.macro,
+                         "enabled": slot.enabled, "swallow": slot.swallow, "label": slot.label}
+                if slot.typing_delay_ms is not None:  # a slot without its own delay writes the same keys as before
+                    entry["typing_delay_ms"] = slot.typing_delay_ms
+                changed.append(entry)
         return {**self.extra, "schema_version": SCHEMA_VERSION, "slots": changed}
 
 
@@ -289,6 +304,8 @@ def _slot_errors(slot: Slot, check_shortcut: Callable[[str], None] | None) -> li
     for name in ("enabled", "swallow"):
         if not isinstance(getattr(slot, name), bool):
             errors.append(f"'{name}' muss true oder false sein.")
+    if slot.typing_delay_ms is not None and (error := typing_delay_error(slot.typing_delay_ms)) is not None:
+        errors.append(error)
     if not isinstance(slot.label, str) or len(slot.label) > MAX_LABEL_LENGTH:
         errors.append(f"Die Beschriftung muss ein Text mit höchstens {MAX_LABEL_LENGTH} Zeichen sein.")
     return errors
@@ -301,7 +318,7 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return dict(pairs)
 
 
-_SLOT_FIELDS = {"slot", "trigger", "macro", "enabled", "swallow", "label"}
+_SLOT_FIELDS = {"slot", "trigger", "macro", "enabled", "swallow", "label", "typing_delay_ms"}
 
 
 class FunctionKeysStore:
@@ -391,7 +408,11 @@ class FunctionKeysStore:
         bad_types = not all(isinstance(getattr(slot, n), bool) for n in ("enabled", "swallow"))
         if bad_types or not isinstance(slot.label, str):
             return None, "; ".join(errors)
-        return slot.replace(enabled=False), "ausgeschaltet. " + "; ".join(errors)
+        # an unusable delay is dropped so the slot can be saved again; the macro stays, switched off
+        bad_delay = slot.typing_delay_ms is not None and typing_delay_error(slot.typing_delay_ms) is not None
+        return slot.replace(enabled=False, typing_delay_ms=None if bad_delay else slot.typing_delay_ms), (
+            "ausgeschaltet. " + "; ".join(errors)
+        )
 
     def save(self, keys: FunctionKeys) -> None:
         """Atomic write. ValueError if the slots are invalid or the file belongs to a newer version."""

@@ -56,6 +56,20 @@ In the settings, under "Switch list", pick the alphabets you want to switch thro
 
 On Linux, the packages `libx11-dev libxtst-dev libxi-dev` are also required.
 
+### Typing delay
+
+After every character the program types it pauses for a moment (default 20 ms), because some programs read several queued characters as the last one and scramble the text. If a program still drops or mixes up letters, raise "Typing delay" in the settings (0 to 10000 ms); a lower value types faster, but below about 15 ms Windows Notepad garbled text in tests, and 0 means no pause at all. The pause after Enter and Tab is fixed.
+
+Three places can set it, and the most specific wins:
+
+1. `{Delay N}` inside the macro text: from that point on to the end of the output that is being typed (a later `{Delay M}` replaces it). It does not carry over to the next macro run or Morse letter.
+2. `typing_delay_ms` of a function key slot in `function_keys.json` (the "Typing delay" field in the slot's editor; empty = not set). It applies to every character that slot types.
+3. `typing_delay_ms` in `settings.json` (the "Typing delay" setting). It applies to everything else, including everything typed by Morse letters and by codes of alphabets and smiley sets.
+
+### Undo the last output
+
+The tray menu entry "Undo last output" and the optional shortcut "Shortcut to undo" (settings page, field `undo_shortcut`) delete what was typed last by sending as many Backspaces as it had characters. Only the last output can be undone, and only once: after an undo there is nothing to undo until something new is typed, so repeated presses never delete more text. What counts as the last output: one decoded letter or word gap, or one run of a macro (a function key or a code with a macro text). Counted are the characters actually typed (a line break is one) and the keys `Enter`, `Tab` and `Space` as one each. Any other key in a macro (`{Ctrl+A}`, `{Delete}` …), a pasted file or a correction that deleted earlier text makes the result unknown, so it counts as nothing and nothing before it is deleted. Text that Esc cut short is not counted. Scrolling and waiting change nothing and leave the earlier output undoable. Nothing happens while a macro is typing or Morse input is off; a short message says why. The shortcut waits up to 3 seconds for Ctrl, Alt, Shift and Win to be let go, because Ctrl+Backspace would delete whole words.
+
 ### Emoji and long texts (smiley sets)
 
 The built-in set "Standard" has 125 emoji (faces, gestures, hearts, symbols, food and things such as 😊 😍 🔥 💯 ✅ 🚀 ☕), each on an 8-symbol code that no alphabet uses, so a letter is never shadowed. The easiest codes to key belong to the most common emoji. The Smileys page lists every code. Your own sets work the same way; see below.
@@ -129,6 +143,19 @@ Everything is typed like keyboard input: text, line breaks, tabs and emoji. On W
 "--..-..-": "{Clipboard}{Enter}"
 ```
 
+#### Pausing and rolling back
+
+`{Wait 500}` (`{Warte 500}`) pauses the macro for 500 ms before the next step.
+
+`{Delay 100}` (`{Verzögerung 100}`) sets the pause after every typed character to 100 ms from that point on, for the rest of the output being typed; `a{Delay 100}bc{Delay 5}de` types `a` at the usual pace, `b` and `c` 100 ms apart and `d`, `e` 5 ms apart. It overrides `typing_delay_ms` of the slot and of the settings, see "Typing delay". The value is a whole number from 0 to 10000 ms (the same range as `typing_delay_ms`; 0 = no pause); anything else (negative, text, above 10000) refuses the whole macro with a message and nothing is typed. `{Delay 100}` and `{Delay100}` are the same, case is ignored. It is not a pause by itself and does not count towards the limit for `{Wait}`, and it ends with the macro run. Does not work for single characters from `{Clipboard}` text.
+
+`{Rollback}` (`{Rückgängig}`) deletes typed text with Backspaces. If the macro has already typed something before it (text, `{Clipboard}`, Enter/Tab/Space), it deletes exactly that; otherwise it deletes the last output of the previous macro or Morse letter, the same length that "Undo last output" uses. So a code with `{Clipboard}` followed later by another code with just `{Rollback}` removes exactly what the clipboard code typed, whether that was `abc` or a whole book. One run deletes once: afterwards there is nothing left to roll back until something new is typed. The length counts only what was really typed; after any other key (`{Ctrl+A}`, `{Delete}` …), a pasted file or a correction the length is unknown and `{Rollback}` deletes nothing. The Backspaces are sent without the typing delay, in pieces of 2000 characters; between the pieces Esc and the on/off switch are checked, so even a very long rollback can be stopped, and what was not yet deleted stays available for the next rollback or undo. `{Rollback}` is listed in the warning when you import a file that contains it.
+
+```json
+"--..-.--": "{Clipboard}",
+"--..-..-": "{Rollback}"
+```
+
 #### Scrolling
 
 `{Scroll Down}`, `{Scroll Up}` and `{Scroll Stop}` turn the mouse wheel. Spaces are optional and case is ignored (`{ScrollDown}`). German: `{Scroll Runter}`, `{Scroll Hoch}`, `{Scroll Stopp}`; `{Scroll End}` and `{Scroll Ende}` mean the same as Stop. There are no default Morse codes for them. Bind them like any macro, in your own alphabet or smiley set or on a function-key slot (Stream Deck):
@@ -199,7 +226,9 @@ All keys are optional. A missing key gets its default, an unknown key is ignored
   "block_input": false,
   "block_shortcut": "Ctrl+Shift+Pause",
   "cycle_shortcut": "Ctrl+Alt+F9",
-  "cycle_alphabets": ["latin", "german", "greek"]
+  "cycle_alphabets": ["latin", "german", "greek"],
+  "typing_delay_ms": 20,
+  "undo_shortcut": "Ctrl+Alt+F8"
 }
 ```
 
@@ -208,6 +237,7 @@ All keys are optional. A missing key gets its default, an unknown key is ignored
 | `dot_threshold_ms` | A press shorter than this is a dot, longer is a dash (ignored with a separate dash key) | 50 to 2000 |
 | `letter_gap_ms` | Silence that ends a letter | 100 to 5000 |
 | `word_gap_ms` | Silence that adds a space; `0` = never | 0 to 15000, and above `letter_gap_ms` unless 0 |
+| `typing_delay_ms` | Pause after each typed character; a slot's `typing_delay_ms` and a `{Delay N}` in a macro override it | 0 to 10000, default 20 |
 | `trigger` | The Morse key (the dot key with a separate dash key) | a key binding, see below |
 | `separate_dash_key` | On: `trigger` always gives a dot and `dash_trigger` a dash | `true` or `false` |
 | `dash_trigger` | The dash key | a key binding, different from `trigger` |
@@ -222,6 +252,7 @@ All keys are optional. A missing key gets its default, an unknown key is ignored
 | `block_shortcut` | Shortcut that switches Morse input and blocking on or off; `""` = none | a key binding, see below |
 | `cycle_shortcut` | Shortcut that switches to the next alphabet of `cycle_alphabets`; `""` = none; must differ from `block_shortcut` | a key binding |
 | `cycle_alphabets` | Your own pick of alphabet ids, switched in this order | a list of up to 64 different ids |
+| `undo_shortcut` | Shortcut that deletes the last typed output; `""` = none; must differ from `block_shortcut` and `cycle_shortcut` | a key binding |
 
 **Key bindings** are one key, or modifiers joined with `+` in front of one key: `F8`, `Ctrl+Shift+Pause`, `CapsLock+VK81`. Modifiers: `Ctrl`, `Alt`, `Shift`, `Win`, `CapsLock` (German names such as `Strg` and `Umschalt` work too). Keys: `ScrollLock`, `Pause`, `Insert`, `ControlRight`, `AltGr`, `F1` to `F12`, `Space`, `MouseLeft`, `MouseRight`, `MouseMiddle`, `Mouse4` to `Mouse32`, and any other key as its Windows virtual-key code `VK1` to `VK255`. The easy way: click a key button on the settings page, press the key. If you press nothing for 8 seconds, a shortcut is removed and a Morse key stays as it was.
 
@@ -298,14 +329,15 @@ Copy `python/mourse_decoder/locales/en.json` as a template and translate the val
   "schema_version": 1,
   "slots": [
     { "slot": 5, "trigger": "Ctrl+F5", "macro": "Mit freundlichen Grüßen{Enter}Anton",
-      "enabled": true, "swallow": true, "label": "Gruß" }
+      "enabled": true, "swallow": true, "label": "Gruß", "typing_delay_ms": 40 }
   ]
 }
 ```
 
+- `typing_delay_ms` is optional (0 to 10000): the pause after each character this slot types. It overrides the global `typing_delay_ms` from `settings.json`, and a `{Delay N}` in the macro overrides it from that point on. A slot without it uses the global value, and files from before this field load unchanged.
 - Only slots that differ from their default are written. Unknown fields are kept when the file is saved again. A file that cannot be read is moved to `function_keys.json.bak` and the defaults apply; a broken entry is reported, and a macro that does not parse is kept but switched off. A file with a newer `schema_version` is read but never overwritten.
 - F1 to F12 have no trigger until you set one. F13 to F24 exist as keys on some keyboards and in Stream Deck software, and default to the bare key. Windows has no F25 to F100, so those slots are virtual: their default triggers are long combinations of Ctrl, Alt, Shift and Win with F13 to F24 that nobody presses by accident, first all four modifiers (`Ctrl+Alt+Shift+Win+F13` is F25), then every three, then pairs. Set a Stream Deck button to send one of them. Every trigger can be changed.
-- Modifiers must match exactly: `F13` does not fire while Ctrl is held, `Ctrl+F13` does not fire under Ctrl+Alt. A trigger must differ from the Morse key, the dash key and the two shortcuts, and from every other active slot. Esc, the modifier keys and plain typing keys (letters, digits, Space, Enter, Backspace, Tab, punctuation, numpad without Ctrl, Alt or Win) are refused as triggers, because the hook would otherwise fire on normal typing; a right or middle click is refused only while it is swallowed and has no modifier.
+- Modifiers must match exactly: `F13` does not fire while Ctrl is held, `Ctrl+F13` does not fire under Ctrl+Alt. A trigger must differ from the Morse key, the dash key and the three shortcuts (on/off, switch, undo), and from every other active slot. Esc, the modifier keys and plain typing keys (letters, digits, Space, Enter, Backspace, Tab, punctuation, numpad without Ctrl, Alt or Win) are refused as triggers, because the hook would otherwise fire on normal typing; a right or middle click is refused only while it is swallowed and has no modifier.
 - `swallow` (default on) hides the trigger key from the focused app. A key without a slot is never touched. On Linux the hook can only watch, so triggers always reach the app.
 - Before the macro types, the program waits up to 3 seconds for Ctrl, Alt, Shift and Win to be let go; otherwise typed text would turn into shortcuts. One macro runs at a time, a second trigger meanwhile is ignored. Keys sent by the program itself never fire a slot, so a macro containing `{F13}` does not start itself.
 - Pressing Esc stops any running macro, also those of Morse letters, and ends scrolling. Esc itself still reaches the app.

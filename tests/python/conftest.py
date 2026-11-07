@@ -25,6 +25,8 @@ class FakeEngine:
         self.block_shortcut = ""
         self.cycle_shortcut = ""
         self.cycle_count = 0
+        self.undo_shortcut = ""
+        self.undo_count = 0
         self.function_keys: list[tuple[int, str, bool]] = []
         self.fired_slots: list[int] = []  # slot numbers ``poll_function_key`` hands out
         self.modifiers_released = True
@@ -91,15 +93,21 @@ class RecordingInjector:
         self.fail = False
         self.titles = [""]
         self.clipboard: str | None = None  # what ``clipboard_text`` returns
+        self.delays: list[int] = []  # every ``set_typing_delay`` call; the last one is the pause in force
+        self.typed_with: list[tuple[str, int | None]] = []  # each typed text and the pause in force for it
 
     def inject_text(self, text: str) -> None:
         if self.fail:
             raise RuntimeError("Injektion kaputt")
         self.calls.append(("text", text))
+        self.typed_with.append((text, self.delays[-1] if self.delays else None))
         self.buffer += text
 
     def type_text(self, text: str) -> None:
         self.inject_text(text)
+
+    def set_typing_delay(self, ms: int) -> None:
+        self.delays.append(ms)
 
     def pastes(self, text: str) -> bool:
         return False

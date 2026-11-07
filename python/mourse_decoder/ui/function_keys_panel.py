@@ -28,6 +28,7 @@ VALIDATE_DELAY_MS = 250  # check the editor once typing pauses
 TEST_DELAY_MS = 3000     # the test types into the window in front: time to click into the target
 EXAMPLE_MACRO = "{Loop 3 i}[i] {EndLoop}"  # types 0 1 2
 REPEAT_EXAMPLES = ("{Backspace 5}", "{Space 18}")  # key name plus count
+DELAY_EXAMPLE, WAIT_EXAMPLE, ROLLBACK_EXAMPLE = "{Delay 100}", "{Wait 500}", "{Rollback}"
 ESCAPED_BRACE = "\\{"  # how a literal "{" is written in a macro
 _COLUMNS = ("slot", "kind", "trigger", "text", "status")
 _WIDTHS = {"slot": 56, "kind": 72, "trigger": 200, "text": 120, "status": 84}
@@ -141,6 +142,7 @@ class FunctionKeysPanel(tk.Frame):
         help_text = " ".join((
             tr("functionkeys.macro.help", example=EXAMPLE_MACRO),
             tr("functionkeys.macro.repeat", first=REPEAT_EXAMPLES[0], second=REPEAT_EXAMPLES[1]),
+            tr("functionkeys.macro.delay", delay=DELAY_EXAMPLE, wait=WAIT_EXAMPLE, rollback=ROLLBACK_EXAMPLE),
             tr("functionkeys.macro.escape", brace=ESCAPED_BRACE),
         ))
         macro_help = label(body, help_text, size=9, muted=True, justify="left")
@@ -157,6 +159,14 @@ class FunctionKeysPanel(tk.Frame):
         )
         box.configure(width=300, height=40)
         box.pack()
+
+        delay_holder = card.add_row(tr("functionkeys.delay"), tr("functionkeys.delay.hint"))
+        label(delay_holder, tr("unit.ms"), muted=True).pack(side="right", padx=(8, 0))
+        self._delay_var = tk.StringVar()
+        self._delay_var.trace_add("write", lambda *_: self._changed())
+        box, _ = field_box(delay_holder, ttk.Entry, textvariable=self._delay_var, width=7)
+        box.configure(width=110, height=40)
+        box.pack(side="right")
 
         trigger_row = card.add_row(tr("functionkeys.trigger"), tr("functionkeys.trigger.hint"))
         Button(trigger_row, tr("functionkeys.trigger.default"), self._default_trigger, variant="plain").pack(
@@ -260,6 +270,7 @@ class FunctionKeysPanel(tk.Frame):
             self._number = number
             self._title.set(tr("functionkeys.editor", name=slot.name, kind=tr(f"functionkeys.type.{view.row(slot)[1]}")))
             self._label_var.set(slot.label)
+            self._delay_var.set("" if slot.typing_delay_ms is None else str(slot.typing_delay_ms))
             self._trigger.set_shortcut(slot.trigger)
             self._enabled.set(slot.enabled)
             self._swallow.set(slot.swallow)
@@ -272,10 +283,22 @@ class FunctionKeysPanel(tk.Frame):
             self._loading = False
         self._validate()
 
+    def _delay_value(self) -> int | str | None:
+        """The delay field: None if empty (use the global setting), the number, or the raw text if it is no
+        whole number, which the slot check then reports."""
+        text = self._delay_var.get().strip()
+        if not text:
+            return None
+        try:
+            return int(text)
+        except ValueError:
+            return text
+
     def _editor_slot(self) -> Slot:
         return self._keys.slot(self._number).replace(
             label=self._label_var.get(), trigger=self._trigger.shortcut, enabled=self._enabled.get(),
             swallow=self._swallow.get(), macro=self._macro.get("1.0", "end-1c"),
+            typing_delay_ms=self._delay_value(),
         )
 
     def _dirty(self) -> bool:

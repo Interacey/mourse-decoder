@@ -16,16 +16,36 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable
-from typing import Protocol
+from typing import NamedTuple, Protocol
 
 from . import clipboard, desktop, macros
 from .decoders import Decoder, Emission, create_decoder
 from .dictionary import DictionaryManager
 from .function_keys import FunctionKeys, Slot
 from .scroller import DOWN, UP, Scroller
-from .settings import Settings
+from .settings import Settings, effective_typing_delay
 
 log = logging.getLogger(__name__)
+
+# keys in a macro that put exactly one character into the text; any other key ({Ctrl+A}, {Delete}, ...)
+# changes the text in ways we cannot follow, so "undo last output" forgets what came before it
+_ONE_CHARACTER_KEYS = frozenset({"enter", "return", "eingabe", "tab", "space", "leertaste"})
+
+
+def typed_length(text: str) -> int:
+    """How many Backspaces take ``text`` back: a line break is one Return key however it is written."""
+    return len(text.replace("\r\n", "\n").replace("\r", "\n"))
+
+
+class UndoResult(NamedTuple):
+    """Outcome of ``undo_last_output``: ``deleted`` characters, or why nothing was deleted.
+
+    ``reason`` is "" after a deletion, else "nothing" (no output to undo), "busy" (a macro is typing),
+    "off" (Morse input is off or the program is stopping) or "modifiers" (Ctrl/Alt/Shift/Win stayed down).
+    """
+
+    deleted: int
+    reason: str = ""
 
 
 def _crlf(text: str) -> str:
@@ -43,6 +63,8 @@ class EngineLike(Protocol):
     block_shortcut: str
     cycle_shortcut: str  # "" = none
     cycle_count: int  # how often the cycle shortcut was pressed, wraps at 2**32
+    undo_shortcut: str  # "" = none
+    undo_count: int  # how often the undo shortcut was pressed, wraps at 2**32
 
     def start(self, callback: Callable[[str, str], None], use_hook: bool = True) -> None: ...
     def stop(self) -> None: ...
@@ -63,6 +85,8 @@ class InjectorLike(Protocol):
     def inject_text(self, text: str) -> None: ...
     def type_text(self, text: str) -> None:
         """Always typed key by key, never pasted: for what is meant to go in like keyboard input."""
+    def set_typing_delay(self, ms: int) -> None:
+        """Optional: the pause after each typed character from now on, in ms."""
     def pastes(self, text: str) -> bool:
         """True if ``inject_text`` would paste ``text`` instead of typing it."""
     def inject_backspaces(self, count: int) -> None: ...
@@ -100,6 +124,7 @@ class NativeInjector:
     def __init__(self, native_module, clipboard_module=clipboard) -> None:
         self._native = native_module
         self._clipboard = clipboard_module
+        self._char_delay_ms: int | None = None  # None = the native default
 
     def pastes(self, text: str) -> bool:
         # shortcut: Windows only, other systems type everything
@@ -112,10 +137,20 @@ class NativeInjector:
     def inject_text(self, text: str) -> None:
         if self.pastes(text) and self.try_paste(text):
             return
-        self._native.inject_text(text)
+        self._type_native(text)
 
     def type_text(self, text: str) -> None:
-        self._native.inject_text(text)
+        self._type_native(text)
+
+    def set_typing_delay(self, ms: int) -> None:
+        self._char_delay_ms = ms
+
+    def _type_native(self, text: str) -> None:
+        if self._char_delay_ms is None:
+            self._native.inject_text(text)
+        else:
+            self._native.inject_text(text, self._char_delay_ms)
+
     def _with_saved_clipboard(self, fill, settle_s: float) -> bool:
         """Fill the clipboard, press Ctrl+V and put the old content back. False if it couldn't be saved."""
         try:
@@ -167,6 +202,7 @@ class MorseController:
     WINDOW_TIMEOUT_S = 10.0  # for {WaitWindow …}; slow apps like a cold Firefox start need a few seconds
     POLL_S = 0.05  # how often waits look at the window title and the on/off switch
     TYPE_CHUNK = 100  # characters typed between two looks at the on/off switch (about 2 s)
+    ERASE_CHUNK = 2000  # Backspaces sent between two looks at the on/off switch and Esc
     MODIFIER_TIMEOUT_S = 3.0  # a function key waits this long for Ctrl/Alt/Shift/Win to be let go
 
     def __init__(
@@ -190,6 +226,7 @@ class MorseController:
         self._running = False
         self._stopping = False  # set by stop() so a running macro ends before the engine is joined
         self._cycle_seen = 0
+        self._undo_seen = 0
         self._settings = settings
         self._function_keys = FunctionKeys()
         # held while a macro types, whether a Morse letter or a function key started it
@@ -199,6 +236,11 @@ class MorseController:
         self._esc_lock = threading.Lock()
         self._esc_generation = 0
         self._macro_esc_mark = 0
+        # characters the last output left in the text, for ``undo_last_output``. Written and read only
+        # while ``_macro_lock`` is held; ``_run_*`` collect the numbers of the output being typed
+        self._last_output = 0
+        self._run_typed = 0
+        self._run_touched = False
         # lazy wheel: injectors without scroll() work as long as nothing scrolls
         self._scroller = scroller_factory(
             wheel=lambda notches: self._injector.scroll(notches),
@@ -235,6 +277,7 @@ class MorseController:
             self._apply_keys(s)
             self._apply_blocking(s)
             self._cycle_seen = int(self._engine.cycle_count)  # the counter lives as long as the process
+            self._undo_seen = int(self._engine.undo_count)
             self._engine.start(self._on_engine_event, use_hook=self._use_hook)
             self._running = True
             try:
@@ -293,6 +336,7 @@ class MorseController:
     def _apply_blocking(self, s: Settings) -> None:
         self._engine.block_shortcut = s.block_shortcut
         self._engine.cycle_shortcut = s.cycle_shortcut
+        self._engine.undo_shortcut = s.undo_shortcut
         self._engine.block_input = s.block_input
         # the engine only blocks while Morse input is on, so a paused app never eats the key
         self._engine.active = s.enabled
@@ -319,6 +363,76 @@ class MorseController:
             count = int(self._engine.cycle_count)
             presses, self._cycle_seen = (count - self._cycle_seen) % 2**32, count
             return presses
+
+    def poll_undo(self) -> int:
+        """How often the undo shortcut was pressed since the last call (0 while stopped)."""
+        with self._lock:
+            if not self._running:
+                return 0
+            count = int(self._engine.undo_count)
+            presses, self._undo_seen = (count - self._undo_seen) % 2**32, count
+            return presses
+
+    def undo_last_output(self) -> UndoResult:
+        """Delete the last output with as many Backspaces as it had characters, once.
+
+        The length is forgotten before anything is sent, so a second call has nothing to delete until
+        a new output arrives (and a failing injector cannot lead to deleting twice). Nothing happens
+        while a macro types or Morse input is off. Waits up to ``MODIFIER_TIMEOUT_S`` for held
+        Ctrl/Alt/Shift/Win keys, because Ctrl+Backspace would delete words.
+        """
+        with self._lock:
+            if not (self._settings.enabled and self._engine.active):
+                return UndoResult(0, "off")
+        if not self._macro_lock.acquire(blocking=False):
+            return UndoResult(0, "busy")
+        try:
+            if not self._last_output:
+                return UndoResult(0, "nothing")
+            self._begin_macro()
+            try:
+                self._wait_for_modifiers_released()
+            except macros.MacroStopped:
+                return UndoResult(0, "off")
+            except macros.MacroError:
+                return UndoResult(0, "modifiers")
+            count = self._last_output
+            self._run_typed, self._run_touched, self._last_output = count, True, 0
+            try:
+                self._erase()
+            except macros.MacroStopped:
+                return UndoResult(count - self._run_typed, "off")
+            finally:
+                self._last_output = self._run_typed  # 0 unless Esc stopped it half way: the rest stays undoable
+            return UndoResult(count)
+        finally:
+            self._macro_lock.release()
+
+    def _erase(self) -> None:
+        """Send Backspaces for ``_run_typed`` characters, in pieces of ``ERASE_CHUNK``, counting it down.
+
+        Plain fast Backspaces, no typing delay. Selecting with Shift+Left needs as many key events and
+        behaves differently from app to app, so it is not used. Between pieces the on/off switch and Esc
+        are looked at; the characters not yet deleted stay in ``_run_typed`` (all forgotten if the injector fails).
+        """
+        while self._run_typed:
+            self._stop_if_switched_off()
+            piece = min(self._run_typed, self.ERASE_CHUNK)
+            try:
+                self._injector.inject_backspaces(piece)
+            except Exception:
+                self._run_typed = 0  # how much of the piece went out is unknown: never delete again
+                raise
+            self._run_typed -= piece
+            for _ in range(min(piece, len(self.history))):
+                self.history.pop()
+
+    def _rollback(self) -> None:
+        """``{Rollback}``: delete what this macro typed so far; if it typed or changed nothing yet, the last output."""
+        if not self._run_touched:
+            self._run_typed, self._last_output = self._last_output, 0
+            self._run_touched = True
+        self._erase()
 
     @property
     def function_keys(self) -> FunctionKeys:
@@ -401,7 +515,7 @@ class MorseController:
         try:
             self._begin_macro()
             self._wait_for_modifiers_released()
-            self._emit_steps(Emission(slot.macro))
+            self._emit_steps(Emission(slot.macro), slot.typing_delay_ms)
         except macros.MacroStopped as exc:
             log.info("%s: %s", slot.name, exc)
         except Exception as exc:  # noqa: BLE001
@@ -498,25 +612,40 @@ class MorseController:
         except Exception:  # noqa: BLE001 - must not hide the error that got us here
             log.exception("Decoder konnte nicht zurückgesetzt werden")
 
-    def _emit_steps(self, emission: Emission) -> None:
+    def _emit_steps(self, emission: Emission, typing_delay_ms: int | None = None) -> None:
+        """Type one output. ``typing_delay_ms`` is the pause after each character of a slot that has its own,
+        None = the global setting. A {Delay N} step replaces it for the rest of this output only, because
+        every output starts by setting the pause again.
+
+        What the output leaves in the text is counted for ``undo_last_output``: typed characters, and the
+        keys Enter, Tab and Space as one each. Any other key, a pasted file or an erase makes the length
+        unknown, so it counts as 0 from there on. Scrolling and waiting change nothing and leave the
+        length of the previous output alone. Text that Esc cut short is not counted.
+        """
         # typing takes a few ms, so do it outside the lock to not block apply_settings
         steps = macros.parse(emission.text, self._injector.check_shortcut)  # first, so a broken macro changes nothing
         self._check_paths(steps)
-        if emission.erase:
-            self._injector.inject_backspaces(emission.erase)
-            for _ in range(min(emission.erase, len(self.history))):
-                self.history.pop()
+        self._set_typing_delay(effective_typing_delay(self._settings.typing_delay_ms, typing_delay_ms))
+        self._run_typed, self._run_touched = 0, False
         try:
+            if emission.erase:
+                self._run_touched = True
+                self._injector.inject_backspaces(emission.erase)
+                for _ in range(min(emission.erase, len(self.history))):
+                    self.history.pop()
             for kind, value in steps:
                 self._stop_if_switched_off()
                 if kind == "text":
                     self._type(value, self._injector.inject_text)
-                    self._stop_if_switched_off()  # Esc during the text: the injector stopped early
                     self.history.extend(value)
                 elif kind == "keys":
-                    self._injector.press_shortcut(value)
+                    self._press(value)
                 elif kind == "wait":
                     self._sleep(value)
+                elif kind == "delay":
+                    self._set_typing_delay(value)
+                elif kind == "rollback":
+                    self._rollback()
                 elif kind == "window":
                     self._wait_for_window(value)
                 elif kind == "clipboard":
@@ -536,12 +665,36 @@ class MorseController:
                     else:
                         self._scroller.stop()
                 else:
+                    self._run_touched, self._run_typed = True, 0
                     self._injector.paste_files([macros.resolve_path(p) for p in value])
         finally:
+            if self._run_touched:
+                self._last_output = self._run_typed
             if len(emission.text) > 1:
                 # clicks made while the macro ran are queued in the engine; drop them so
                 # they don't come out as stray letters afterwards
                 self._engine.reset()
+
+    def _set_typing_delay(self, ms: int) -> None:
+        # optional on the injector, like try_paste: fakes and the dry-run printer have no delay
+        setter = getattr(self._injector, "set_typing_delay", None)
+        if setter is not None:
+            setter(ms)
+
+    def _press(self, combo: str) -> None:
+        self._run_touched = True
+        one_character = combo.strip().lower() in _ONE_CHARACTER_KEYS
+        if not one_character:
+            self._run_typed = 0
+        self._injector.press_shortcut(combo)
+        if one_character:
+            self._run_typed += 1
+
+    def _type_piece(self, piece: str, inject: Callable[[str], None]) -> None:
+        self._run_touched = True  # even a piece that Esc cuts short has changed the text
+        inject(piece)
+        self._stop_if_switched_off()  # Esc during the piece: the injector stopped early, so it is not counted
+        self._run_typed += typed_length(piece)
 
     def _type(self, text: str, inject: Callable[[str], None], always: bool = False) -> None:
         """Type ``text``; long text in pieces, so switching Morse input off stops it within a moment.
@@ -549,13 +702,16 @@ class MorseController:
         Text that gets pasted goes in whole, pasting is over in an instant.
         """
         if len(text) <= self.TYPE_CHUNK:
-            inject(text)
+            self._type_piece(text, inject)
             return
         if not always and self._injector.pastes(text):
             try_paste = getattr(self._injector, "try_paste", None)
+            self._run_touched = True
             if try_paste is None or try_paste(text):
                 if try_paste is None:
                     inject(text)
+                self._stop_if_switched_off()
+                self._run_typed += typed_length(text)
                 return
             # clipboard busy: type it in pieces below, so the off switch and Esc are looked at
         start = 0
@@ -564,7 +720,7 @@ class MorseController:
             if text[end - 1 : end] == "\r" and text[end : end + 1] == "\n":
                 end += 1  # a split CRLF would be typed as two line breaks
             self._stop_if_switched_off()
-            inject(text[start:end])
+            self._type_piece(text[start:end], inject)
             start = end
 
     @staticmethod
