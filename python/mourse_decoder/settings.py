@@ -159,6 +159,28 @@ MAX_CYCLE_ALPHABETS = 64
 DOT_THRESHOLD_RANGE = (50, 2000)
 LETTER_GAP_RANGE = (100, 5000)
 WORD_GAP_RANGE = (0, 15000)
+# pause after each typed character, in ms. Keep in sync with CHAR_DELAY_RANGE_MS and DEFAULT_CHAR_DELAY_MS in
+# src/injector.rs: below 15 ms Windows Notepad scrambled the text, so 20 is the default
+DEFAULT_TYPING_DELAY_MS = 20
+TYPING_DELAY_RANGE = (0, 10000)
+
+
+def effective_typing_delay(global_ms: int, macro_ms: int | None) -> int:
+    """The pause a macro starts with: the slot's own value if it has one, else the global setting.
+
+    A {Delay N} inside the macro text still wins over both from that point on.
+    """
+    return global_ms if macro_ms is None else macro_ms
+
+
+def typing_delay_error(value: object) -> str | None:
+    """German error text if ``value`` is no whole number of ms in ``TYPING_DELAY_RANGE``, else None."""
+    low, high = TYPING_DELAY_RANGE
+    if not isinstance(value, int) or isinstance(value, bool):
+        return "Die Tastenanschlag-Verzögerung muss eine ganze Zahl sein."
+    if not low <= value <= high:
+        return f"Die Tastenanschlag-Verzögerung muss zwischen {low} und {high} ms liegen."
+    return None
 
 
 @dataclass(frozen=True)
@@ -166,6 +188,7 @@ class Settings:
     dot_threshold_ms: int = 200  # shorter press is a dot
     letter_gap_ms: int = 600     # silence that ends a letter
     word_gap_ms: int = 1400      # ITU ratio 7:3 -> 600 * 7/3, 0 = no spaces
+    typing_delay_ms: int = DEFAULT_TYPING_DELAY_MS  # pause after each typed character; a macro may set its own
     trigger: str = "ScrollLock"  # key or combination; with a separate dash key it gives the dots
     separate_dash_key: bool = False  # off: press duration decides, on: dash_trigger gives dashes
     dash_trigger: str = "Pause"
@@ -180,6 +203,7 @@ class Settings:
     block_shortcut: str = "Ctrl+Shift+Pause"  # toggles block_input from anywhere, "" = none
     cycle_shortcut: str = ""     # switches to the next alphabet of cycle_alphabets, "" = none
     cycle_alphabets: tuple[str, ...] = ()  # the user's own pick of alphabet ids to switch through
+    undo_shortcut: str = ""      # deletes the last typed output, "" = none
 
     def validate(self) -> list[str]:
         """List of error messages, empty if valid."""
@@ -195,6 +219,9 @@ class Settings:
         check_range("dot_threshold_ms", "Punkt/Strich-Schwelle", self.dot_threshold_ms, DOT_THRESHOLD_RANGE)
         check_range("letter_gap_ms", "Buchstabenpause", self.letter_gap_ms, LETTER_GAP_RANGE)
         check_range("word_gap_ms", "Wortpause", self.word_gap_ms, WORD_GAP_RANGE)
+
+        if (error := typing_delay_error(self.typing_delay_ms)) is not None:
+            errors.append(error)
 
         if not errors:
             if self.word_gap_ms and self.word_gap_ms <= self.letter_gap_ms:
@@ -216,11 +243,15 @@ class Settings:
             errors.append("'notifications' muss true oder false sein.")
         if not isinstance(self.block_input, bool):
             errors.append("'block_input' muss true oder false sein.")
-        for spec in (self.block_shortcut, self.cycle_shortcut):
+        for spec in (self.block_shortcut, self.cycle_shortcut, self.undo_shortcut):
             if not is_valid_shortcut(spec):
                 errors.append(f"Ungültiges Tastenkürzel '{spec}'.")
         if self.block_shortcut and self.cycle_shortcut and same_binding(self.block_shortcut, self.cycle_shortcut):
             errors.append("Die beiden Kürzel (Ein/Aus und Umschalten) müssen verschieden sein.")
+        if self.undo_shortcut and any(
+            same_binding(self.undo_shortcut, other) for other in (self.block_shortcut, self.cycle_shortcut) if other
+        ):
+            errors.append("Das Rückgängig-Kürzel muss sich von den anderen Kürzeln unterscheiden.")
         errors.extend(self._shortcut_clash_errors())
         errors.extend(self._cycle_errors())
         return errors
@@ -257,7 +288,11 @@ class Settings:
         if self.separate_dash_key:
             morse.append(("Strich-Taste", self.dash_trigger))
         errors = []
-        shortcuts = (("Ein/Aus-Kürzel", self.block_shortcut), ("Umschalt-Kürzel", self.cycle_shortcut))
+        shortcuts = (
+            ("Ein/Aus-Kürzel", self.block_shortcut),
+            ("Umschalt-Kürzel", self.cycle_shortcut),
+            ("Rückgängig-Kürzel", self.undo_shortcut),
+        )
         for shortcut_label, shortcut in shortcuts:
             if not shortcut or not is_valid_binding(shortcut):
                 continue
@@ -279,7 +314,11 @@ class Settings:
             )
             return "" if clash else shortcut
 
-        return self.replace(block_shortcut=keep(self.block_shortcut), cycle_shortcut=keep(self.cycle_shortcut))
+        return self.replace(
+            block_shortcut=keep(self.block_shortcut),
+            cycle_shortcut=keep(self.cycle_shortcut),
+            undo_shortcut=keep(self.undo_shortcut),
+        )
 
     @property
     def engine_dash_trigger(self) -> str:

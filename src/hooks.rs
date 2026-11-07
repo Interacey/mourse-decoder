@@ -196,6 +196,10 @@ static SHORTCUT: Mutex<Option<KeyBinding>> = Mutex::new(None);
 static CYCLE_SHORTCUT: Mutex<Option<KeyBinding>> = Mutex::new(None);
 static CYCLE_DOWN: AtomicBool = AtomicBool::new(false);
 static CYCLE_COUNT: AtomicU32 = AtomicU32::new(0);
+/// The shortcut that undoes the last typed output; same scheme as the cycle shortcut.
+static UNDO_SHORTCUT: Mutex<Option<KeyBinding>> = Mutex::new(None);
+static UNDO_DOWN: AtomicBool = AtomicBool::new(false);
+static UNDO_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// `Some(true)` on the first press of a shortcut's key while its modifiers are held,
 /// `Some(false)` on its key repeats (`down` remembers the press, so they must not count
@@ -547,7 +551,11 @@ fn route_input(event: rdev::Event) -> Option<rdev::Event> {
     if cycle == Some(true) {
         CYCLE_COUNT.fetch_add(1, Ordering::SeqCst);
     }
-    let shortcut_used = toggle.is_some() || cycle.is_some();
+    let undo = shortcut_pressed(&UNDO_SHORTCUT, &UNDO_DOWN, &event.event_type, held);
+    if undo == Some(true) {
+        UNDO_COUNT.fetch_add(1, Ordering::SeqCst);
+    }
+    let shortcut_used = toggle.is_some() || cycle.is_some() || undo.is_some();
 
     // function-key slots and the Esc abort. Own typing (`suppress_for`) can't fire a slot, so
     // a macro with `{F13}` doesn't start itself; releases are handled even then
@@ -626,9 +634,20 @@ pub fn cycle_count() -> u32 {
     CYCLE_COUNT.load(Ordering::SeqCst)
 }
 
+/// Sets the shortcut that undoes the last typed output; an empty string removes it.
+pub fn set_undo_shortcut(text: &str) -> Result<(), String> {
+    *lock_or_recover(&UNDO_SHORTCUT) = parse_shortcut(text)?;
+    Ok(())
+}
+
+/// How many times the undo shortcut was pressed since the process started (wraps around).
+pub fn undo_count() -> u32 {
+    UNDO_COUNT.load(Ordering::SeqCst)
+}
+
 /// Replaces the function-key slots with `(slot, binding, swallow)` entries. Fails without
 /// changing anything if an entry is invalid, duplicated or taken by the Morse keys, the
-/// on/off shortcut or the cycle shortcut (those are only known while an engine runs).
+/// on/off shortcut, the cycle shortcut or the undo shortcut (those are only known while an engine runs).
 pub fn set_function_keys(entries: &[(u16, String, bool)]) -> Result<(), String> {
     let mut reserved: Vec<Reserved> = Vec::new();
     if let Some(route) = lock_or_recover(&ROUTE).as_ref() {
@@ -646,6 +665,9 @@ pub fn set_function_keys(entries: &[(u16, String, bool)]) -> Result<(), String> 
     }
     if let Some(binding) = *lock_or_recover(&CYCLE_SHORTCUT) {
         reserved.push(("dem Umschalt-Kürzel", binding));
+    }
+    if let Some(binding) = *lock_or_recover(&UNDO_SHORTCUT) {
+        reserved.push(("dem Rückgängig-Kürzel", binding));
     }
     let parsed = function_keys::parse_entries(entries, &reserved)?;
     function_keys::with_table(|table| table.set(parsed));
@@ -1095,6 +1117,8 @@ mod tests {
         *lock_or_recover(&SHORTCUT) = None;
         *lock_or_recover(&CYCLE_SHORTCUT) = None;
         CYCLE_DOWN.store(false, Ordering::SeqCst);
+        *lock_or_recover(&UNDO_SHORTCUT) = None;
+        UNDO_DOWN.store(false, Ordering::SeqCst);
         *lock_or_recover(&SUPPRESS_UNTIL) = None;
         function_keys::reset();
         *lock_or_recover(&CAPTURE) = Capture {
@@ -1188,6 +1212,35 @@ mod tests {
         handle_event(press(Key::F9));
         assert_eq!(cycle_count(), start + 2, "removed shortcut does nothing");
         assert!(set_cycle_shortcut("Ctrl+Foo").is_err());
+        reset_block_state();
+    }
+
+    #[test]
+    fn undo_shortcut_counts_each_press_once_and_leaves_morse_input_alone() {
+        let _serial = lock_or_recover(&GLOBAL_STATE);
+        reset_block_state();
+        let start = undo_count();
+        let cycle_start = cycle_count();
+        set_undo_shortcut("Ctrl+Alt+F8").unwrap();
+        handle_event(press(Key::F8)); // no modifiers held
+        assert_eq!(undo_count(), start);
+        handle_event(release(Key::F8));
+        handle_event(press(Key::ControlLeft));
+        handle_event(press(Key::Alt));
+        for _ in 0..4 {
+            handle_event(press(Key::F8)); // key repeat while held
+        }
+        assert_eq!(undo_count(), start + 1, "four repeats are one press");
+        handle_event(release(Key::F8));
+        handle_event(press(Key::F8));
+        assert_eq!(undo_count(), start + 2, "a new press counts again");
+        assert_eq!(cycle_count(), cycle_start, "the cycle counter stays");
+        assert!(active(), "the undo shortcut never switches Morse input");
+        set_undo_shortcut("").unwrap();
+        handle_event(release(Key::F8));
+        handle_event(press(Key::F8));
+        assert_eq!(undo_count(), start + 2, "removed shortcut does nothing");
+        assert!(set_undo_shortcut("Ctrl+Foo").is_err());
         reset_block_state();
     }
 
@@ -1405,6 +1458,7 @@ mod tests {
         let _rx = route_keys("F11", Some("Ctrl+F12"));
         set_shortcut("Ctrl+Shift+Pause").unwrap();
         set_cycle_shortcut("Alt+F9").unwrap();
+        set_undo_shortcut("Alt+F8").unwrap();
         let try_slot =
             |binding: &str| set_function_keys(&[(1, binding.to_string(), true)]).unwrap_err();
         assert!(try_slot("F11").contains("Morse-Taste"));
@@ -1412,6 +1466,7 @@ mod tests {
         assert!(try_slot("Ctrl+Alt+F12").contains("Strich-Taste"));
         assert!(try_slot("Ctrl+Shift+Alt+Pause").contains("Ein/Aus"));
         assert!(try_slot("Alt+F9").contains("Umschalt"));
+        assert!(try_slot("Alt+F8").contains("Rückgängig"));
         assert!(
             set_function_keys(&[(1, "F12".to_string(), true)]).is_ok(),
             "needs fewer modifiers than the dash key"

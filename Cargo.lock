@@ -343,7 +343,7 @@ dependencies = [
 
 [[package]]
 name = "morse_core"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "enigo",
  "pyo3",

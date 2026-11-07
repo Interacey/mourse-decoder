@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import queue
+import threading
 import tkinter as tk
 from collections.abc import Callable
 from tkinter import messagebox
@@ -88,7 +89,8 @@ class TrayApp:
                 log.exception("Fehler in UI-Aufgabe")
         try:
             # one failing poll must not stop the others, and the loop must be scheduled again in any case
-            for poll in (self._poll_block, self._poll_cycle, self._poll_function_keys, self._poll_hook):
+            polls = (self._poll_block, self._poll_cycle, self._poll_undo, self._poll_function_keys, self._poll_hook)
+            for poll in polls:
                 try:
                     poll()
                 except Exception:  # noqa: BLE001
@@ -148,6 +150,27 @@ class TrayApp:
         # always shown, even with "show notices" off: it is the only sign that the shortcut worked
         self._toast.show(tr("cycle.toast", name=infos[alphabet], pos=position, total=total))
 
+    def _poll_undo(self) -> None:
+        """The undo shortcut deletes the last output; any number of presses since the last tick is one undo."""
+        if self._controller.poll_undo():
+            self._undo()
+
+    def _undo(self) -> None:
+        """Undo on a thread of its own: it may wait for held modifier keys, which must not freeze the window."""
+        threading.Thread(target=self._run_undo, name="undo", daemon=True).start()
+
+    def _run_undo(self) -> None:
+        try:
+            result = self._controller.undo_last_output()
+        except Exception as exc:  # noqa: BLE001 - e.g. the injector failed
+            log.exception("Rückgängig fehlgeschlagen")
+            message = f"{tr('tray.error')}: {exc}"
+            self.call_in_ui(lambda: self._toast.show(message, False))
+            return
+        text = tr("undo.done", n=result.deleted) if result.deleted else tr(f"undo.{result.reason}")
+        # always shown, even with "show notices" off: the shortcut works from any app and this is the only reply
+        self.call_in_ui(lambda: self._toast.show(text, bool(result.deleted)))
+
     def on_symbol(self, symbol: str) -> None:
         self.call_in_ui(lambda: self._window.add_symbol(symbol))
 
@@ -196,6 +219,7 @@ class TrayApp:
                 checked=lambda _item: self._controller.settings.enabled,
             ),
             pystray.MenuItem(tr("tray.alphabet"), pystray.Menu(*alphabets)),
+            pystray.MenuItem(tr("tray.undo"), lambda _i, _it: self.call_in_ui(self._undo)),
             pystray.MenuItem(tr("tray.settings"), lambda _i, _it: self.call_in_ui(self._open_settings)),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(tr("tray.quit"), lambda _i, _it: self.call_in_ui(self.quit)),

@@ -302,3 +302,53 @@ def test_notice_lists_load_warnings(root, fake_engine, injector, tmp_path):
         assert "schema_version 9" in panel._notice_text.cget("text")
     finally:
         panel.destroy()
+
+
+
+
+def test_the_delay_field_is_empty_for_a_slot_without_its_own_value(page):
+    assert page._delay_var.get() == ""
+    assert page._editor_slot().typing_delay_ms is None
+
+
+def test_saving_a_delay_writes_it_and_reloads_it(page):
+    select(page, 57)
+    type_macro(page, "text")
+    page._delay_var.set("80")
+    page._validate()
+    assert page._dirty()
+    page._save()
+    assert page.controller.function_keys.slot(57).typing_delay_ms == 80
+    assert saved_slots(page)[57]["typing_delay_ms"] == 80
+    select(page, 13)
+    select(page, 57)
+    assert page._delay_var.get() == "80"
+
+
+def test_emptying_the_field_goes_back_to_the_global_value(page):
+    select(page, 57)
+    type_macro(page, "text")
+    page._delay_var.set("80")
+    page._save()
+    page._delay_var.set("  ")
+    page._save()
+    assert page.controller.function_keys.slot(57).typing_delay_ms is None
+    assert "typing_delay_ms" not in saved_slots(page)[57]
+
+
+@pytest.mark.parametrize(("text", "message"), [("abc", "ganze Zahl"), ("-1", "zwischen 0 und 10000"), ("10001", "zwischen 0 und 10000")])
+def test_a_bad_delay_is_shown_and_cannot_be_saved(page, text, message):
+    select(page, 57)
+    type_macro(page, "text")
+    page._delay_var.set(text)
+    page._validate()
+    assert message in page._error.cget("text")
+    page._save()
+    assert page.controller.function_keys.slot(57).typing_delay_ms is None
+    assert 57 not in saved_slots(page)
+
+
+def test_changing_only_the_delay_makes_the_slot_dirty(page):
+    assert not page._dirty()
+    page._delay_var.set("60")
+    assert page._dirty()

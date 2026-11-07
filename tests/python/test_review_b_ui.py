@@ -39,6 +39,7 @@ def make_tray(hook_error=None):
     tray._controller = SimpleNamespace(
         poll_active_toggle=Raising("block", log),
         poll_cycle=Raising("cycle", log),
+        poll_undo=Raising("undo", log),
         poll_function_keys=Raising("keys", log),
     )
     tray._toast = SimpleNamespace(shown=[], show=lambda *a: tray._toast.shown.append(a))
@@ -52,7 +53,7 @@ def test_a_failing_poll_does_not_stop_the_loop():
     tray, log = make_tray()
     tray._ui_queue.put(lambda: 1 / 0)
     tray._drain_queue()
-    assert log == ["block", "cycle", "keys"]  # every poll ran although each raised
+    assert log == ["block", "cycle", "undo", "keys"]  # every poll ran although each raised
     assert len(tray._root.after_calls) == 1
 
 
@@ -114,3 +115,62 @@ def test_rebuild_uses_the_public_busy_property():
     from mourse_decoder.ui.update_panel import UpdatePanel
 
     assert isinstance(UpdatePanel.busy, property)
+
+
+
+
+def undo_tray(poll_undo=lambda: 0, undo_last_output=None):
+    tray, _ = make_tray()
+    tray._controller = SimpleNamespace(poll_undo=poll_undo, undo_last_output=undo_last_output)
+    return tray
+
+
+def test_pressing_the_undo_shortcut_starts_one_undo(monkeypatch):
+    tray = undo_tray(poll_undo=lambda: 3)
+    started = []
+    monkeypatch.setattr(tray, "_undo", lambda: started.append(1), raising=False)
+    tray._poll_undo()
+    assert started == [1], "three presses in one tick are one undo"
+    tray._controller.poll_undo = lambda: 0
+    tray._poll_undo()
+    assert started == [1]
+
+
+def run_undo(result):
+    from mourse_decoder.controller import UndoResult
+    from mourse_decoder.i18n import set_language
+
+    set_language("en")
+    tray = undo_tray(undo_last_output=lambda: UndoResult(*result))
+    tray._run_undo()
+    while not tray._ui_queue.empty():
+        tray._ui_queue.get()()
+    return tray._toast.shown
+
+
+@pytest.mark.parametrize(
+    ("result", "shown"),
+    [
+        ((4,), [("4 characters deleted", True)]),
+        ((0, "nothing"), [("Nothing to undo.", False)]),
+        ((0, "busy"), [("A macro is still typing.", False)]),
+        ((0, "off"), [("Morse input is off.", False)]),
+        ((0, "modifiers"), [("Ctrl, Alt, Shift or Win are still held.", False)]),
+    ],
+)
+def test_the_undo_result_is_shown_as_a_message(result, shown):
+    assert run_undo(result) == shown
+
+
+def test_a_failing_undo_shows_the_error():
+    from mourse_decoder.i18n import set_language
+
+    set_language("en")
+
+    def boom():
+        raise RuntimeError("kaputt")
+
+    tray = undo_tray(undo_last_output=boom)
+    tray._run_undo()
+    tray._ui_queue.get()()
+    assert "kaputt" in tray._toast.shown[0][0] and tray._toast.shown[0][1] is False

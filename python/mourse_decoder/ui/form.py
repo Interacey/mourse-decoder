@@ -8,6 +8,7 @@ NUMERIC_FIELDS: dict[str, str] = {
     "dot_threshold_ms": "Punkt/Strich-Schwelle",
     "letter_gap_ms": "Buchstabenpause",
     "word_gap_ms": "Wortpause",
+    "typing_delay_ms": "Tastenanschlag-Verzögerung",
 }
 
 
