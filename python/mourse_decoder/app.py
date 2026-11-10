@@ -120,6 +120,8 @@ def _start_function_keys(controller: MorseController, directory, injector) -> li
 class _PrintInjector:
     """For --dry-run: show instead of typing."""
 
+    dry_run = True  # the controller does not read the clipboard for {Scrape} and types a placeholder
+
     def inject_text(self, text: str) -> None:
         print(f"[tippe {text!r}]", flush=True)
 

@@ -197,9 +197,11 @@ def _parse_scrape(spec: str | None) -> Scrape:
     template: list[str | int] = []
     for m in _SCRAPE_TEMPLATE_TOKEN.finditer(template_raw):
         if m[1]:
-            if not 1 <= int(m[1]) <= len(pairs):
-                raise _fail(f"{{Scrape …}}: ${m[1]} gibt es nicht, es sind {len(pairs)} Paare.")
-            template.append(int(m[1]))
+            number = int(m[1]) if len(m[1]) <= 9 else 0  # int() of 4301+ digits raises ValueError
+            if not 1 <= number <= len(pairs):
+                shown = m[1] if len(m[1]) <= 20 else m[1][:20] + "…"
+                raise _fail(f"{{Scrape …}}: ${shown} gibt es nicht, es sind {len(pairs)} Paare.")
+            template.append(number)
         else:
             char = "$" if m[0] == "$$" else _unescape(m[0])
             if template and isinstance(template[-1], str):

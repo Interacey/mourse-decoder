@@ -317,14 +317,6 @@ def test_a_scraped_result_with_commands_is_typed_literally(fake_engine, injector
     assert injector.calls == [("text", "{Enter}[i]{File C:\\nope}")]
 
 
-def test_a_scrape_step_that_reaches_the_dispatch_is_an_error_not_a_crash(fake_engine, injector):
-    controller = make_controller(fake_engine, injector)
-    controller._resolve_scrapes = lambda steps: steps  # as if the pre-resolution had been skipped
-    with pytest.raises(MacroError, match="nicht ausgewertet"):
-        controller._emit_steps(Emission("{Scrape a | b | => $1}"))
-    assert injector.calls == []
-
-
 def test_a_slot_with_a_broken_scrape_is_reported():
     from mourse_decoder.function_keys import FunctionKeys
 
@@ -347,3 +339,88 @@ def test_scrape_is_listed_like_the_clipboard_for_the_import_warning(tmp_path):
         },
     )
     assert macros.commands_in_file(path) == ["{Scrape …}", "{Clipboard}"]
+
+
+# --- review fixes --------------------------------------------------------------------------------------
+
+
+def test_a_scrape_after_ctrl_c_reads_the_clipboard_at_its_position(fake_engine, injector):
+    injector.clipboard = "old: x;"
+    controller = make_controller(fake_engine, injector)
+    injector.press_shortcut = lambda combo: (injector.calls.append(("keys", combo)), setattr(injector, "clipboard", "Name: Anna\n"))
+    run_macro(controller, "{Ctrl+C}{Wait 1}{Scrape Name: | \n | => $1}")
+    assert injector.calls == [("keys", "Ctrl+C"), ("text", "Anna")]
+
+
+def test_a_scrape_before_any_key_is_still_cut_before_anything_is_typed(fake_engine, injector):
+    injector.clipboard = "Name: Anna\n"
+    controller = make_controller(fake_engine, injector)
+    with pytest.raises(MacroError, match="Marke 'Preis:'"):
+        controller._emit_steps(Emission("ab{Wait 1}{Scrape Preis: | | => $1}{Ctrl+C}{Scrape Name: | | => $1}"))
+    assert injector.calls == []
+
+
+def test_a_missing_marker_after_a_key_stops_there_and_earlier_output_stays(fake_engine, injector):
+    injector.clipboard = "Name: Anna\n"
+    controller = make_controller(fake_engine, injector)
+    with pytest.raises(MacroError, match="Marke 'Preis:'"):
+        controller._emit_steps(Emission("ab{Ctrl+C}{Scrape Preis: | | => $1}cd"))
+    assert injector.calls == [("text", "ab"), ("keys", "Ctrl+C")]
+
+
+def test_an_empty_clipboard_after_a_key_stops_there(fake_engine, injector):
+    injector.clipboard = "x"
+    controller = make_controller(fake_engine, injector)
+    injector.press_shortcut = lambda combo: (injector.calls.append(("keys", combo)), setattr(injector, "clipboard", ""))
+    with pytest.raises(MacroError, match="Zwischenablage"):
+        controller._emit_steps(Emission("a{Ctrl+X}{Scrape a | | => $1}"))
+    assert injector.calls == [("text", "a"), ("keys", "Ctrl+X")]
+
+
+def test_a_scrape_after_a_file_step_is_cut_late(fake_engine, injector, tmp_path):
+    injector.clipboard = "a=1;"
+    controller = make_controller(fake_engine, injector)
+    injector.paste_files = lambda paths: (injector.calls.append(("files", paths)), setattr(injector, "clipboard", "a=2;"))
+    run_macro(controller, "{File " + str(tmp_path) + "}{Scrape a= | ; | => $1}")
+    assert injector.calls[-1] == ("text", "2")
+
+
+def test_a_huge_placeholder_number_is_a_macro_error_not_a_crash():
+    for digits in (10, 4300, 4301, 100_000):
+        with pytest.raises(MacroError, match="gibt es nicht"):
+            parse("{Scrape a | b | => $" + "9" * digits + "}")
+
+
+def test_a_huge_placeholder_number_is_reported_for_a_slot_and_for_a_run(fake_engine, injector):
+    from mourse_decoder.function_keys import FunctionKeys
+
+    macro = "{Scrape a | b | => $" + "1" * 4301 + "}"
+    keys = FunctionKeys()
+    keys = keys.replace_slot(keys.slot(13).replace(macro=macro))
+    assert any(e.startswith("F13: ") for e in keys.validate(None, lambda combo: None))
+    controller = make_controller(fake_engine, injector)
+    with pytest.raises(MacroError):
+        controller._emit_steps(Emission(macro))
+
+
+def test_the_real_limit_is_99_scrapes_in_a_loop():
+    assert len(parse("{Loop 99}{Scrape a|b|=>$1}{EndLoop}")) == 99
+    with pytest.raises(MacroError, match="zu viel Text"):
+        parse("{Loop 100}{Scrape a|b|=>$1}{EndLoop}")
+
+
+def test_readme_names_the_real_loop_limit():
+    from pathlib import Path
+
+    readme = (Path(__file__).parents[2] / "README.md").read_text(encoding="utf-8")
+    assert "at most 99 of them fit in loops" in readme
+    assert "at most 100 of them" not in readme
+
+
+def test_dry_run_does_not_read_the_clipboard_and_does_not_abort_on_a_scrape(fake_engine, injector, capsys):
+    from mourse_decoder.app import _PrintInjector
+
+    controller = make_controller(fake_engine, _PrintInjector())
+    controller._emit_steps(Emission("a{Scrape Name: | | => $1}{Ctrl+C}{Scrape Name: | | => $1}"))
+    out = capsys.readouterr().out
+    assert out.count("<Ausschnitt>") == 2 and "Marke" not in out

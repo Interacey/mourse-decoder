@@ -625,7 +625,7 @@ class MorseController:
         # typing takes a few ms, so do it outside the lock to not block apply_settings
         steps = macros.parse(emission.text, self._injector.check_shortcut)  # first, so a broken macro changes nothing
         self._check_paths(steps)
-        steps = self._resolve_scrapes(steps)  # a missing marker stops the macro before anything is typed
+        steps = self._resolve_scrapes(steps)  # a missing marker before any key press stops the macro before it types
         self._set_typing_delay(effective_typing_delay(self._settings.typing_delay_ms, typing_delay_ms))
         self._run_typed, self._run_touched = 0, False
         try:
@@ -662,7 +662,10 @@ class MorseController:
                     if value:
                         self._type(value, self._injector.type_text, always=True)
                 elif kind == "scrape":
-                    raise macros.MacroError("{Scrape …} wurde nicht ausgewertet – nichts getippt.")
+                    # after a key or file step: the clipboard may have changed, so read it only now
+                    cut = self._cut(value)
+                    if cut:
+                        self._type(cut, self._injector.type_text, always=True)
                 elif kind == "scroll":
                     # returns at once: the scroller thread does the rest, outside the macro lock
                     if value == "down":
@@ -731,18 +734,32 @@ class MorseController:
             start = end
 
     def _resolve_scrapes(self, steps: list[macros.Step]) -> list[macros.Step]:
-        """Cut every {Scrape} out of the clipboard now, so a missing marker stops the macro before it types.
+        """Cut the {Scrape}s that can be cut before typing, so a missing marker stops the macro before it types.
 
-        The result is a "scraped" step: plain text that is never read as a command again.
+        A {Scrape} is cut now unless a key or file step comes before it: a shortcut such as Ctrl+C or Ctrl+X
+        can change the clipboard and a pasted file replaces it. Those stay "scrape" steps and are cut at their
+        position. A cut one becomes a "scraped" step: plain text that is never read as a command again.
         """
         if not any(kind == "scrape" for kind, _ in steps):
             return steps  # the clipboard is read only for a macro that needs it
+        out: list[macros.Step] = []
+        may_change_clipboard = False
+        for kind, value in steps:
+            if kind in ("keys", "files"):
+                may_change_clipboard = True
+            elif kind == "scrape" and not may_change_clipboard:
+                kind, value = "scraped", self._cut(value)
+            out.append((kind, value))
+        return out
+
+    def _cut(self, scrape: macros.Scrape) -> str:
+        """The text one {Scrape} types. The dry run does not read the clipboard (it may hold a password)."""
+        if getattr(self._injector, "dry_run", False):
+            return "<Ausschnitt>"
         text = self._injector.clipboard_text()
         if not text:
             raise macros.MacroError("Die Zwischenablage enthält keinen Text – nichts getippt.")
-        return [
-            ("scraped", macros.scrape_text(value, text)) if kind == "scrape" else (kind, value) for kind, value in steps
-        ]
+        return macros.scrape_text(scrape, text)
 
     @staticmethod
     def _check_paths(steps: list[macros.Step]) -> None:
