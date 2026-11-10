@@ -625,6 +625,7 @@ class MorseController:
         # typing takes a few ms, so do it outside the lock to not block apply_settings
         steps = macros.parse(emission.text, self._injector.check_shortcut)  # first, so a broken macro changes nothing
         self._check_paths(steps)
+        steps = self._resolve_scrapes(steps)  # a missing marker stops the macro before anything is typed
         self._set_typing_delay(effective_typing_delay(self._settings.typing_delay_ms, typing_delay_ms))
         self._run_typed, self._run_touched = 0, False
         try:
@@ -656,6 +657,12 @@ class MorseController:
                     if not secret:
                         raise macros.MacroError("Die Zwischenablage enthält keinen Text – nichts getippt.")
                     self._type(secret, self._injector.type_text, always=True)
+                elif kind == "scraped":
+                    # typed like {Clipboard} and kept out of the history for the same reason
+                    if value:
+                        self._type(value, self._injector.type_text, always=True)
+                elif kind == "scrape":
+                    raise macros.MacroError("{Scrape …} wurde nicht ausgewertet – nichts getippt.")
                 elif kind == "scroll":
                     # returns at once: the scroller thread does the rest, outside the macro lock
                     if value == "down":
@@ -722,6 +729,20 @@ class MorseController:
             self._stop_if_switched_off()
             self._type_piece(text[start:end], inject)
             start = end
+
+    def _resolve_scrapes(self, steps: list[macros.Step]) -> list[macros.Step]:
+        """Cut every {Scrape} out of the clipboard now, so a missing marker stops the macro before it types.
+
+        The result is a "scraped" step: plain text that is never read as a command again.
+        """
+        if not any(kind == "scrape" for kind, _ in steps):
+            return steps  # the clipboard is read only for a macro that needs it
+        text = self._injector.clipboard_text()
+        if not text:
+            raise macros.MacroError("Die Zwischenablage enthält keinen Text – nichts getippt.")
+        return [
+            ("scraped", macros.scrape_text(value, text)) if kind == "scrape" else (kind, value) for kind, value in steps
+        ]
 
     @staticmethod
     def _check_paths(steps: list[macros.Step]) -> None:

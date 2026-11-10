@@ -143,6 +143,28 @@ Everything is typed like keyboard input: text, line breaks, tabs and emoji. On W
 "--..-..-": "{Clipboard}{Enter}"
 ```
 
+#### Cutting text out of the clipboard
+
+`{Scrape from1 | to1 | from2 | to2 | … | => template}` (German: `{Ausschnitt …}`) reads the text on the clipboard, cuts out the part after each "from" marker up to the following "to" marker and types the template with the parts put in. Name and spaces around the name and the `|` are free, case of the name is ignored. Input is the clipboard text only: no file, no network.
+
+```
+Clipboard: "Name: Anna Weiß\nPreis: 12,50 €\n"
+{Scrape Name: | \n | Preis: | € | => $1 zahlt $2 Euro}{Enter}      types  Anna Weiß zahlt 12,50 Euro  and Enter
+
+Clipboard: "ID=77; user=bob; mail=bob@example.org"
+{Ausschnitt user= | ; | => Hallo $1!}                              types  Hallo bob!
+```
+
+- The fields are separated by `|`. The pairs (from, to) come first; the last field starts with `=>` and is the template. At least one pair is needed.
+- In the template `$1`, `$2`, … stand for the part of pair 1, 2, … (any pair, in any order, as often as you like); `$$` is a literal `$`. A `$` not followed by a digit is a literal `$` too. Square brackets are not used: `[i]` and `[= …]` in a template stay text, also inside a loop.
+- The search is plain text (no regular expressions) and ignores case. Spaces around a field are dropped; spaces inside a marker (`Total price:`) must match exactly. Write `\x20` for a space at the start or end of a marker.
+- Each "to" is searched after the end of its "from", and each pair after the end of the previous pair. Only the first match counts. An empty "to" (`{Scrape Preis: | | => $1}`) means the end of the line (or of the text). Every extracted part is stripped of spaces and line breaks at both ends. The "from" must not be empty.
+- Escapes in markers and template: `\|` a `|`, `\n` a line break, `\t` a tab, `\\` a backslash, `\x7B` a `{` and `\x7D` a `}` (a command ends at the first `}`, so braces need this), in general `\xHH` for any character below 256. Any other backslash stays (`C:\temp`). An escape never acts as a marker separator or placeholder: `\x24` is a literal `$`.
+- The extracted text is typed like `{Clipboard}`: key by key, never pasted, and it is never read as a command again (a `{Enter}` or `[i]` in the clipboard is typed as it stands). It is not shown on the Live page. A `{Scrape}` can be used inside `{Loop}`.
+- Checked before anything is typed: a missing template, a pair with no "to" field, an empty "from", or a `$n` without a pair `n` stops the macro. When the macro runs, a marker that is not found (`Marke 'Preis:' nicht in der Zwischenablage gefunden. Nichts getippt.`), an empty clipboard or a result over the limits also stops it, and nothing is typed, not even the text before the `{Scrape}`.
+- Limits: the clipboard text may have at most 200000 characters, the text one `{Scrape}` types at most 10000. Because that length is not known when loops are expanded, each `{Scrape}` counts as 10000 characters against the one million of a macro, so at most 100 of them fit in loops.
+- `{Scrape …}` is listed in the warning when you import a file that contains it, like `{Clipboard}`.
+
 #### Pausing and rolling back
 
 `{Wait 500}` (`{Warte 500}`) pauses the macro for 500 ms before the next step.
