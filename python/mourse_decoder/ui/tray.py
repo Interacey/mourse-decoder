@@ -174,6 +174,9 @@ class TrayApp:
     def on_symbol(self, symbol: str) -> None:
         self.call_in_ui(lambda: self._window.add_symbol(symbol))
 
+    def on_timing(self, kind: str, ms: int) -> None:
+        self.call_in_ui(lambda: self._window.add_timing(kind, ms))
+
     def on_letter(self, sequence: str, text: str | None) -> None:
         shown = text if text is not None else "?"
 

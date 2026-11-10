@@ -113,7 +113,7 @@ def test_word_gap_event():
         key(eng, 0.02)
         events.wait_for("word_gap")
         kinds = [k for k, _ in events.events]
-        assert kinds == ["symbol", "letter", "word_gap"]
+        assert kinds == ["press_ms", "symbol", "letter", "word_gap"]  # press_ms: the measured hold time, see calibration
     finally:
         eng.stop()
 
@@ -134,7 +134,7 @@ def test_reset_discards_pending_sequence(engine):
     key(engine, 0.02)
     engine.reset()
     time.sleep(0.1)
-    assert [k for k, _ in events.events] == ["symbol"]
+    assert [k for k, _ in events.events] == ["press_ms", "symbol"]
 
 
 def test_start_twice_fails(engine):
@@ -179,7 +179,7 @@ def test_callback_exception_does_not_kill_worker(engine):
             time.sleep(0.01)
     finally:
         sys.unraisablehook = old_hook
-    assert calls[:2] == ["symbol", "letter"]  # the worker survives the error
+    assert calls[:3] == ["press_ms", "symbol", "letter"]  # the worker survives the error
     assert len(errors) == 1
 
 

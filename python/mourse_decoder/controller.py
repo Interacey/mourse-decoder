@@ -109,6 +109,10 @@ class ControllerListener(Protocol):
     def on_letter(self, sequence: str, text: str | None) -> None: ...
     def on_error(self, message: str) -> None: ...
 
+    # optional, only called while ``calibrating``: ``kind`` is "press_ms" (how long the key was held) or
+    # "gap_ms" (silence before a press), ``ms`` the whole milliseconds the engine measured
+    def on_timing(self, kind: str, ms: int) -> None: ...
+
 
 class NativeInjector:
     """Adapter for the Rust ``inject_text`` / ``inject_backspaces`` / ``press_shortcut`` functions."""
@@ -224,6 +228,7 @@ class MorseController:
         self._use_hook = use_hook
         self._lock = threading.RLock()
         self._running = False
+        self._calibrating = False
         self._stopping = False  # set by stop() so a running macro ends before the engine is joined
         self._cycle_seen = 0
         self._undo_seen = 0
@@ -266,6 +271,23 @@ class MorseController:
 
     def set_listener(self, listener: ControllerListener | None) -> None:
         self._listener = listener
+
+    @property
+    def calibrating(self) -> bool:
+        """True while the calibration page measures: letters and word gaps are not typed then."""
+        return self._calibrating
+
+    def set_calibrating(self, on: bool) -> None:
+        """Switch measuring on or off without touching ``Settings.enabled``.
+
+        The engine is reset on every change so a half-keyed sequence does not end as a letter
+        right after the switch.
+        """
+        if on == self._calibrating:
+            return
+        self._calibrating = on
+        if self._running:
+            self._engine.reset()
 
     def start(self) -> None:
         with self._lock:
@@ -563,6 +585,8 @@ class MorseController:
                 self._handle_letter(payload)
             elif kind == "word_gap":
                 self._handle_word_gap()
+            elif kind in ("press_ms", "gap_ms"):
+                self._handle_timing(kind, payload)
             else:
                 log.debug("Unbekanntes Engine-Ereignis %r", kind)
         except macros.MacroStopped:
@@ -571,9 +595,19 @@ class MorseController:
             log.exception("Fehler bei Engine-Ereignis %s", kind)
             self._notify("on_error", str(exc))
 
+    def _handle_timing(self, kind: str, payload: str) -> None:
+        if not self._calibrating or getattr(self._listener, "on_timing", None) is None:
+            return
+        try:
+            ms = int(payload)
+        except ValueError:
+            log.debug("Ungültige Zeitangabe %r", payload)
+            return
+        self._notify("on_timing", kind, ms)
+
     def _handle_letter(self, sequence: str) -> None:
         with self._lock:
-            if not self._settings.enabled:
+            if not self._settings.enabled or self._calibrating:
                 return  # engine keeps running, output is paused
             emission = self._decoder.decode(sequence)
         if emission is None:
@@ -584,7 +618,7 @@ class MorseController:
 
     def _handle_word_gap(self) -> None:
         with self._lock:
-            if not self._settings.enabled:
+            if not self._settings.enabled or self._calibrating:
                 return
             emission = self._decoder.word_gap()
         if emission is not None:

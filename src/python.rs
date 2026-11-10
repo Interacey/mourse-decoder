@@ -66,6 +66,9 @@ fn to_python_event(output: TimerOutput) -> (&'static str, String) {
         TimerOutput::Symbol(s) => ("symbol", s.as_char().to_string()),
         TimerOutput::Letter(seq) => ("letter", seq),
         TimerOutput::WordGap => ("word_gap", String::new()),
+        // whole milliseconds, as text like the other payloads
+        TimerOutput::Press(d) => ("press_ms", d.as_millis().to_string()),
+        TimerOutput::Gap(d) => ("gap_ms", d.as_millis().to_string()),
     }
 }
 
@@ -117,7 +120,7 @@ impl PyMorseEngine {
             });
         };
 
-        let handle = EngineHandle::spawn(state.config, sink).map_err(|e| {
+        let handle = EngineHandle::spawn_with(state.config, true, sink).map_err(|e| {
             PyRuntimeError::new_err(format!("Worker-Thread konnte nicht starten: {e}"))
         })?;
 
