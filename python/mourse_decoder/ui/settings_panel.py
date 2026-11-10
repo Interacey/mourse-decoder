@@ -7,16 +7,21 @@ from __future__ import annotations
 
 import tkinter as tk
 from collections.abc import Callable
-from tkinter import ttk
+from datetime import datetime
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
 
+from .. import backup
 from ..controller import MorseController
 from ..dictionary import DictionaryManager
 from ..i18n import available_languages, tr
-from ..settings import THEME_MODES, TYPING_DELAY_RANGE, Settings
+from ..settings import THEME_MODES, TYPING_DELAY_RANGE, Settings, default_config_dir
 from . import theme
 from .form import parse_form
 from .key_capture import CaptureBackend, KeyCaptureButton, ShortcutCaptureButton
-from .theme import Card, ScrollFrame, Switch, field_box, label, list_box
+from .theme import Button, Card, ScrollFrame, Switch, field_box, label, list_box
+
+PREVIEW_LINES = 12  # file names listed in the import confirmation
 
 _TIMING_FIELDS = (
     ("dot_threshold_ms", "timing.dot"),
@@ -29,6 +34,33 @@ _SPINBOX = {"typing_delay_ms": (*TYPING_DELAY_RANGE, 5)}
 TYPING_DELAY_MS = 450  # apply number fields once typing pauses
 
 
+class BackupDialogs:
+    """The file and message dialogs of the backup buttons; tests pass a fake."""
+
+    def __init__(self, parent: tk.Misc) -> None:
+        self._parent = parent
+
+    def save_path(self, title: str, initialfile: str) -> str:
+        return filedialog.asksaveasfilename(
+            parent=self._parent, title=title, initialfile=initialfile, defaultextension=".zip",
+            filetypes=[(tr("backup.file.zip"), "*.zip")],
+        )
+
+    def open_path(self, title: str) -> str:
+        return filedialog.askopenfilename(
+            parent=self._parent, title=title, filetypes=[(tr("backup.file.zip"), "*.zip"), (tr("file.all"), "*.*")]
+        )
+
+    def ask(self, title: str, text: str) -> bool:
+        return messagebox.askyesno(title, text, parent=self._parent)
+
+    def info(self, title: str, text: str) -> None:
+        messagebox.showinfo(title, text, parent=self._parent)
+
+    def error(self, title: str, text: str) -> None:
+        messagebox.showerror(title, text, parent=self._parent)
+
+
 class SettingsPanel(tk.Frame):
     def __init__(
         self,
@@ -37,8 +69,12 @@ class SettingsPanel(tk.Frame):
         dictionaries: DictionaryManager,
         apply_settings: Callable[[Settings], None],
         capture_backend: CaptureBackend | None = None,
+        backup_dialogs: BackupDialogs | None = None,
+        config_dir: Path | None = None,
     ) -> None:
         super().__init__(master, bg=theme.P.bg)
+        self._backup_dialogs = backup_dialogs or BackupDialogs(self)
+        self._config_dir = Path(config_dir) if config_dir else default_config_dir()
         self._controller = controller
         self._dictionaries = dictionaries
         self._apply = apply_settings
@@ -160,6 +196,13 @@ class SettingsPanel(tk.Frame):
         self._error = tk.Label(body, bg=theme.P.bg, fg=theme.P.danger, font=theme.font(9), anchor="w", justify="left")
         self._error.grid(row=10, column=0, sticky="w", padx=8, pady=(8, 0))
 
+        # backup of all user files as one zip
+        self._section(11, "backup.section")
+        saves = Card(body)
+        saves.grid(row=12, column=0, sticky="ew")
+        Button(saves.add_row(tr("backup.export"), tr("backup.export.hint")), tr("backup.export.button"), self._export_backup).pack()
+        Button(saves.add_row(tr("backup.import"), tr("backup.import.hint")), tr("backup.import.button"), self._import_backup).pack()
+
         self.refresh()
 
     def _section(self, row: int, key: str) -> None:
@@ -276,3 +319,53 @@ class SettingsPanel(tk.Frame):
             self._error.configure(text=f"{tr('err.apply')}: {exc}")
         finally:
             self._busy = False
+
+    def _export_backup(self) -> None:
+        dialogs = self._backup_dialogs
+        target = dialogs.save_path(tr("backup.dlg.export"), f"mourse-backup-{datetime.now():%Y%m%d}.zip")
+        if not target:
+            return
+        with_telecode = (self._config_dir / backup.TELECODE_FILE).is_file() and dialogs.ask(
+            tr("backup.export"), tr("backup.telecode.ask")
+        )
+        try:
+            manifest = backup.export_bundle(self._config_dir, Path(target), include_telecode=with_telecode)
+        except backup.BackupError as exc:
+            dialogs.error(tr("backup.err.export"), str(exc))
+            return
+        dialogs.info(tr("backup.export"), tr("backup.export.done", count=len(manifest["files"]), path=target))
+
+    def _import_backup(self) -> None:
+        dialogs = self._backup_dialogs
+        source = dialogs.open_path(tr("backup.dlg.import"))
+        if not source:
+            return
+        try:
+            preview = backup.inspect_bundle(Path(source), self._config_dir)
+        except backup.BackupError as exc:
+            dialogs.error(tr("backup.err.import"), str(exc))
+            return
+        if not preview.count("add") and not preview.count("replace"):
+            dialogs.info(tr("backup.import"), tr("backup.import.nothing"))
+            return
+        changes = [e for e in preview.entries if e.status != "unchanged"]
+        listed = "\n".join(f"{tr('backup.status.' + e.status)}: {e.path}" for e in changes[:PREVIEW_LINES])
+        if len(changes) > PREVIEW_LINES:
+            listed += "\n" + tr("backup.import.more", count=len(changes) - PREVIEW_LINES)
+        text = tr(
+            "backup.import.confirm",
+            add=preview.count("add"), replace=preview.count("replace"), unchanged=preview.count("unchanged"),
+            version=preview.manifest.get("app_version", "?"), created=preview.manifest.get("created_utc", "?"),
+            files=listed,
+        )
+        if not dialogs.ask(tr("backup.import"), text):
+            return
+        try:
+            result = backup.import_bundle(Path(source), self._config_dir)
+        except backup.BackupError as exc:
+            dialogs.error(tr("backup.err.import"), str(exc))
+            return
+        if result.restore_point:
+            dialogs.info(tr("backup.import"), tr("backup.import.done", path=result.restore_point))
+        else:
+            dialogs.info(tr("backup.import"), tr("backup.import.done.nopoint"))

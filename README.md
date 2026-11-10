@@ -344,6 +344,25 @@ Copy `python/mourse_decoder/locales/en.json` as a template and translate the val
 
 **The Function keys page** lists all 100 slots with type (real or virtual), trigger, label or macro and status; the switch "Only assigned" and the search box narrow the list. Select a slot to edit its macro, label, trigger (click the trigger button, press the keys; "Default" restores the standard one), "Active" and "Swallow the key". The macro is checked while you type and a mistake is shown in red; "Save" is available once the slot is valid and installs it right away. "Test" runs the saved macro after 3 seconds, so you can click into the target window first, and "Reset" returns the slot to its default trigger with an empty macro. For a virtual slot, set the Stream Deck button to send the combination shown in the Trigger column. Esc stops a running macro.
 
+## Backup and restore
+
+The Settings page has "Export backup" and "Import backup" at the bottom. Export saves your configuration as one zip file (default name `mourse-backup-YYYYMMDD.zip`).
+
+**Included:** `settings.json`, `function_keys.json` and every `.json` file in `alphabets/`, `smileys/` and `languages/`, byte for byte as they are on disk, plus a `manifest.json` (program version, creation time in UTC, and for each file its size and SHA-256).
+
+**Not included:** `.bak` copies and temporary files, and `telecode.sqlite` unless you answer Yes when Export asks (it only asks if the file exists). The program cannot rebuild that database by itself: it needs the Unihan download and `mourse-decoder-build-telecodes`, see "Chinese telecodes". It holds no personal data.
+
+**The zip is sensitive.** Function-key macros can contain paths, texts and anything else you typed into them. Treat the zip like a password file and do not share it.
+
+**Import** checks the whole zip before it writes anything, then shows how many files are new, replaced or unchanged and asks for confirmation. Files that are in the zip replace the files with the same name; all other files in your folder stay. Before the first write, your current files are saved as a restore point, `MourseDecoder-backup-<date>-<time>.zip` next to the configuration folder (same format: to undo an import, import that zip). If a write fails, the files already written are put back. Restart the program afterwards so it reads the files again.
+
+An import is refused, and nothing is changed, if:
+- `manifest.json` is missing, or its format version is unknown;
+- a name is not one of the files above (paths with `..`, absolute paths, drive letters, backslashes, sub-folders, links, `.bak` files), or a file is listed twice;
+- a size or SHA-256 does not match the manifest, or the zip holds a file the manifest does not list;
+- a JSON file does not parse, or `function_keys.json` has a `schema_version` newer than this program knows;
+- the zip has more than 2000 entries, one file over 50 MiB, more than 200 MiB in total, or an entry that is compressed more than 100 times over 1 MiB (zip bomb).
+
 ## Security
 
 - **Network paths are refused** in `{File …}`. Merely checking whether `\\server\share\x` exists makes Windows log in at that server and hand over the user's NTLM hash, so a smiley set from a stranger could leak it. Local drives and mapped drives (`Z:\`) work.
