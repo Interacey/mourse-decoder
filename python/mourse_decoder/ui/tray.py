@@ -89,7 +89,7 @@ class TrayApp:
                 log.exception("Fehler in UI-Aufgabe")
         try:
             # one failing poll must not stop the others, and the loop must be scheduled again in any case
-            polls = (self._poll_block, self._poll_cycle, self._poll_undo, self._poll_function_keys, self._poll_hook)
+            polls = (self._poll_state, self._poll_block, self._poll_cycle, self._poll_undo, self._poll_function_keys, self._poll_hook)
             for poll in polls:
                 try:
                     poll()
@@ -109,6 +109,10 @@ class TrayApp:
         log.error("Tastatur-Hook ausgefallen: %s", error)
         self._icon.notify(error, tr("tray.error"))
         self._toast.show(error, False)
+
+    def _poll_state(self) -> None:
+        """Watchdog: put the saved blocking state back if the engine lost it or the machine just resumed."""
+        self._controller.check_input_state()
 
     def _poll_block(self) -> None:
         """The hook's shortcut can turn Morse input on or off; mirror that into the settings."""
