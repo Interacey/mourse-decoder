@@ -70,6 +70,8 @@ class EngineLike(Protocol):
     def stop(self) -> None: ...
     def configure(self, dot_threshold_ms: int, letter_gap_ms: int, word_gap_ms: int = 0) -> None: ...
     def reset(self) -> None: ...
+    def set_measuring(self, on: bool) -> None:
+        """Engine events "press_ms" / "gap_ms" on or off (off by default)."""
     def set_function_keys(self, entries: list[tuple[int, str, bool]]) -> None:
         """Install (slot, trigger, swallow) entries; ValueError if one is invalid or clashes."""
     def clear_function_keys(self) -> None: ...
@@ -112,6 +114,10 @@ class ControllerListener(Protocol):
     # optional, only called while ``calibrating``: ``kind`` is "press_ms" (how long the key was held) or
     # "gap_ms" (silence before a press), ``ms`` the whole milliseconds the engine measured
     def on_timing(self, kind: str, ms: int) -> None: ...
+
+    # optional: the controller ended the measuring by itself (``reason`` "stopped" or "timeout"),
+    # the page has to drop its "measuring" state
+    def on_calibration_ended(self, reason: str) -> None: ...
 
 
 class NativeInjector:
@@ -208,6 +214,8 @@ class MorseController:
     TYPE_CHUNK = 100  # characters typed between two looks at the on/off switch (about 2 s)
     ERASE_CHUNK = 2000  # Backspaces sent between two looks at the on/off switch and Esc
     MODIFIER_TIMEOUT_S = 3.0  # a function key waits this long for Ctrl/Alt/Shift/Win to be let go
+    # measuring ends by itself after this long, so letters can never stay muted because a page forgot to stop
+    CALIBRATION_MAX_S = 600.0
 
     def __init__(
         self,
@@ -219,7 +227,9 @@ class MorseController:
         decoder_factory: Callable[[DictionaryManager, str], Decoder] = create_decoder,
         use_hook: bool = True,
         scroller_factory: Callable[..., Scroller] = Scroller,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
+        self._clock = clock
         self._engine = engine
         self._injector = injector
         self._dictionaries = dictionaries
@@ -229,6 +239,7 @@ class MorseController:
         self._lock = threading.RLock()
         self._running = False
         self._calibrating = False
+        self._calibration_started = 0.0
         self._stopping = False  # set by stop() so a running macro ends before the engine is joined
         self._cycle_seen = 0
         self._undo_seen = 0
@@ -277,17 +288,52 @@ class MorseController:
         """True while the calibration page measures: letters and word gaps are not typed then."""
         return self._calibrating
 
-    def set_calibrating(self, on: bool) -> None:
-        """Switch measuring on or off without touching ``Settings.enabled``.
+    def set_calibrating(self, on: bool) -> bool:
+        """Switch measuring on or off without touching ``Settings.enabled``; returns the state afterwards.
 
-        The engine is reset on every change so a half-keyed sequence does not end as a letter
-        right after the switch.
+        Measuring needs a running controller (False otherwise). It also ends by itself: ``stop()``, a
+        listener that was told ``on_calibration_ended``, or ``CALIBRATION_MAX_S`` after the start.
+        The engine is reset on every change, with this effect:
+
+        * on: a letter keyed before the switch is dropped, so it does not mix with the measuring;
+        * off: a letter started while measuring is dropped, otherwise the practice presses would be
+          typed as one. Nothing from before the switch is lost, that was dropped at "on" and letters
+          are muted while measuring anyway.
+
+        One race remains: a letter whose pause ran out just before the switch can still reach
+        ``_handle_letter`` after the flag is clear and is typed (a few ms wide).
         """
-        if on == self._calibrating:
-            return
-        self._calibrating = on
-        if self._running:
-            self._engine.reset()
+        with self._lock:
+            if on == self._calibrating:
+                return on
+            if on and not self._running:
+                return False
+            self._calibrating = on
+            self._calibration_started = self._clock()
+            self._engine.set_measuring(on)
+            if self._running:
+                self._engine.reset()
+            return on
+
+    def check_calibration_timeout(self) -> bool:
+        """End a measuring that lasts longer than ``CALIBRATION_MAX_S``; True if it did."""
+        with self._lock:
+            if not self._calibrating or self._clock() - self._calibration_started < self.CALIBRATION_MAX_S:
+                return False
+        self._end_calibrating("timeout")
+        return True
+
+    def _end_calibrating(self, reason: str) -> None:
+        """Measuring off, then tell the page. Not under the lock: the listener may call back."""
+        with self._lock:
+            if not self._calibrating:
+                return
+            self._calibrating = False
+            self._engine.set_measuring(False)
+            if self._running:
+                self._engine.reset()
+        if getattr(self._listener, "on_calibration_ended", None) is not None:
+            self._notify("on_calibration_ended", reason)
 
     def start(self) -> None:
         with self._lock:
@@ -315,6 +361,7 @@ class MorseController:
                 return
             self._running = False
             self._stopping = True
+        self._end_calibrating("stopped")  # the page must not stay on "measuring" for a stopped engine
         self._scroller.stop()
         self._engine.block_input = False  # never leave the key blocked behind
         self._engine.clear_function_keys()
@@ -579,6 +626,7 @@ class MorseController:
     def _on_engine_event(self, kind: str, payload: str) -> None:
         # an exception here wouldn't kill the worker, but the letter would vanish silently
         try:
+            self.check_calibration_timeout()
             if kind == "symbol":
                 self._notify("on_symbol", payload)
             elif kind == "letter":

@@ -74,20 +74,20 @@ The tray menu entry "Undo last output" and the optional shortcut "Shortcut to un
 
 The "Calibration" tab measures your own key rhythm and suggests the three timing values (dot/dash threshold, letter pause, word pause). It only suggests: nothing in the settings changes until you press "Apply suggestion".
 
-1. Press "Start". While the tab measures, nothing is typed, and Morse input stays switched on for everything else. Leaving the tab or hiding the window stops the measuring.
+1. Press "Start". While the tab measures, nothing is typed, and Morse input stays switched on for everything else. Leaving the tab, minimizing or hiding the window, applying, stopping the program and a limit of 10 minutes all stop the measuring, so typing can never stay muted. Measuring also works while Morse input is switched off, but the key is then not blocked and does its normal job (the tab says so).
 2. Follow the prompts, one step after the other: short presses (dots), long presses (dashes), then pauses between letters and pauses between words. For the two pause steps, press once to start and then press again after each pause. The first press of such a step only starts it.
 3. Each step ends by itself after a fixed number of presses (6 dots, 6 dashes, 5 letter pauses, 4 word pauses). "Next step" moves on earlier, "Redo step" throws the step's samples away.
 4. Check the suggested values and press "Apply suggestion". They are rounded to whole milliseconds, kept inside the ranges of the settings page and checked like the settings page does (the word pause must stay longer than the letter pause). A value the tab has no suggestion for is left as it is.
 
 How the values are worked out, from the median of each step after outliers are dropped (a sample is dropped if it is farther from the median than `max(2 × 1.4826 × MAD, 25 % of the median)`):
 
-* Dot/dash threshold: the geometric mean of the dot median and the dash median.
-* Letter pause: 75 % of the letter-pause median, so that most of your own letter pauses stay above the threshold.
-* Word pause: the geometric mean of the letter-pause median and the word-pause median.
+* Dot/dash threshold: the geometric mean of the dot median and the dash median. It has to lie strictly between the two medians, otherwise there is no suggestion.
+* Letter pause: 75 % of the letter-pause median, so that most of your own letter pauses stay above the threshold. It must also be longer than 1.5 times your longest pause between two symbols of one letter (measured in the dot and dash steps, so key those presses one right after the other); if it is not, it is raised just above that, and if that would reach your letter pauses there is no suggestion.
+* Word pause: the geometric mean of the letter-pause median and the word-pause median. It only comes from the word step; if the word pause is switched off (0), the tab says that applying turns it on.
 
-A value needs at least 3 usable samples. If the dash median is less than 1.5 times the dot median, or the word-pause median less than 1.5 times the letter-pause median, the tab says the two are not distinguishable and suggests nothing for them. With "Separate dash key" on, only the pauses are measured, because the press time decides nothing then.
+A value needs at least 3 usable samples. Presses and pauses under 20 ms count as contact bounce and are ignored, presses above 5 s, letter pauses above 10 s and word pauses above 20 s as breaks. If the dash median is less than 1.5 times the dot median, or the word-pause median less than 1.5 times the letter-pause median, the tab says the two are not distinguishable and suggests nothing for them. A value that had to be moved into the range of the settings page is marked with the calculated and the suggested number. Missing samples are only reported for the current and the earlier steps. With "Separate dash key" on, only the pauses are measured, because the press time decides nothing then.
 
-The press times come from the Rust engine: while the program runs it reports `press_ms` (how long the key was held, sent just before the `symbol` event) and `gap_ms` (the silence before a press) next to the existing `symbol`, `letter` and `word_gap` events. Older listeners ignore the new kinds; the Python controller only passes them on while the tab is measuring.
+The press times come from the Rust engine, but only while measuring is switched on (`MorseEngine.set_measuring(True)`, off by default and after `stop()`): it then reports `press_ms` (how long the key was held, sent just before the `symbol` event) and `gap_ms` (the silence before a press; none for the first press, after a reset or for the repeats of a held key) next to the `symbol`, `letter` and `word_gap` events. Without it the event stream is the old one. Switching on or off resets the engine, so a half-keyed letter is dropped; letters are muted while measuring.
 
 ### Emoji and long texts (smiley sets)
 

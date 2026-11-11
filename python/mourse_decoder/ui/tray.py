@@ -89,7 +89,14 @@ class TrayApp:
                 log.exception("Fehler in UI-Aufgabe")
         try:
             # one failing poll must not stop the others, and the loop must be scheduled again in any case
-            polls = (self._poll_block, self._poll_cycle, self._poll_undo, self._poll_function_keys, self._poll_hook)
+            polls = (
+                self._poll_block,
+                self._poll_cycle,
+                self._poll_undo,
+                self._poll_function_keys,
+                self._poll_hook,
+                self._poll_calibration,
+            )
             for poll in polls:
                 try:
                     poll()
@@ -97,6 +104,10 @@ class TrayApp:
                     log.exception("Abfrage %s fehlgeschlagen", poll.__name__)
         finally:
             self._root.after(POLL_INTERVAL_MS, self._drain_queue)
+
+    def _poll_calibration(self) -> None:
+        """A measuring that nobody ended stops after its time limit, even if no key is pressed."""
+        self._controller.check_calibration_timeout()
 
     def _poll_hook(self) -> None:
         """Once the keyboard hook has died, Morse input is gone: say so one time."""
@@ -176,6 +187,9 @@ class TrayApp:
 
     def on_timing(self, kind: str, ms: int) -> None:
         self.call_in_ui(lambda: self._window.add_timing(kind, ms))
+
+    def on_calibration_ended(self, reason: str) -> None:
+        self.call_in_ui(lambda: self._window.calibration_ended(reason))
 
     def on_letter(self, sequence: str, text: str | None) -> None:
         shown = text if text is not None else "?"

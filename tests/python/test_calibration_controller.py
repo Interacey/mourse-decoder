@@ -97,6 +97,7 @@ def test_the_real_engine_reports_the_press_before_the_symbol_and_the_gap_at_the_
     events: list[tuple[str, str]] = []
     engine = core.MorseEngine(dot_threshold_ms=150, letter_gap_ms=400, word_gap_ms=0)
     engine.start(lambda kind, payload: events.append((kind, payload)), use_hook=False)
+    engine.set_measuring(True)
     try:
         engine.feed_press()
         time.sleep(0.05)
@@ -113,3 +114,214 @@ def test_the_real_engine_reports_the_press_before_the_symbol_and_the_gap_at_the_
     values = {i: int(p) for i, (k, p) in enumerate(events) if k in ("press_ms", "gap_ms")}
     assert 40 <= values[0] <= 150 and 90 <= values[2] <= 250 and 240 <= values[3] <= 400
     assert [p for k, p in events if k == "symbol"] == [".", "-"]
+
+
+# --- review fixes: measuring switch, lifecycle of the flag, watchdog ------------------------------
+
+
+class Clock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class EndListener(TimingListener):
+    def __init__(self) -> None:
+        super().__init__()
+        self.ended: list[str] = []
+
+    def on_calibration_ended(self, reason: str) -> None:
+        self.ended.append(reason)
+
+
+def make_with_clock(engine, injector, listener=None, **settings):
+    clock = Clock()
+    controller = MorseController(
+        engine, injector, DictionaryManager(), Settings().replace(**settings), listener=listener, clock=clock
+    )
+    controller.start()
+    return controller, clock
+
+
+def test_the_engine_measures_only_while_calibrating(fake_engine, injector):
+    controller = make(fake_engine, injector)
+    assert fake_engine.measuring is False and fake_engine.measuring_calls == []  # nothing until asked
+    assert controller.set_calibrating(True) is True
+    assert fake_engine.measuring is True
+    assert controller.set_calibrating(False) is False
+    assert fake_engine.measuring is False
+    assert fake_engine.measuring_calls == [True, False]
+
+
+def test_measuring_cannot_start_on_a_stopped_controller(fake_engine, injector):
+    controller = MorseController(fake_engine, injector, DictionaryManager(), Settings())
+    assert controller.set_calibrating(True) is False
+    assert not controller.calibrating and fake_engine.measuring_calls == []
+    controller.start()
+    controller.stop()
+    assert controller.set_calibrating(True) is False
+
+
+def test_stop_ends_measuring_and_tells_the_page(fake_engine, injector):
+    listener = EndListener()
+    controller = make(fake_engine, injector, listener)
+    controller.set_calibrating(True)
+    controller.stop()
+    assert not controller.calibrating and fake_engine.measuring is False
+    assert listener.ended == ["stopped"]
+    controller.start()
+    assert not controller.calibrating
+    fake_engine.letters("...")
+    assert injector.buffer == "S"  # not muted after stop and start
+
+
+def test_stop_without_measuring_tells_nobody(fake_engine, injector):
+    listener = EndListener()
+    controller = make(fake_engine, injector, listener)
+    controller.stop()
+    assert listener.ended == [] and fake_engine.measuring_calls == []
+
+
+def test_a_listener_without_on_calibration_ended_is_fine(fake_engine, injector, listener):
+    controller = make(fake_engine, injector, listener)  # RecordingListener has no such method
+    controller.set_calibrating(True)
+    controller.stop()
+    assert not controller.calibrating and listener.errors == []
+
+
+def test_a_failing_listener_does_not_keep_measuring_on(fake_engine, injector):
+    class Broken(TimingListener):
+        def on_calibration_ended(self, reason: str) -> None:
+            raise RuntimeError("page is gone")
+
+    controller = make(fake_engine, injector, Broken())
+    controller.set_calibrating(True)
+    controller.stop()
+    assert not controller.calibrating and fake_engine.measuring is False
+
+
+def test_measuring_ends_by_itself_after_the_time_limit(fake_engine, injector):
+    listener = EndListener()
+    controller, clock = make_with_clock(fake_engine, injector, listener)
+    controller.set_calibrating(True)
+    clock.now += MorseController.CALIBRATION_MAX_S - 1
+    assert controller.check_calibration_timeout() is False and controller.calibrating
+    clock.now += 1
+    assert controller.check_calibration_timeout() is True
+    assert not controller.calibrating and fake_engine.measuring is False
+    assert listener.ended == ["timeout"]
+    assert controller.check_calibration_timeout() is False  # once
+
+
+def test_the_time_limit_counts_from_the_latest_start(fake_engine, injector):
+    controller, clock = make_with_clock(fake_engine, injector)
+    controller.set_calibrating(True)
+    clock.now += MorseController.CALIBRATION_MAX_S - 5
+    controller.set_calibrating(False)
+    controller.set_calibrating(True)
+    clock.now += 10
+    assert controller.check_calibration_timeout() is False and controller.calibrating
+
+
+def test_an_engine_event_after_the_time_limit_ends_the_muting_and_is_typed(fake_engine, injector):
+    # nobody polls and the page forgot to stop: the next letter must not vanish
+    listener = EndListener()
+    controller, clock = make_with_clock(fake_engine, injector, listener)
+    controller.set_calibrating(True)
+    fake_engine.letters("...")
+    assert injector.buffer == ""
+    clock.now += MorseController.CALIBRATION_MAX_S
+    fake_engine.letters("...")
+    assert injector.buffer == "S" and listener.ended == ["timeout"]
+
+
+def test_the_time_limit_is_ten_minutes():
+    assert MorseController.CALIBRATION_MAX_S == 600
+
+
+def test_switching_on_drops_a_letter_keyed_before_and_off_drops_one_keyed_while_measuring(fake_engine, injector):
+    controller = make(fake_engine, injector)
+    controller.set_calibrating(True)
+    assert fake_engine.reset_calls >= 1
+    controller.set_calibrating(False)
+    assert fake_engine.reset_calls >= 2  # a letter started while measuring is not typed afterwards
+
+
+def _real_controller(injector, **settings):
+    from mourse_decoder import _morse_core as core
+
+    engine = core.MorseEngine()
+    timing = {"dot_threshold_ms": 150, "letter_gap_ms": 300, "word_gap_ms": 0}  # the controller configures the engine
+    controller = MorseController(
+        engine, injector, DictionaryManager(), Settings().replace(**timing, **settings), use_hook=False
+    )
+    controller.start()
+    return engine, controller
+
+
+def _tap(engine, hold_s=0.02, pause_s=0.03):
+    engine.feed_press()
+    time.sleep(hold_s)
+    engine.feed_release()
+    time.sleep(pause_s)
+
+
+@pytest.mark.skipif(not NATIVE_AVAILABLE, reason="Rust-Modul nicht gebaut (maturin develop)")
+def test_real_engine_a_letter_started_while_measuring_is_not_typed_after_switching_off(injector):
+    engine, controller = _real_controller(injector)
+    try:
+        controller.set_calibrating(True)
+        _tap(engine)
+        _tap(engine)
+        controller.set_calibrating(False)  # the open letter ".." is discarded by the reset
+        time.sleep(0.6)
+        assert injector.buffer == ""
+        _tap(engine)  # normal typing works again: "."
+        _tap(engine)
+        time.sleep(0.6)
+        assert injector.buffer == "I"
+    finally:
+        controller.stop()
+
+
+@pytest.mark.skipif(not NATIVE_AVAILABLE, reason="Rust-Modul nicht gebaut (maturin develop)")
+def test_real_engine_a_letter_keyed_before_measuring_is_dropped_by_the_switch_on(injector):
+    engine, controller = _real_controller(injector)
+    try:
+        _tap(engine)
+        controller.set_calibrating(True)
+        controller.set_calibrating(False)
+        time.sleep(0.6)
+        assert injector.buffer == ""  # intended: the half-keyed letter belongs to neither mode
+        _tap(engine)
+        time.sleep(0.6)
+        assert injector.buffer == "E"
+    finally:
+        controller.stop()
+
+
+@pytest.mark.skipif(not NATIVE_AVAILABLE, reason="Rust-Modul nicht gebaut (maturin develop)")
+def test_real_engine_sends_no_timing_events_unless_calibrating_and_stop_switches_off(injector):
+    engine, controller = _real_controller(injector)
+    listener = TimingListener()
+    controller.set_listener(listener)
+    kinds: list[str] = []
+    try:
+        assert engine.measuring is False
+        _tap(engine)
+        _tap(engine)
+        time.sleep(0.5)
+        assert listener.timings == [] and injector.buffer == "I"
+        controller.set_calibrating(True)
+        assert engine.measuring is True
+        _tap(engine)
+        _tap(engine)
+        time.sleep(0.1)
+        kinds = [k for k, _ in listener.timings]
+        assert kinds == ["press_ms", "gap_ms", "press_ms"]
+        assert injector.buffer == "I"  # muted while measuring
+    finally:
+        controller.stop()
+    assert engine.measuring is False

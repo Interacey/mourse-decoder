@@ -84,6 +84,7 @@ class CalibrationPanel(tk.Frame):
             button.pack(side="left", padx=(0, 8))
 
         self.bind("<Destroy>", self._destroyed)
+        self.bind("<Unmap>", self._unmapped)  # the page is hidden (tab left, window minimized or withdrawn)
         self.refresh()
 
     @property
@@ -94,32 +95,58 @@ class CalibrationPanel(tk.Frame):
     def add_timing(self, kind: str, ms: int) -> None:
         if not self._measuring:
             return
-        if kind == "press_ms":
-            self._session.add_press(ms)
-        elif kind == "gap_ms":
-            self._session.add_gap(ms)
-        if self._session.done:
-            self.stop()
-        self._show()
+        try:
+            if kind == "press_ms":
+                self._session.add_press(ms)
+            elif kind == "gap_ms":
+                self._session.add_gap(ms)
+            if self._session.done:
+                self.stop()
+            self._show()
+        except Exception:
+            # a failing page must not leave the engine measuring (letters would stay muted)
+            log.exception("Kalibrierung: Messwert nicht verarbeitet")
+            self._release()
 
     def stop(self) -> None:
         """End the measuring (the results stay). Also called when the page is left."""
         if self._measuring:
+            try:
+                self._release()
+            finally:
+                self._show()
+
+    def controller_ended(self, reason: str) -> None:
+        """The controller ended the measuring itself (stop, time limit): drop the state, keep the results."""
+        if self._measuring:
             self._measuring = False
-            self._controller.set_calibrating(False)
             self._show()
+            if reason == "timeout":
+                self._notes.set(tr("calibration.timeout"))
 
     def refresh(self) -> None:
         """Settings changed elsewhere: show the current values and a matching measurement."""
-        # the steps depend on the key mode; a running measurement is not swapped under the user
-        if not self._measuring and (DOT in self._session.phases) == self._controller.settings.separate_dash_key:
+        # the steps depend on the key mode: measuring stops, the new mode starts a matching session
+        if (DOT in self._session.phases) == self._controller.settings.separate_dash_key:
+            self._release()
             self._new_session()
         self._show()
 
+    def _release(self) -> None:
+        """Measuring off, in the controller as well; never raises."""
+        self._measuring = False
+        try:
+            self._controller.set_calibrating(False)
+        except Exception:  # noqa: BLE001 - there is nothing more the page can do
+            log.exception("Kalibrierung: Messen konnte nicht beendet werden")
+
     def _destroyed(self, event: tk.Event) -> None:
         if event.widget is self and self._measuring:
-            self._measuring = False
-            self._controller.set_calibrating(False)
+            self._release()
+
+    def _unmapped(self, event: tk.Event) -> None:
+        if event.widget is self:
+            self.stop()
 
     def _new_session(self) -> None:
         self._session = calibration.Session(use_threshold=not self._controller.settings.separate_dash_key)
@@ -130,8 +157,12 @@ class CalibrationPanel(tk.Frame):
             return
         if self._session.done or not any(self._session.samples(p) for p in calibration.PHASES):
             self._new_session()
+        self._session.resume()  # starting resets the engine: the next press has no pause before it
+        if not self._controller.set_calibrating(True):
+            self._show()
+            self._notes.set(tr("calibration.not_running"))
+            return
         self._measuring = True
-        self._controller.set_calibrating(True)
         self._show()
 
     def _next_step(self) -> None:
@@ -145,17 +176,21 @@ class CalibrationPanel(tk.Frame):
         self._show()
 
     def _apply(self) -> None:
-        proposal = self._session.proposal()
+        self.stop()  # new values and a running measurement do not mix
+        proposal = self._session.proposal(word_was_off=self._controller.settings.word_gap_ms == 0)
         if not proposal.usable:
             self._notes.set(tr("calibration.nothing"))
             return
         try:
             new = calibration.apply_proposal(self._controller.settings, proposal)
             self._apply_settings(new)
+        except calibration.ApplyError as exc:
+            self._notes.set(tr(f"calibration.apply.{exc.code}", **exc.numbers))
+            return
         except Exception as exc:  # noqa: BLE001 - the settings page shows every refusal the same way
-            if not isinstance(exc, ValueError):
-                log.exception("Kalibrierung: Werte nicht übernommen")
-            self._notes.set(tr("calibration.apply_failed", msg=str(exc)))
+            # the text of Settings.validate is German only: log it, show the localized sentence
+            log.warning("Kalibrierung: Werte nicht übernommen: %s", exc, exc_info=not isinstance(exc, ValueError))
+            self._notes.set(tr("calibration.apply.failed"))
             return
         self._notes.set(tr("calibration.applied"))
         self._show(keep_notes=True)
@@ -165,7 +200,10 @@ class CalibrationPanel(tk.Frame):
         phase = session.phase
         if self._measuring and phase:
             self._state.set(tr("calibration.state.running", step=tr(f"calibration.step.{phase}")))
-            self._hint.set(tr(f"calibration.hint.{phase}", n=session.target))
+            hint = tr(f"calibration.hint.{phase}", n=session.target)
+            if phase in (DOT, DASH):
+                hint += " " + tr("calibration.hint.rhythm")
+            self._hint.set(hint)
         elif session.done:
             self._state.set(tr("calibration.state.done"))
             self._hint.set("")
@@ -176,7 +214,7 @@ class CalibrationPanel(tk.Frame):
         self._next_btn.set_enabled(self._measuring)
         self._restart_btn.set_enabled(self._measuring)
 
-        proposal = session.proposal()
+        proposal = session.proposal(word_was_off=settings.word_gap_ms == 0)
         groups = {DOT: proposal.dot, DASH: proposal.dash, LETTER: proposal.letter, WORD: proposal.word}
         for name in calibration.PHASES:
             samples = session.samples(name)
@@ -203,8 +241,12 @@ class CalibrationPanel(tk.Frame):
                 )
             )
         if not keep_notes:
-            parts = [tr(f"calibration.issue.{code}") for code in proposal.issues]
+            parts = [tr(f"calibration.issue.{code}", **proposal.details.get(code, {})) for code in proposal.issues]
             dropped = sum(g.dropped for g in groups.values())
             if dropped:
                 parts.append(tr("calibration.dropped", n=dropped))
+            if session.ignored:
+                parts.append(tr("calibration.ignored", n=session.ignored))
+            if not settings.enabled:
+                parts.append(tr("calibration.disabled_note"))
             self._notes.set(" ".join(parts))

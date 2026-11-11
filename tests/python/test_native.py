@@ -113,7 +113,7 @@ def test_word_gap_event():
         key(eng, 0.02)
         events.wait_for("word_gap")
         kinds = [k for k, _ in events.events]
-        assert kinds == ["press_ms", "symbol", "letter", "word_gap"]  # press_ms: the measured hold time, see calibration
+        assert kinds == ["symbol", "letter", "word_gap"]
     finally:
         eng.stop()
 
@@ -134,7 +134,7 @@ def test_reset_discards_pending_sequence(engine):
     key(engine, 0.02)
     engine.reset()
     time.sleep(0.1)
-    assert [k for k, _ in events.events] == ["press_ms", "symbol"]
+    assert [k for k, _ in events.events] == ["symbol"]
 
 
 def test_start_twice_fails(engine):
@@ -179,7 +179,7 @@ def test_callback_exception_does_not_kill_worker(engine):
             time.sleep(0.01)
     finally:
         sys.unraisablehook = old_hook
-    assert calls[:3] == ["press_ms", "symbol", "letter"]  # the worker survives the error
+    assert calls[:2] == ["symbol", "letter"]  # the worker survives the error
     assert len(errors) == 1
 
 
@@ -369,3 +369,85 @@ def test_function_key_api_on_the_real_module():
     eng.set_function_keys([(2, "F20", True)])
     eng.clear_function_keys()
     eng.set_function_keys([])
+
+
+# measuring (calibration): press_ms / gap_ms exist only while switched on
+def test_measuring_is_off_by_default_and_the_stream_is_the_old_one(engine):
+    events = EventCollector()
+    assert engine.measuring is False
+    engine.start(events, use_hook=False)
+    key(engine, 0.02)
+    key(engine, 0.30)
+    events.wait_for("letter")
+    assert [k for k, _ in events.events] == ["symbol", "symbol", "letter"]
+
+
+def test_measuring_reports_press_before_symbol_and_gap_at_the_second_press():
+    eng = core.MorseEngine(dot_threshold_ms=150, letter_gap_ms=2000, word_gap_ms=0)
+    events = EventCollector()
+    eng.start(events, use_hook=False)
+    try:
+        eng.set_measuring(True)
+        assert eng.measuring is True
+        eng.feed_press()  # first press: no gap
+        eng.feed_press()  # repeat of the held key: no gap, no new press
+        time.sleep(0.06)
+        eng.feed_release()
+        time.sleep(0.12)
+        eng.feed_press()
+        time.sleep(0.05)
+        eng.feed_release()
+        events.wait_for("symbol", 2)
+        kinds = [k for k, _ in events.events]
+        assert kinds == ["press_ms", "symbol", "gap_ms", "press_ms", "symbol"]
+        press1, _, gap, press2, _ = (int(p) if k.endswith("_ms") else p for k, p in events.events)
+        assert 50 <= press1 < 400
+        assert 100 <= gap < 600
+        assert 40 <= press2 < 400
+    finally:
+        eng.stop()
+
+
+def test_measuring_can_be_switched_while_running(engine):
+    events = EventCollector()
+    engine.start(events, use_hook=False)
+    key(engine, 0.02)
+    engine.set_measuring(True)
+    key(engine, 0.02)
+    engine.set_measuring(False)
+    key(engine, 0.02)
+    events.wait_for("letter")
+    kinds = [k for k, _ in events.events]
+    # only the middle key press was measured: its gap and its hold time
+    assert kinds == ["symbol", "gap_ms", "press_ms", "symbol", "symbol", "letter"]
+
+
+def test_stop_switches_measuring_off_and_start_uses_the_value_set_before():
+    eng = core.MorseEngine(dot_threshold_ms=150, letter_gap_ms=250, word_gap_ms=0)
+    try:
+        eng.set_measuring(True)  # before start: used by the worker from its first event
+        events = EventCollector()
+        eng.start(events, use_hook=False)
+        key(eng, 0.02)
+        assert events.wait_for("press_ms")
+        eng.stop()
+        assert eng.measuring is False
+        events = EventCollector()
+        eng.start(events, use_hook=False)
+        key(eng, 0.02)
+        events.wait_for("letter")
+        assert [k for k, _ in events.events] == ["symbol", "letter"]
+    finally:
+        eng.stop()
+
+
+def test_reset_forgets_the_gap_while_measuring(engine):
+    events = EventCollector()
+    engine.start(events, use_hook=False)
+    engine.set_measuring(True)
+    key(engine, 0.02)
+    engine.reset()
+    time.sleep(0.05)
+    key(engine, 0.02)
+    events.wait_for("letter")
+    assert "gap_ms" not in [k for k, _ in events.events]

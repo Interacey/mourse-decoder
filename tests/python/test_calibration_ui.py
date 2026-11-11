@@ -126,7 +126,7 @@ def test_a_refused_result_is_reported_and_nothing_changes(make_panel):
     page._next_step()
     feed(page, [("gap_ms", [1, 2200, 2200, 2200, 2200, 2200])])  # letter pause 1650 > unchanged word pause 1400
     page._apply()
-    assert page._notes.get().startswith("Not applied:") and "Wortpause" in page._notes.get()
+    assert page._notes.get().startswith("Not applied:") and "1650" in page._notes.get()
     assert page.controller.settings.letter_gap_ms == 600
 
 
@@ -200,3 +200,245 @@ def test_the_calibration_tab_is_registered_with_a_title_in_every_language():
     for path in locales.glob("*.json"):
         strings = json.loads(path.read_text(encoding="utf-8"))["strings"]
         assert english <= set(strings), path.name
+
+
+# --- review fixes: lifecycle of the measuring state, hints, localized messages ----------------------
+
+
+class ForwardEnd:
+    """What TrayApp does: the controller's end of measuring reaches the page."""
+
+    def __init__(self, page) -> None:
+        self.page = page
+
+    def on_calibration_ended(self, reason: str) -> None:
+        self.page.controller_ended(reason)
+
+
+def test_controller_stop_resets_the_page(make_panel, fake_engine, injector):
+    page = make_panel()
+    page.controller.set_listener(ForwardEnd(page))
+    page._toggle()
+    assert page.measuring
+    page.controller.stop()
+    assert not page.measuring and not page.controller.calibrating
+    assert "Press Start" in page._state.get() and page._start_btn._text == "Start"
+    page.controller.start()
+    fake_engine.letters("...")
+    assert injector.buffer == "S"
+
+
+def test_the_time_limit_resets_the_page_and_says_why(make_panel, fake_engine, injector):
+    page = make_panel()
+    page.controller.set_listener(ForwardEnd(page))
+    now = [0.0]
+    page.controller._clock = lambda: now[0]
+    page._toggle()
+    now[0] += page.controller.CALIBRATION_MAX_S
+    assert page.controller.check_calibration_timeout()
+    assert not page.measuring and "10 minutes" in page._notes.get()
+    fake_engine.letters("...")
+    assert injector.buffer == "S"
+
+
+def test_hiding_the_page_stops_measuring(make_panel, fake_engine, injector):
+    page = make_panel()
+    page._toggle()
+    page.event_generate("<Unmap>")
+    page.update()
+    assert not page.measuring and not page.controller.calibrating
+    fake_engine.letters("...")
+    assert injector.buffer == "S"
+
+
+def test_an_exception_in_the_page_does_not_leave_the_engine_measuring(make_panel, monkeypatch):
+    page = make_panel()
+    page._toggle()
+
+    def boom(ms):
+        raise RuntimeError("kaputt")
+
+    monkeypatch.setattr(page._session, "add_press", boom)
+    page.add_timing("press_ms", 100)
+    assert not page.measuring and not page.controller.calibrating
+
+
+def test_a_failing_controller_does_not_break_stop(make_panel, monkeypatch):
+    page = make_panel()
+    page._toggle()
+
+    def boom(on):
+        raise RuntimeError("engine gone")
+
+    monkeypatch.setattr(page.controller, "set_calibrating", boom)
+    page.stop()
+    assert not page.measuring
+
+
+def test_a_key_mode_change_while_measuring_stops_measuring(make_panel):
+    page = make_panel(separate_dash_key=True)
+    page._toggle()
+    assert page.measuring and page._session.phases == (cal.LETTER, cal.WORD)
+    page.controller.apply_settings(page.controller.settings.replace(separate_dash_key=False))
+    page.refresh()
+    assert not page.measuring and not page.controller.calibrating
+    assert page._session.phases == cal.PHASES
+
+
+def test_applying_stops_measuring_first(make_panel):
+    page = make_panel()
+    full_run(page)
+    page._toggle()  # a second run
+    assert page.measuring
+    page._apply()
+    assert not page.measuring and not page.controller.calibrating
+
+
+def test_start_on_a_stopped_controller_says_so(make_panel):
+    page = make_panel()
+    page.controller.stop()
+    page._toggle()
+    assert not page.measuring and "not running" in page._notes.get()
+
+
+def test_a_disabled_morse_input_still_measures_and_says_so(make_panel, fake_engine, injector):
+    page = make_panel(enabled=False)
+    assert "switched off" in page._notes.get()
+    page._toggle()
+    assert page.measuring
+    page.add_timing("press_ms", 110)
+    assert page._progress["dot"].get() == "1 / 6"
+    fake_engine.letters("...")
+    assert injector.buffer == ""
+
+
+def test_the_dot_step_shows_no_shortage_of_dashes(make_panel):
+    page = make_panel()
+    page._toggle()
+    feed(page, [("press_ms", DOTS[:2])])
+    assert "dashes" not in page._notes.get()
+    assert "Too few dots" in page._notes.get()
+    assert "one right after the other" in page._hint.get()
+    feed(page, [("press_ms", DOTS[2:])])
+    assert page._notes.get() == ""  # dashes are not reached yet, nothing is missing
+
+
+def test_first_pause_after_a_start_counts_in_a_separate_key_session(make_panel):
+    page = make_panel(separate_dash_key=True)
+    page._toggle()
+    page.add_timing("gap_ms", 800)  # press 1 brings no gap event, so this is the first real pause
+    assert page._progress["letter"].get().startswith("1 / 5")
+
+
+def test_a_resumed_measurement_does_not_lose_its_first_pause(make_panel):
+    page = make_panel(separate_dash_key=True)
+    page._toggle()
+    page.add_timing("gap_ms", 800)
+    page.stop()
+    page._toggle()  # the engine is reset again
+    page.add_timing("gap_ms", 820)
+    assert page._progress["letter"].get().startswith("2 / 5")
+
+
+def test_a_switched_off_word_pause_is_named_before_it_is_turned_on(make_panel):
+    page = make_panel(word_gap_ms=0)
+    full_run(page)
+    assert "switched off" in page._notes.get() and "turns it on" in page._notes.get()
+    page._apply()
+    assert page.controller.settings.word_gap_ms > 0
+
+
+def test_a_switched_off_word_pause_stays_off_without_the_word_step(make_panel):
+    page = make_panel(word_gap_ms=0)
+    page._toggle()
+    page._next_step()
+    page._next_step()
+    feed(page, [("gap_ms", [1] + LETTER_GAPS)])
+    page._apply()
+    assert page.controller.settings.word_gap_ms == 0 and page.controller.settings.letter_gap_ms > 0
+
+
+def test_a_clamped_value_is_explained_in_the_notes(make_panel):
+    page = make_panel()
+    page._toggle()
+    page._next_step()
+    page._next_step()
+    feed(page, [("gap_ms", [1, 9000, 9500, 9200, 9400, 9300])])
+    assert "outside the allowed range of 100 to 5000 ms" in page._notes.get()
+    assert page._results["letter"].get() == "now 600 ms, suggested 5000 ms"
+
+
+def test_bounce_is_counted_in_the_notes(make_panel):
+    page = make_panel()
+    page._toggle()
+    feed(page, [("press_ms", [5, 8, 12, 110])])
+    assert "ignored as contact bounce" in page._notes.get()
+
+
+def test_a_refused_result_is_localized_without_the_german_validation_text(make_panel):
+    set_language("es")
+    try:
+        page = make_panel()
+        page._toggle()
+        page._next_step()
+        page._next_step()
+        feed(page, [("gap_ms", [1, 2200, 2200, 2200, 2200, 2200])])
+        page._apply()
+        text = page._notes.get()
+        assert "1650" in text and "1400" in text and "pausa de palabra" in text and "Wortpause" not in text
+    finally:
+        set_language("en")
+
+
+def test_any_other_refusal_shows_the_localized_sentence_not_the_exception_text(make_panel):
+    page = make_panel()
+    full_run(page)
+    page._apply_settings = lambda new: (_ for _ in ()).throw(ValueError("Die Funktionstaste ..."))
+    page._apply()
+    assert page._notes.get() == "Not applied: the settings were refused. Check the settings page."
+
+
+def test_main_window_stops_measuring_on_unmap_hide_and_controller_end():
+    try:
+        from mourse_decoder.ui import main_window as main_mod
+    except Exception as exc:  # pystray needs an X display on Linux
+        pytest.skip(f"UI modules not importable here: {exc!r}")
+    from types import SimpleNamespace
+
+    calls: list[str] = []
+    page = SimpleNamespace(
+        stop=lambda: calls.append("stop"), controller_ended=lambda reason: calls.append(f"ended:{reason}")
+    )
+    root = SimpleNamespace(withdraw=lambda: calls.append("withdraw"))
+    window = object.__new__(main_mod.MainWindow)
+    window._root, window._pages = root, {"calibration": page}
+    window._on_unmap(SimpleNamespace(widget=SimpleNamespace()))  # an event of a child: ignored
+    assert calls == []
+    window._on_unmap(SimpleNamespace(widget=root))  # minimized or withdrawn
+    window.hide()
+    window.calibration_ended("timeout")
+    assert calls == ["stop", "stop", "withdraw", "ended:timeout"]
+    window._pages = {}  # page not opened yet: nothing to do
+    window._on_unmap(SimpleNamespace(widget=root))
+    window.calibration_ended("stopped")
+
+
+def test_the_tray_forwards_the_end_and_polls_the_time_limit():
+    try:
+        from mourse_decoder.ui import tray as tray_mod
+    except Exception as exc:  # pystray needs an X display on Linux
+        pytest.skip(f"UI modules not importable here: {exc!r}")
+    import queue
+    from types import SimpleNamespace
+
+    ended: list[str] = []
+    checks: list[int] = []
+    tray = object.__new__(tray_mod.TrayApp)
+    tray._ui_queue = queue.Queue()
+    tray._window = SimpleNamespace(calibration_ended=ended.append)
+    tray._controller = SimpleNamespace(check_calibration_timeout=lambda: checks.append(1))
+    tray.on_calibration_ended("timeout")
+    tray._ui_queue.get_nowait()()
+    assert ended == ["timeout"]
+    tray._poll_calibration()
+    assert checks == [1]

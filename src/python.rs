@@ -4,7 +4,13 @@
 //!
 //! * `MorseEngine`: starts/stops the worker and the global hook and calls a Python
 //!   callback `callback(kind: str, payload: str)` for every event, where `kind` is
-//!   one of "symbol", "letter", "word_gap".
+//!   one of "symbol", "letter", "word_gap". While `set_measuring(True)` is in force (the
+//!   calibration page; off by default, off again after `stop()`) there are two more:
+//!   "press_ms" (payload: whole milliseconds the key was held, sent right before the
+//!   "symbol" of that release) and "gap_ms" (payload: whole milliseconds of silence since
+//!   the last release, sent when a new press arrives; none for the first press, after a
+//!   `reset()`, or for the repeats of a held key). Without measuring the stream has only
+//!   the first three kinds, exactly as before.
 //! * `inject_text(text, char_delay_ms=None)`, `inject_backspaces(n)`: native text injection.
 //! * `begin_capture()`, `poll_capture()`, `cancel_capture()`: read the next key or
 //!   mouse button for the key binding.
@@ -34,6 +40,8 @@ struct EngineState {
     keys: MorseKeys,
     handle: Option<EngineHandle>,
     hooked: bool,
+    /// Press and gap events on or off; given to the worker at start and on every change.
+    measuring: bool,
 }
 
 impl EngineState {
@@ -91,6 +99,7 @@ impl PyMorseEngine {
                 },
                 handle: None,
                 hooked: false,
+                measuring: false,
             }),
         })
     }
@@ -120,9 +129,10 @@ impl PyMorseEngine {
             });
         };
 
-        let handle = EngineHandle::spawn_with(state.config, true, sink).map_err(|e| {
-            PyRuntimeError::new_err(format!("Worker-Thread konnte nicht starten: {e}"))
-        })?;
+        let handle =
+            EngineHandle::spawn_with(state.config, state.measuring, sink).map_err(|e| {
+                PyRuntimeError::new_err(format!("Worker-Thread konnte nicht starten: {e}"))
+            })?;
 
         #[cfg(feature = "native-io")]
         if use_hook {
@@ -151,6 +161,7 @@ impl PyMorseEngine {
                 crate::hooks::clear_route();
             }
             state.hooked = false;
+            state.measuring = false; // a new start never measures unless asked again
             state.handle.take()
         };
         // critical: join the worker WITHOUT holding the GIL. The worker may be waiting in
@@ -174,6 +185,21 @@ impl PyMorseEngine {
             handle.send(WorkerMessage::Configure(config));
         }
         Ok(())
+    }
+
+    /// Press and gap events ("press_ms", "gap_ms") on or off; off by default and after `stop()`.
+    /// Takes effect between the key events sent before and after the call, also while running.
+    fn set_measuring(&self, on: bool) {
+        let mut state = lock_or_recover(&self.state);
+        state.measuring = on;
+        if let Some(handle) = &state.handle {
+            handle.send(WorkerMessage::SetMeasuring(on));
+        }
+    }
+
+    #[getter]
+    fn measuring(&self) -> bool {
+        lock_or_recover(&self.state).measuring
     }
 
     /// Discards a half-keyed sequence (e.g. on an alphabet change).

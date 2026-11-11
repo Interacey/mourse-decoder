@@ -107,6 +107,7 @@ class MainWindow:
         root.minsize(900, 700)
         root.protocol("WM_DELETE_WINDOW", on_hide)  # the close button hides to the tray instead of quitting
         self._build()
+        root.bind("<Unmap>", self._on_unmap, add="+")  # minimize and withdraw end a calibration measurement
 
     def _build(self) -> None:
         root, settings = self._root, self._controller.settings
@@ -280,6 +281,15 @@ class MainWindow:
     def _stop_calibration(self) -> None:
         if (page := self._pages.get("calibration")) is not None:
             page.stop()  # measuring ends with the page, or the engine would stay silent
+
+    def _on_unmap(self, event: tk.Event) -> None:
+        if event.widget is self._root:  # the same event also comes from every child
+            self._stop_calibration()
+
+    def calibration_ended(self, reason: str) -> None:
+        """The controller ended the measuring itself (stop, time limit): the page drops its state."""
+        if (page := self._pages.get("calibration")) is not None:
+            page.controller_ended(reason)
 
     def show_tab(self, name: str) -> None:
         if name != "calibration":

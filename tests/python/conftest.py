@@ -35,6 +35,8 @@ class FakeEngine:
         self.callback: Callable[[str, str], None] | None = None
         self.configure_calls: list[tuple[int, int, int]] = []
         self.reset_calls = 0
+        self.measuring = False
+        self.measuring_calls: list[bool] = []
         self.started = False
         self.use_hook: bool | None = None
 
@@ -53,6 +55,10 @@ class FakeEngine:
 
     def reset(self) -> None:
         self.reset_calls += 1
+
+    def set_measuring(self, on: bool) -> None:
+        self.measuring = on
+        self.measuring_calls.append(on)
 
     def set_function_keys(self, entries: list[tuple[int, str, bool]]) -> None:
         if self.set_function_keys_error:
