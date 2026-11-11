@@ -419,8 +419,8 @@ def test_measuring_can_be_switched_while_running(engine):
     key(engine, 0.02)
     events.wait_for("letter")
     kinds = [k for k, _ in events.events]
-    # only the middle key press was measured: its gap and its hold time
-    assert kinds == ["symbol", "measuring", "gap_ms", "press_ms", "symbol", "measuring", "symbol", "letter"]
+    # only the middle key press was measured; each switch also reset the worker, so it has no gap
+    assert kinds == ["symbol", "measuring", "press_ms", "symbol", "measuring", "symbol", "letter"]
     assert [p for k, p in events.events if k == "measuring"] == ["1", "0"]
 
 

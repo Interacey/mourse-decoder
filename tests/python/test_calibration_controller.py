@@ -365,3 +365,107 @@ def test_stop_and_start_clear_the_muting_even_without_a_marker(fake_engine, inje
     controller.start()
     fake_engine.letters("...")
     assert injector.buffer == "S"
+
+
+# --- second review round ----------------------------------------------------------------------------
+
+
+def _wabun(fake_engine, injector):
+    return MorseController(fake_engine, injector, DictionaryManager(), Settings().replace(alphabet="wabun"))
+
+
+@pytest.mark.parametrize("measure_between", [False, True])
+def test_a_dakuten_after_a_measurement_does_not_turn_the_earlier_kana_into_a_voiced_one(
+    fake_engine, injector, measure_between
+):
+    controller = _wabun(fake_engine, injector)
+    controller.start()
+    fake_engine.letters(".-..")  # a kana that a dakuten would voice
+    typed = list(injector.calls)
+    if measure_between:
+        controller.set_calibrating(True)
+        fake_engine.emit("word_gap")  # the long pause of the measurement, muted
+        controller.set_calibrating(False)
+    fake_engine.letters("..")  # dakuten keyed first after the pause
+    new_calls = injector.calls[len(typed) :]
+    if measure_between:
+        assert ("backspace", 1) not in new_calls  # nothing to voice any more: it stands alone
+    else:
+        assert ("backspace", 1) in new_calls  # without measuring the combination works as before
+
+
+def test_half_entered_telecode_digits_do_not_cross_a_measurement(fake_engine, injector):
+    from mourse_decoder.decoders import TelecodeDecoder
+
+    class Store:
+        def lookup(self, code):
+            return "X" if code == "1234" else None
+
+        def close(self): ...
+
+    digits = {".----": "1", "..---": "2", "...--": "3", "....-": "4"}
+    outcomes = {}
+    for measure_between in (False, True):
+        engine, inj = type(fake_engine)(), type(injector)()
+        controller = MorseController(
+            engine, inj, DictionaryManager(), Settings(), decoder_factory=lambda _m, _a: TelecodeDecoder(Store(), digits)
+        )
+        controller.start()
+        engine.letters(".----", "..---")
+        if measure_between:
+            controller.set_calibrating(True)
+            controller.set_calibrating(False)
+        engine.letters("...--", "....-")
+        outcomes[measure_between] = inj.calls
+    assert ("backspace", 3) in outcomes[False]  # 1, 2, 3, 4 is the code 1234
+    assert ("backspace", 3) not in outcomes[True]  # the measurement cut the entry in two
+
+
+def test_the_decoder_is_reset_at_both_markers(fake_engine, injector):
+    controller = _wabun(fake_engine, injector)
+    controller.start()
+    resets = []
+    controller._decoder.reset = lambda: resets.append(1)
+    controller.set_calibrating(True)
+    controller.set_calibrating(False)
+    assert len(resets) == 2
+
+
+def test_switching_sends_no_separate_reset_to_the_engine(fake_engine, injector):
+    # the worker resets itself in the same step as the switch; a second message from here would leave a gap
+    controller = make(fake_engine, injector)
+
+    def boom():
+        raise AssertionError("engine.reset() called")
+
+    fake_engine.reset = boom
+    controller.set_calibrating(True)
+    controller.set_calibrating(False)
+    controller._end_calibrating("timeout")
+
+
+def test_a_letter_in_flight_while_stop_joins_the_worker_is_not_typed(fake_engine, injector):
+    class Lagging(type(fake_engine)):
+        def stop(self):
+            self.emit("letter", "...")  # the worker finishes a letter of the measuring phase while being joined
+            super().stop()
+
+    engine = Lagging()
+    controller = MorseController(engine, injector, DictionaryManager(), Settings())
+    controller.start()
+    controller.set_calibrating(True)
+    controller.stop()
+    assert injector.buffer == "" and injector.calls == []
+    controller.start()
+    engine.letters("...")
+    assert injector.buffer == "S"  # the muting ended with the stop
+
+
+def test_no_backspaces_are_sent_for_a_letter_that_arrives_while_the_program_stops(fake_engine, injector):
+    from mourse_decoder.decoders import Emission
+
+    controller = make(fake_engine, injector)
+    controller._stopping = True
+    with pytest.raises(Exception, match="beendet"):
+        controller._emit_steps(Emission("x", erase=2))
+    assert ("backspace", 2) not in injector.calls

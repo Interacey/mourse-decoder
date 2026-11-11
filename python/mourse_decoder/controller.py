@@ -297,7 +297,8 @@ class MorseController:
 
         Measuring needs a running controller (False otherwise). It also ends by itself: ``stop()``, a
         listener that was told ``on_calibration_ended``, or ``CALIBRATION_MAX_S`` after the start.
-        The engine is reset on every change, with this effect:
+        The engine worker resets itself in the same step as the switch (one message, so no queued key
+        event can slip in between), and the decoder is reset when the marker arrives:
 
         * on: a letter whose pause ran out before the switch is typed, a half-keyed one is dropped;
         * off: every letter of the measuring phase is dropped, also one that is still on its way to
@@ -315,9 +316,7 @@ class MorseController:
             self._calibrating = on
             self._calibration_started = self._clock()
             self._engine.set_measuring(on)
-            if self._running:
-                self._engine.reset()
-            elif not on:
+            if not self._running and not on:
                 self._muted = False
             return on
 
@@ -335,11 +334,7 @@ class MorseController:
             if not self._calibrating:
                 return
             self._calibrating = False
-            self._engine.set_measuring(False)
-            if self._running:
-                self._engine.reset()
-            else:
-                self._muted = False
+            self._engine.set_measuring(False)  # ``_muted`` ends with the marker, or in ``stop`` after the join
         if getattr(self._listener, "on_calibration_ended", None) is not None:
             self._notify("on_calibration_ended", reason)
 
@@ -375,6 +370,8 @@ class MorseController:
         self._engine.block_input = False  # never leave the key blocked behind
         self._engine.clear_function_keys()
         self._engine.stop()
+        with self._lock:
+            self._muted = False  # only now: a letter of the measuring phase may still have been on its way
 
     def apply_settings(self, new: Settings) -> None:
         errors = new.validate() or self._function_keys.clashes(new)
@@ -644,6 +641,7 @@ class MorseController:
                 self._handle_word_gap()
             elif kind == "measuring":
                 self._muted = payload == "1"
+                self._reset_decoder()  # a half-keyed combination (dakuten, digits) does not cross the switch
             elif kind in ("press_ms", "gap_ms"):
                 self._handle_timing(kind, payload)
             else:
@@ -722,6 +720,7 @@ class MorseController:
         self._run_typed, self._run_touched = 0, False
         try:
             if emission.erase:
+                self._stop_if_switched_off()  # before the first key is sent, not after the backspaces
                 self._run_touched = True
                 self._injector.inject_backspaces(emission.erase)
                 for _ in range(min(emission.erase, len(self.history))):

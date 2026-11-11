@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import itertools
+
 import pytest
 from mourse_decoder import calibration as cal
 from mourse_decoder.controller import MorseController
@@ -119,15 +121,17 @@ def test_apply_without_a_suggestion_says_so(make_panel):
     assert page.applied == []
 
 
-def test_a_refused_result_is_reported_and_nothing_changes(make_panel):
+def test_a_letter_pause_that_reaches_the_word_pause_takes_the_word_pause_along(make_panel):
     page = make_panel()
     page._toggle()
     page._next_step()
     page._next_step()
     feed(page, [("gap_ms", [1, 2200, 2200, 2200, 2200, 2200])])  # letter pause 1650 > unchanged word pause 1400
+    assert page._results["word"].get() == "now 1400 ms, suggested 2475 ms"  # shown before applying
+    assert "raised to 2475 ms as well" in page._notes.get()
     page._apply()
-    assert page._notes.get().startswith("Not applied:") and "1650" in page._notes.get()
-    assert page.controller.settings.letter_gap_ms == 600
+    s = page.controller.settings
+    assert (s.letter_gap_ms, s.word_gap_ms) == (1650, 2475)
 
 
 def test_too_few_or_overlapping_samples_show_the_reason(make_panel):
@@ -271,8 +275,7 @@ def test_a_failing_controller_does_not_break_stop(make_panel, monkeypatch):
         raise RuntimeError("engine gone")
 
     monkeypatch.setattr(page.controller, "set_calibrating", boom)
-    page.stop()
-    assert not page.measuring
+    page.stop()  # logs, does not raise
 
 
 def test_a_key_mode_change_while_measuring_stops_measuring(make_panel):
@@ -383,9 +386,8 @@ def test_a_refused_result_is_localized_without_the_german_validation_text(make_p
         page._next_step()
         page._next_step()
         feed(page, [("gap_ms", [1, 2200, 2200, 2200, 2200, 2200])])
-        page._apply()
         text = page._notes.get()
-        assert "1650" in text and "1400" in text and "pausa de palabra" in text and "Wortpause" not in text
+        assert "1650" in text and "1400" in text and "2475" in text and "pausa de palabra" in text
     finally:
         set_language("en")
 
@@ -442,3 +444,87 @@ def test_the_tray_forwards_the_end_and_polls_the_time_limit():
     assert ended == ["timeout"]
     tray._poll_calibration()
     assert checks == [1]
+
+
+# --- second review round: one truth for page and controller -----------------------------------------
+
+
+def test_a_late_timeout_notice_does_not_touch_a_measurement_started_after_it(make_panel, fake_engine, injector):
+    page = make_panel()  # no listener: the notice stays in "the UI queue" until the test delivers it
+    page._toggle()
+    page.controller._calibration_started -= page.controller.CALIBRATION_MAX_S + 1
+    assert page.controller.check_calibration_timeout()
+    page._toggle()  # the button still said "Stop" (the notice waits in the UI queue): this stops, nothing more
+    assert not page.measuring
+    page._toggle()  # a new measurement
+    assert page.measuring and page.controller.calibrating
+    page.controller_ended("timeout")  # the old notice arrives now
+    assert page.measuring and page.controller.calibrating  # page and controller still agree
+    fake_engine.letters("...")
+    assert injector.buffer == ""
+    page.stop()
+    assert not page.controller.calibrating
+    fake_engine.letters("...")
+    assert injector.buffer == "S"
+
+
+def test_a_stale_page_flag_cannot_keep_the_controller_measuring(make_panel, fake_engine, injector):
+    page = make_panel()
+    page._toggle()
+    page.controller.set_calibrating(False)  # the controller ended it, the page was not told
+    page.controller.set_calibrating(True)  # and something started it again
+    page.stop()  # leaving the tab has to switch it off, whatever the page believed
+    assert not page.controller.calibrating
+    fake_engine.letters("...")
+    assert injector.buffer == "S"
+
+
+@pytest.mark.parametrize("ops", list(itertools.product(("start", "stop", "unmap", "late_notice", "timeout"), repeat=3)))
+def test_measuring_can_never_stay_on_after_stop_unmap_or_destroy(make_panel, fake_engine, injector, ops):
+    page = make_panel()
+    page.controller.set_listener(ForwardEnd(page))
+    for op in ops:
+        if op == "start":
+            page._toggle()
+        elif op == "stop":
+            page.stop()
+        elif op == "unmap":
+            page.event_generate("<Unmap>")
+            page.update()
+        elif op == "late_notice":
+            page.controller_ended("timeout")
+        else:
+            page.controller._calibration_started -= page.controller.CALIBRATION_MAX_S + 1
+            page.controller.check_calibration_timeout()
+        assert page.measuring == page.controller.calibrating  # one truth
+    page.stop()
+    assert not page.controller.calibrating and not page.measuring
+    fake_engine.letters("...")
+    assert injector.buffer == "S"
+
+
+@pytest.mark.parametrize("ops", [("start",), ("start", "stop", "start"), ("start", "timeout", "start")])
+def test_destroying_the_page_ends_measuring_in_every_state(make_panel, fake_engine, injector, ops):
+    page = make_panel()
+    controller = page.controller
+    for op in ops:
+        if op == "timeout":
+            controller._calibration_started -= controller.CALIBRATION_MAX_S + 1
+            controller.check_calibration_timeout()
+        elif op == "stop":
+            page.stop()
+        else:
+            page._toggle()
+    page.destroy()
+    assert not controller.calibrating
+    fake_engine.letters("...")
+    assert injector.buffer == "S"
+
+
+def test_the_button_text_follows_the_controller(make_panel):
+    page = make_panel()
+    page._toggle()
+    assert page._start_btn._text == "Stop"
+    page.controller.set_calibrating(False)
+    page.controller_ended("stopped")
+    assert page._start_btn._text == "Start" and not page.measuring

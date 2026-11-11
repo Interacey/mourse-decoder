@@ -30,7 +30,7 @@ class CalibrationPanel(tk.Frame):
         self._controller = controller
         self._apply_settings = apply_settings
         self._session = calibration.Session(use_threshold=not controller.settings.separate_dash_key)
-        self._measuring = False
+        self._shown_measuring = False  # what the Start/Stop button shows, so a click means what it says
         self.columnconfigure(0, weight=1)
 
         tk.Label(
@@ -89,11 +89,12 @@ class CalibrationPanel(tk.Frame):
 
     @property
     def measuring(self) -> bool:
-        return self._measuring
+        """The controller's state: page and controller cannot disagree about it."""
+        return self._controller.calibrating
 
     # called on the UI thread via TrayApp.call_in_ui
     def add_timing(self, kind: str, ms: int) -> None:
-        if not self._measuring:
+        if not self.measuring:
             return
         try:
             if kind == "press_ms":
@@ -109,20 +110,24 @@ class CalibrationPanel(tk.Frame):
             self._release()
 
     def stop(self) -> None:
-        """End the measuring (the results stay). Also called when the page is left."""
-        if self._measuring:
-            try:
-                self._release()
-            finally:
-                self._show()
+        """End the measuring (the results stay). Also called when the page is left.
+
+        Always passed on to the controller (switching off is idempotent there), whatever the page thinks.
+        """
+        try:
+            self._release()
+        finally:
+            self._show()
 
     def controller_ended(self, reason: str) -> None:
-        """The controller ended the measuring itself (stop, time limit): drop the state, keep the results."""
-        if self._measuring:
-            self._measuring = False
-            self._show()
-            if reason == "timeout":
-                self._notes.set(tr("calibration.timeout"))
+        """The controller ended the measuring itself (stop, time limit): show the state, keep the results.
+
+        The notice can be late (it waits in the UI queue); if a new measurement runs by now it is stale and
+        only the display is refreshed.
+        """
+        self._show()
+        if reason == "timeout" and not self.measuring:
+            self._notes.set(tr("calibration.timeout"))
 
     def refresh(self) -> None:
         """Settings changed elsewhere: show the current values and a matching measurement."""
@@ -133,26 +138,33 @@ class CalibrationPanel(tk.Frame):
         self._show()
 
     def _release(self) -> None:
-        """Measuring off, in the controller as well; never raises."""
-        self._measuring = False
+        """Measuring off in the controller; never raises."""
         try:
             self._controller.set_calibrating(False)
         except Exception:  # noqa: BLE001 - there is nothing more the page can do
             log.exception("Kalibrierung: Messen konnte nicht beendet werden")
 
     def _destroyed(self, event: tk.Event) -> None:
-        if event.widget is self and self._measuring:
+        if event.widget is self:
             self._release()
 
     def _unmapped(self, event: tk.Event) -> None:
         if event.widget is self:
             self.stop()
 
+    def _proposal(self) -> calibration.Proposal:
+        settings = self._controller.settings
+        return self._session.proposal(
+            word_was_off=settings.word_gap_ms == 0,
+            word_gap_now=settings.word_gap_ms,
+            letter_gap_now=settings.letter_gap_ms,
+        )
+
     def _new_session(self) -> None:
         self._session = calibration.Session(use_threshold=not self._controller.settings.separate_dash_key)
 
     def _toggle(self) -> None:
-        if self._measuring:
+        if self._shown_measuring:  # the button says "Stop", even if the controller ended meanwhile
             self.stop()
             return
         if self._session.done or not any(self._session.samples(p) for p in calibration.PHASES):
@@ -162,7 +174,6 @@ class CalibrationPanel(tk.Frame):
             self._show()
             self._notes.set(tr("calibration.not_running"))
             return
-        self._measuring = True
         self._show()
 
     def _next_step(self) -> None:
@@ -177,16 +188,13 @@ class CalibrationPanel(tk.Frame):
 
     def _apply(self) -> None:
         self.stop()  # new values and a running measurement do not mix
-        proposal = self._session.proposal(word_was_off=self._controller.settings.word_gap_ms == 0)
+        proposal = self._proposal()
         if not proposal.usable:
             self._notes.set(tr("calibration.nothing"))
             return
         try:
             new = calibration.apply_proposal(self._controller.settings, proposal)
             self._apply_settings(new)
-        except calibration.ApplyError as exc:
-            self._notes.set(tr(f"calibration.apply.{exc.code}", **exc.numbers))
-            return
         except Exception as exc:  # noqa: BLE001 - the settings page shows every refusal the same way
             # the text of Settings.validate is German only: log it, show the localized sentence
             log.warning("Kalibrierung: Werte nicht übernommen: %s", exc, exc_info=not isinstance(exc, ValueError))
@@ -198,7 +206,8 @@ class CalibrationPanel(tk.Frame):
     def _show(self, keep_notes: bool = False) -> None:
         session, settings = self._session, self._controller.settings
         phase = session.phase
-        if self._measuring and phase:
+        measuring = self._shown_measuring = self.measuring
+        if measuring and phase:
             self._state.set(tr("calibration.state.running", step=tr(f"calibration.step.{phase}")))
             hint = tr(f"calibration.hint.{phase}", n=session.target)
             if phase in (DOT, DASH):
@@ -210,11 +219,11 @@ class CalibrationPanel(tk.Frame):
         else:
             self._state.set(tr("calibration.state.idle"))
             self._hint.set(tr("calibration.separate_note") if settings.separate_dash_key else "")
-        self._start_btn.set_text(tr("calibration.stop") if self._measuring else tr("calibration.start"))
-        self._next_btn.set_enabled(self._measuring)
-        self._restart_btn.set_enabled(self._measuring)
+        self._start_btn.set_text(tr("calibration.stop") if measuring else tr("calibration.start"))
+        self._next_btn.set_enabled(measuring)
+        self._restart_btn.set_enabled(measuring)
 
-        proposal = session.proposal(word_was_off=settings.word_gap_ms == 0)
+        proposal = self._proposal()
         groups = {DOT: proposal.dot, DASH: proposal.dash, LETTER: proposal.letter, WORD: proposal.word}
         for name in calibration.PHASES:
             samples = session.samples(name)

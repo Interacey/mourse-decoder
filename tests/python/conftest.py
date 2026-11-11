@@ -61,7 +61,8 @@ class FakeEngine:
     def set_measuring(self, on: bool) -> None:
         self.measuring = on
         self.measuring_calls.append(on)
-        if self.started:  # the real worker answers with a marker at the place of the switch
+        if self.started:  # the real worker resets itself and answers with a marker at the place of the switch
+            self.reset_calls += 1
             self.pending_acks.append("1" if on else "0")
             if not self.hold_acks:
                 self.release_acks()

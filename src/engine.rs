@@ -38,7 +38,8 @@ pub enum WorkerMessage {
     Reset,
     /// Switches the measuring of press times and gaps on or off (see [`run_worker_with`]).
     /// It sits in the same queue as the key events, so it takes effect exactly between the
-    /// events sent before and after it (the timestamp is the moment of the switch), and the worker answers with
+    /// events sent before and after it (the timestamp is the moment of the switch). The worker also resets
+    /// the timer then, in the same step, and answers with
     /// [`TimerOutput::Measuring`] at that place of the output stream.
     SetMeasuring(bool, Instant),
     Shutdown,
@@ -148,6 +149,9 @@ pub fn run_worker_with<F>(
                 }
                 measure = on;
                 sink(TimerOutput::Measuring(on)); // the marker the controller sorts letters by
+                                                  // a half-keyed letter and the last release belong to the old phase. Done here and not by a
+                                                  // separate Reset message: a press queued in between would still catch up a due pause
+                timer.reset();
             }
             // a half-keyed sequence is dropped on stop on purpose, a letter typed
             // afterwards would be a surprise
@@ -321,10 +325,11 @@ mod tests {
         send(key(0, 50)); // off: symbol only
         tx.send(WorkerMessage::SetMeasuring(true, past + ms(55)))
             .unwrap();
-        send(key(80, 85)); // on: gap 30 and press 5
-        tx.send(WorkerMessage::SetMeasuring(false, past + ms(90)))
+        send(key(80, 85)); // on: press 5 (the switch forgot the earlier release, so no gap)
+        send(key(100, 105)); // on: gap 15 and press 5
+        tx.send(WorkerMessage::SetMeasuring(false, past + ms(110)))
             .unwrap();
-        send(key(100, 150)); // off again
+        send(key(130, 180)); // off again, the open letter ".." is gone
         drop(tx);
         let mut outputs = Vec::new();
         run_worker(rx, fast_config(), |o| outputs.push(o));
@@ -333,20 +338,20 @@ mod tests {
             vec![
                 TimerOutput::Symbol(Symbol::Dash),
                 TimerOutput::Measuring(true),
-                TimerOutput::Gap(ms(30)),
+                TimerOutput::Press(ms(5)),
+                TimerOutput::Symbol(Symbol::Dot),
+                TimerOutput::Gap(ms(15)),
                 TimerOutput::Press(ms(5)),
                 TimerOutput::Symbol(Symbol::Dot),
                 TimerOutput::Measuring(false),
                 TimerOutput::Symbol(Symbol::Dash),
-                TimerOutput::Letter("-.-".into()),
+                TimerOutput::Letter("-".into()),
             ]
         );
     }
 
     #[test]
-    fn a_key_held_while_measuring_starts_still_reports_its_press_time_at_release() {
-        // the Python side resets the engine when it switches measuring on, so a press that began
-        // before the switch normally does not exist; without the reset the worker reports it
+    fn a_key_held_while_measuring_switches_is_forgotten_by_the_switch() {
         let (tx, rx) = mpsc::channel();
         let past = Instant::now() - ms(10_000);
         tx.send(WorkerMessage::Press(past)).unwrap();
@@ -356,15 +361,7 @@ mod tests {
         drop(tx);
         let mut outputs = Vec::new();
         run_worker(rx, fast_config(), |o| outputs.push(o));
-        assert_eq!(
-            outputs,
-            vec![
-                TimerOutput::Measuring(true),
-                TimerOutput::Press(ms(50)),
-                TimerOutput::Symbol(Symbol::Dash),
-                TimerOutput::Letter("-".into()),
-            ]
-        );
+        assert_eq!(outputs, vec![TimerOutput::Measuring(true)]);
     }
 
     #[test]
@@ -387,6 +384,54 @@ mod tests {
                 TimerOutput::Symbol(Symbol::Dot),
                 TimerOutput::Letter(".".into()),
                 TimerOutput::Measuring(true),
+            ]
+        );
+    }
+
+    #[test]
+    fn switching_resets_the_timer_in_the_same_step_without_a_separate_reset() {
+        // "." is due at the switch (before the marker). The press that follows is queued right behind
+        // the switch: it must not catch up anything or measure a gap to the old phase
+        let (tx, rx) = mpsc::channel();
+        let past = Instant::now() - ms(10_000);
+        tx.send(WorkerMessage::Press(past)).unwrap();
+        tx.send(WorkerMessage::Release(past + ms(5))).unwrap();
+        tx.send(WorkerMessage::SetMeasuring(true, past + ms(500)))
+            .unwrap();
+        tx.send(WorkerMessage::Press(past + ms(520))).unwrap();
+        tx.send(WorkerMessage::Release(past + ms(525))).unwrap();
+        drop(tx);
+        let mut outputs = Vec::new();
+        run_worker(rx, fast_config(), |o| outputs.push(o));
+        assert_eq!(
+            outputs,
+            vec![
+                TimerOutput::Symbol(Symbol::Dot),
+                TimerOutput::Letter(".".into()),
+                TimerOutput::Measuring(true),
+                TimerOutput::Press(ms(5)),
+                TimerOutput::Symbol(Symbol::Dot),
+                TimerOutput::Letter(".".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_half_keyed_letter_is_dropped_by_the_switch_off() {
+        let (tx, rx) = mpsc::channel();
+        let past = Instant::now() - ms(10_000);
+        tx.send(WorkerMessage::Press(past)).unwrap();
+        tx.send(WorkerMessage::Release(past + ms(5))).unwrap();
+        tx.send(WorkerMessage::SetMeasuring(false, past + ms(10)))
+            .unwrap(); // pause not over yet
+        drop(tx);
+        let mut outputs = Vec::new();
+        run_worker(rx, fast_config(), |o| outputs.push(o));
+        assert_eq!(
+            outputs,
+            vec![
+                TimerOutput::Symbol(Symbol::Dot),
+                TimerOutput::Measuring(false)
             ]
         );
     }

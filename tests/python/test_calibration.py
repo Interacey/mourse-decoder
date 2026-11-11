@@ -113,7 +113,8 @@ def test_values_are_clamped_to_the_settings_ranges():
 def test_a_letter_pause_that_the_range_raises_above_the_real_pauses_is_refused():
     # 0.75 * 50 = 37 would be raised to the minimum of 100: longer than every pause the user makes
     p = cal.propose([], [], [50] * 3, [80] * 3)
-    assert p.letter_gap_ms is None and cal.LETTER_TOO_CLOSE in p.issues
+    assert p.letter_gap_ms is None
+    assert cal.LETTER_BELOW_RANGE in p.issues and cal.LETTER_TOO_CLOSE not in p.issues  # no inner pauses were measured
 
 
 def test_a_clamped_word_pause_stays_longer_than_the_letter_pause():
@@ -139,13 +140,13 @@ def test_apply_only_touches_suggested_values():
     assert (new.letter_gap_ms, new.word_gap_ms) == (600, 1400)
 
 
-def test_apply_refuses_a_result_that_breaks_the_word_pause_rule():
-    # letter pause 1650 would not be shorter than the unchanged word pause 1400
-    p = cal.propose([], [], [2200] * 3, [1000] * 3)
-    assert p.letter_gap_ms == 1650 and p.word_gap_ms is None
-    with pytest.raises(cal.ApplyError) as caught:
-        cal.apply_proposal(Settings(), p)
-    assert caught.value.code == "word_not_longer" and caught.value.numbers == {"letter": 1650, "word": 1400}
+def test_apply_raises_the_unchanged_word_pause_instead_of_refusing_everything():
+    # letter pause 1650 would not be shorter than the unchanged word pause 1400: the threshold and the
+    # letter pause are applied and the word pause goes to 1.5 times the letter pause
+    p = cal.propose(DOTS, DASHES, [2200] * 3, [1000] * 3)
+    assert p.letter_gap_ms == 1650 and p.word_gap_ms is None and p.dot_threshold_ms
+    new = cal.apply_proposal(Settings(), p)
+    assert (new.dot_threshold_ms, new.letter_gap_ms, new.word_gap_ms) == (p.dot_threshold_ms, 1650, 2475)
 
 
 def test_session_runs_through_all_steps():
@@ -406,3 +407,130 @@ def test_apply_with_a_switched_off_word_pause_only_changes_it_with_word_samples(
     assert cal.apply_proposal(off, letters_only).word_gap_ms == 0
     with_words = cal.propose([], [], LETTERS, WORDS, word_was_off=True)
     assert cal.apply_proposal(off, with_words).word_gap_ms == with_words.word_gap_ms
+
+
+# --- second review round ----------------------------------------------------------------------------
+
+
+def test_a_slow_keyer_with_a_skipped_word_step_keeps_the_threshold_and_raises_the_word_pause():
+    # review case: letter pauses around 2000, default word pause 1400, word step left out
+    s = cal.Session()
+    for presses in (DOTS, DASHES):
+        for ms in presses:
+            s.add_press(ms)
+    s.add_gap(9000)
+    for ms in (2000, 2100, 1900, 2050, 1950):
+        s.add_gap(ms)
+    p = s.proposal(word_gap_now=1400)
+    assert (p.dot_threshold_ms, p.letter_gap_ms) == (219, 1500)
+    assert p.word_gap_ms == 2250 and cal.WORD_RAISED in p.issues
+    assert p.details[cal.WORD_RAISED] == {"old": 1400, "letter": 1500, "value": 2250}
+    new = cal.apply_proposal(Settings(), p)
+    assert (new.dot_threshold_ms, new.letter_gap_ms, new.word_gap_ms) == (219, 1500, 2250)
+
+
+def test_apply_works_without_the_hint_of_propose():
+    p = cal.propose(DOTS, DASHES, [2000, 2100, 1900, 2050, 1950], [])  # no word_gap_now given
+    assert p.word_gap_ms is None
+    new = cal.apply_proposal(Settings(), p)
+    assert new.letter_gap_ms == 1500 and new.word_gap_ms == 2250 and new.dot_threshold_ms == 219
+
+
+def test_a_switched_off_word_pause_is_not_raised():
+    p = cal.propose([], [], [2000, 2100, 1900, 2050, 1950], [], word_gap_now=0)
+    assert p.word_gap_ms is None and cal.WORD_RAISED not in p.issues
+    assert cal.apply_proposal(Settings().replace(word_gap_ms=0), p).word_gap_ms == 0
+
+
+def test_a_measured_word_pause_is_never_replaced_by_the_raise():
+    p = cal.propose([], [], LETTERS, WORDS, word_gap_now=700)
+    assert cal.WORD_RAISED not in p.issues and p.word_gap_ms == round(math.sqrt(850 * 2150))
+
+
+def test_apply_never_produces_invalid_settings_and_keeps_every_valid_value():
+    import random
+
+    rng = random.Random(1)
+    bases = [
+        Settings(),
+        Settings(word_gap_ms=0),
+        Settings(letter_gap_ms=3000, word_gap_ms=4000),
+        Settings(dot_threshold_ms=50, letter_gap_ms=100, word_gap_ms=101),
+        Settings(letter_gap_ms=5000, word_gap_ms=15000),
+    ]
+    conflicts = 0
+    for _ in range(1500):
+        s = cal.Session(use_threshold=rng.random() < 0.8)
+        for _ in range(rng.randint(0, 60)):
+            r = rng.random()
+            if r < 0.45:
+                s.add_press(rng.choice([rng.randint(0, 6000), rng.randint(30, 150), rng.randint(150, 600)]))
+            elif r < 0.9:
+                s.add_gap(rng.choice([rng.randint(0, 31000), rng.randint(30, 300), rng.randint(200, 3000)]))
+            elif r < 0.95:
+                s.next_step()
+            else:
+                s.restart_step()
+        for base in bases:
+            p = s.proposal(
+                word_was_off=base.word_gap_ms == 0, word_gap_now=base.word_gap_ms, letter_gap_now=base.letter_gap_ms
+            )
+            if not p.usable:
+                continue
+            new = cal.apply_proposal(base, p)  # never raises
+            assert new.validate() == []
+            assert DOT_THRESHOLD_RANGE[0] <= new.dot_threshold_ms <= DOT_THRESHOLD_RANGE[1]
+            assert LETTER_GAP_RANGE[0] <= new.letter_gap_ms <= LETTER_GAP_RANGE[1]
+            assert new.word_gap_ms == 0 or new.word_gap_ms > new.letter_gap_ms
+            for name, value in (("dot_threshold_ms", p.dot_threshold_ms), ("letter_gap_ms", p.letter_gap_ms)):
+                if value is not None:
+                    assert getattr(new, name) == value  # the valid values are all taken
+            if p.word_gap_ms is not None:
+                assert new.word_gap_ms == p.word_gap_ms  # what the page shows is what is applied
+            conflicts += cal.WORD_RAISED in p.issues
+    assert conflicts > 50  # the generator does reach the conflict
+
+
+def test_bimodal_dots_get_an_overlap_hint_with_the_numbers():
+    p = cal.propose([60, 60, 60, 300, 300, 300], [400] * 6, [], [])
+    assert p.dot_threshold_ms == 268  # still the best single value
+    assert p.issues == (cal.THRESHOLD_OVERLAPS,)
+    assert p.details[cal.THRESHOLD_OVERLAPS] == {"value": 268, "dot_max": 300, "dash_min": 400}
+
+
+def test_a_clean_threshold_has_no_overlap_hint():
+    assert cal.THRESHOLD_OVERLAPS not in cal.propose(DOTS, DASHES, [], []).issues
+
+
+def test_dashes_that_dip_below_the_threshold_are_reported_too():
+    p = cal.propose([100] * 6, [113, 150, 150, 150, 150, 150], [], [])  # the 113 is kept (25 % floor)
+    assert p.dot_threshold_ms == 122 and cal.THRESHOLD_OVERLAPS in p.issues
+
+
+def test_letter_pauses_that_are_shorter_than_the_suggestion_are_reported():
+    p = cal.propose([100] * 6, [400] * 6, [400, 800, 1200, 600, 1000], [])
+    assert p.letter_gap_ms == 600
+    assert cal.LETTER_PAUSES_SHORTER in p.issues
+    assert p.details[cal.LETTER_PAUSES_SHORTER] == {"value": 600, "low": 400}
+
+
+def test_even_letter_pauses_have_no_hint():
+    assert cal.LETTER_PAUSES_SHORTER not in cal.propose([], [], LETTERS, WORDS).issues
+
+
+def test_tiny_letter_pauses_without_inner_pauses_get_their_own_reason():
+    # separate dash key: no inner pauses were measured, so the text must not talk about them
+    p = cal.propose([], [], [90, 100, 110, 95, 105], [], steps=("letter", "word"), current=None)
+    assert p.letter_gap_ms is None
+    assert cal.LETTER_BELOW_RANGE in p.issues and cal.LETTER_TOO_CLOSE not in p.issues
+    assert p.details[cal.LETTER_BELOW_RANGE] == {"letter": 100, "low": 100}
+
+
+def test_inner_pauses_that_are_too_close_keep_the_old_reason():
+    p = cal.propose([], [], LETTERS, WORDS, inner=[600, 650, 700, 640, 660])
+    assert cal.LETTER_TOO_CLOSE in p.issues and cal.LETTER_BELOW_RANGE not in p.issues
+
+
+def test_a_measured_word_pause_below_the_letter_pause_that_stays_is_not_suggested():
+    p = cal.propose([], [], [35] * 3, [148] * 3, letter_gap_now=600)  # letter pause refused, 600 stays
+    assert p.letter_gap_ms is None and p.word_gap_ms is None and cal.WORDS_NOT_LONGER in p.issues

@@ -26,6 +26,12 @@ clamped value is reported with a ``clamped_*`` hint):
   ``word median >= 1.5 * letter median``. It can only come from samples of the word step, so a word
   pause that is switched off (0) is never turned on without that step; ``word_was_off`` says so.
 * every value needs at least 3 valid samples after outlier rejection.
+
+Hints that leave the suggestion in place (the best single value is still better than none): ``threshold_overlaps``
+(single dots or dashes lie on the wrong side of the threshold), ``letter_pauses_shorter`` (some of the user's
+letter pauses are shorter than the suggested pause and would run letters together). Refused: no threshold
+between the medians, no letter pause above the inner pauses or below the allowed range of the settings.
+A word pause that the new letter pause would reach is raised together with it (``word_raised``).
 """
 
 from __future__ import annotations
@@ -71,6 +77,10 @@ THRESHOLD_UNUSABLE = "threshold_unusable"
 LETTER_RAISED = "letter_raised"
 LETTER_TOO_CLOSE = "letter_too_close"
 WORD_WAS_OFF = "word_was_off"
+WORD_RAISED = "word_raised"
+THRESHOLD_OVERLAPS = "threshold_overlaps"
+LETTER_PAUSES_SHORTER = "letter_pauses_shorter"
+LETTER_BELOW_RANGE = "letter_below_range"
 
 
 def reject_outliers(samples: Sequence[int | float]) -> list[int | float]:
@@ -96,6 +106,7 @@ class Group:
     valid: int
     dropped: int
     high: int | None = None  # the largest valid sample, None like the median
+    low: int | None = None  # the smallest valid sample, None like the median
 
 
 def summarize(samples: Sequence[int | float]) -> Group:
@@ -103,7 +114,7 @@ def summarize(samples: Sequence[int | float]) -> Group:
     dropped = len(samples) - len(kept)
     if len(kept) < MIN_SAMPLES:
         return Group(None, len(kept), dropped)
-    return Group(round(statistics.median(kept)), len(kept), dropped, round(max(kept)))
+    return Group(round(statistics.median(kept)), len(kept), dropped, round(max(kept)), round(min(kept)))
 
 
 @dataclass(frozen=True)
@@ -139,6 +150,8 @@ def propose(
     steps: Sequence[str] | None = None,
     current: str | None = None,
     word_was_off: bool = False,
+    word_gap_now: int | None = None,
+    letter_gap_now: int | None = None,
 ) -> Proposal:
     """Suggested settings for the measured samples (see the module text for the formulas).
 
@@ -146,6 +159,10 @@ def propose(
     ``current`` tell which steps the session has (and the one being measured, None when finished): a
     shortage is only reported for the current and the earlier steps, not for steps not reached yet.
     Without ``steps`` a shortage is reported for both steps of a pair as soon as one has samples.
+    ``word_gap_now`` is the word pause in the settings: if the suggested letter pause would reach it and no
+    word pause was measured, the word pause is raised with it (``word_raised``), so that applying never has
+    to refuse the valid values. ``letter_gap_now`` is the letter pause in the settings: a measured word pause
+    that would not be longer than the letter pause that stays is not suggested (``words_not_longer``).
     """
     dot, dash, letter, word = summarize(dots), summarize(dashes), summarize(letters), summarize(words)
     inner_group = summarize(inner)
@@ -186,6 +203,11 @@ def propose(
                 threshold = value
                 if value != wanted:
                     add(CLAMPED_THRESHOLD, wanted=wanted, value=value, low=low, high=high)
+                # the medians are a clear pair, but single samples may still lie on the wrong side: the
+                # suggestion stays (it is the best single value for these samples), the hint says how many
+                # of the user's own presses would be read the other way
+                if value <= dot.high or value >= dash.low:
+                    add(THRESHOLD_OVERLAPS, value=value, dot_max=dot.high, dash_min=dash.low)
 
     if reported(LETTER) and letter.median is None:
         add(TOO_FEW_LETTER)
@@ -201,14 +223,19 @@ def propose(
                 value = None  # the range ends before the pause would be long enough
         if value is not None and value >= letter.median:
             value = None  # it would cut about half of the user's own letter pauses
-        if value is None:
-            add(LETTER_TOO_CLOSE, inner=inner_group.high or 0, letter=letter.median)
+        if value is None and inner_group.high is None:
+            add(LETTER_BELOW_RANGE, letter=letter.median, low=low)  # no pauses inside letters were measured
+        elif value is None:
+            add(LETTER_TOO_CLOSE, inner=inner_group.high, letter=letter.median)
         else:
             letter_gap = value
             if raised:
                 add(LETTER_RAISED, inner=inner_group.high, value=value)
             elif value != wanted:
                 add(CLAMPED_LETTER, wanted=wanted, value=value, low=low, high=high)
+            # still a suggestion: it is the best single value, but the shorter pauses would not end a letter
+            if value > letter.low:
+                add(LETTER_PAUSES_SHORTER, value=value, low=letter.low)
 
     if reported(WORD):
         if word.median is None:
@@ -228,23 +255,29 @@ def propose(
             if word_was_off:
                 add(WORD_WAS_OFF, value=word_gap)
 
+    if word_gap is None and letter_gap is not None and word_gap_now and word_gap_now <= letter_gap:
+        word_gap = _raised_word_gap(letter_gap)
+        add(WORD_RAISED, old=word_gap_now, letter=letter_gap, value=word_gap)
+    effective_letter = letter_gap if letter_gap is not None else letter_gap_now
+    if word_gap is not None and effective_letter and word_gap <= effective_letter:
+        word_gap = None  # measured, but not longer than the letter pause that is in force
+        if WORDS_NOT_LONGER not in issues:
+            add(WORDS_NOT_LONGER)
+
     return Proposal(threshold, letter_gap, word_gap, dot, dash, letter, word, tuple(issues), details)
 
 
-class ApplyError(ValueError):
-    """A proposal cannot be applied; ``code`` and ``numbers`` give the page what it needs for its own text."""
-
-    def __init__(self, code: str, **numbers: int) -> None:
-        super().__init__(code)
-        self.code = code
-        self.numbers = numbers
+def _raised_word_gap(letter_gap: int) -> int:
+    """The shortest word pause that is clearly longer than the letter pause (``MIN_RATIO`` times it)."""
+    return _clamp(math.ceil(MIN_RATIO * letter_gap), WORD_GAP_RANGE)
 
 
 def apply_proposal(settings: Settings, proposal: Proposal) -> Settings:
-    """``settings`` with the suggested values put in.
+    """``settings`` with the suggested values put in; every valid value is taken.
 
-    ``ApplyError`` if a word pause that was not suggested is then not longer than the new letter pause,
-    ValueError (German text of ``Settings.validate``) for anything else invalid; nothing is changed silently.
+    A word pause that was not suggested and would then not be longer than the new letter pause is raised
+    like ``propose(word_gap_now=...)`` does it, so the threshold and the letter pause are never lost to a
+    conflict. ValueError (German text of ``Settings.validate``) if the result is still invalid.
     """
     changes = {
         name: value
@@ -256,8 +289,8 @@ def apply_proposal(settings: Settings, proposal: Proposal) -> Settings:
         if value is not None
     }
     result = settings.replace(**changes)
-    if result.word_gap_ms and result.letter_gap_ms and result.word_gap_ms <= result.letter_gap_ms:
-        raise ApplyError("word_not_longer", letter=result.letter_gap_ms, word=result.word_gap_ms)
+    if result.word_gap_ms and result.word_gap_ms <= result.letter_gap_ms:
+        result = result.replace(word_gap_ms=_raised_word_gap(result.letter_gap_ms))
     if errors := result.validate():
         raise ValueError("; ".join(errors))
     return result
@@ -349,7 +382,9 @@ class Session:
             self._inner.get(self.phase, []).clear()
             self._skip_gap = True
 
-    def proposal(self, word_was_off: bool = False) -> Proposal:
+    def proposal(
+        self, word_was_off: bool = False, word_gap_now: int | None = None, letter_gap_now: int | None = None
+    ) -> Proposal:
         inner = self._inner[DOT] + self._inner[DASH]
         return propose(
             *(self._samples[p] for p in PHASES),
@@ -357,6 +392,8 @@ class Session:
             steps=self.phases,
             current=self.phase,
             word_was_off=word_was_off,
+            word_gap_now=word_gap_now,
+            letter_gap_now=letter_gap_now,
         )
 
     def _take(self, ms: int) -> None:
