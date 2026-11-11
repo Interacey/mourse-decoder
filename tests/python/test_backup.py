@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import stat
+import tempfile
 import zipfile
 from pathlib import Path
 
@@ -15,7 +16,17 @@ from mourse_decoder.backup import BackupError, export_bundle, import_bundle, ins
 from mourse_decoder.function_keys import SCHEMA_VERSION, FunctionKeys, FunctionKeysStore
 from mourse_decoder.settings import Settings, SettingsStore
 
-SQLITE = b"SQLite format 3\x00" + b"\x00" * 100
+
+def _real_telecode_db() -> bytes:
+    """A database built by the program's own builder, so the import's structure check sees the real schema."""
+    from mourse_decoder.telecode import build_database
+
+    with tempfile.TemporaryDirectory() as folder:
+        build_database([("0001", "一"), ("0002", "丁")], Path(folder) / "t.sqlite")
+        return (Path(folder) / "t.sqlite").read_bytes()
+
+
+SQLITE = _real_telecode_db()
 
 
 def make_config(root: Path) -> Path:
@@ -464,7 +475,7 @@ def test_total_size_limit_is_rejected(tmp_path, monkeypatch):
 
 
 def test_zip_bomb_ratio_is_rejected_before_unpacking(tmp_path):
-    bomb = b"{" + b" " * (3 * 1024 * 1024) + b"}"  # 3 MiB of blanks compress to a few KB
+    bomb = b"{" + b" " * (3 * 512 * 1024) + b"}"  # 1.5 MiB of blanks (under the 2 MiB file limit) compress to a few KB
     zip_path = build_zip(tmp_path / "z.zip", {"alphabets/a.json": bomb})
     assert zip_path.stat().st_size < 30_000
     assert_rejected(zip_path, tmp_path, "zip bomb")

@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from . import jsontext
+from .import_gate import ImportBusy, gate
 
 BUILTIN_SMILEY_DIR = Path(__file__).with_name("smiley_sets")
 
@@ -128,6 +129,7 @@ def import_smiley_file(source: Path, builtin_dir: Path, user_dir: Path) -> Smile
     A missing id is taken from the file name. Importing the same id again
     updates the user's set.
     """
+    _check_gate()
     try:
         data = parse_smiley_text(Path(source).read_text(encoding="utf-8-sig"))
     except (OSError, UnicodeDecodeError) as exc:
@@ -145,7 +147,16 @@ def import_smiley_file(source: Path, builtin_dir: Path, user_dir: Path) -> Smile
     return SmileySetInfo(set_id, str(data.get("name") or set_id), str(data.get("description") or ""), target, True)
 
 
+def _check_gate() -> None:
+    """A backup import is writing the config folder: refuse with the usual error, so the panel shows it."""
+    try:
+        gate.check()
+    except ImportBusy as exc:
+        raise SmileyError(str(exc)) from exc
+
+
 def delete_smiley_set(set_id: str, user_dir: Path) -> None:
+    _check_gate()
     path = user_dir / f"{set_id}.json"
     if not path.is_file():
         raise SmileyError(f"'{set_id}' ist kein eigenes Set und kann nicht gelöscht werden.")

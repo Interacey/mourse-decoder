@@ -21,6 +21,7 @@ from .dictionary import (
     _reject_duplicate_keys,
     load_alphabet,
 )
+from .import_gate import ImportBusy, gate
 
 NEW_ALPHABET_TEMPLATE: dict[str, object] = {
     "id": "mein-alphabet",
@@ -29,6 +30,15 @@ NEW_ALPHABET_TEMPLATE: dict[str, object] = {
     "extends": "common",
     "codes": {".-": "A", "-...": "B"},
 }
+
+
+def _check_gate() -> None:
+    """A backup import is writing the config folder: refuse with the usual error, so the panel shows it and
+    keeps the user's input."""
+    try:
+        gate.check()
+    except ImportBusy as exc:
+        raise AlphabetError(str(exc)) from exc
 
 
 def new_alphabet_text(alphabet_id: str = "mein-alphabet") -> str:
@@ -93,6 +103,7 @@ def save_alphabet_text(
     then fully validated with load_alphabet (extends included), and rolled back on failure so a broken
     file never stays behind.
     """
+    _check_gate()
     directory = _require_user_directory(manager)
     if fixes is not None:
         text, found = repair_alphabet_text(text)
@@ -172,6 +183,7 @@ def _refuse_if_extended(directory: Path, alphabet_id: str, what: str) -> None:
 
 def delete_alphabet(manager: DictionaryManager, alphabet_id: str) -> None:
     """Delete a user alphabet, unless another one still extends it."""
+    _check_gate()
     directory = _require_user_directory(manager)
     path = directory / f"{alphabet_id}.json"
     if not path.is_file():

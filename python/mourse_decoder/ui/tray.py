@@ -19,6 +19,7 @@ import pystray
 from ..controller import MorseController
 from ..dictionary import DictionaryManager
 from ..i18n import set_language, tr
+from ..import_gate import gate
 from ..settings import Settings, SettingsStore
 from ..triggers import binding_label
 from . import theme
@@ -91,6 +92,8 @@ class TrayApp:
             # one failing poll must not stop the others, and the loop must be scheduled again in any case
             polls = (self._poll_block, self._poll_cycle, self._poll_undo, self._poll_function_keys, self._poll_hook)
             for poll in polls:
+                if poll in (self._poll_block, self._poll_cycle) and gate.blocked():
+                    continue  # a backup import is running: the key presses stay pending until it is done
                 try:
                     poll()
                 except Exception:  # noqa: BLE001
@@ -234,6 +237,7 @@ class TrayApp:
 
     def _apply(self, settings: Settings) -> None:
         """Apply and save. Raises on errors, the caller shows them."""
+        gate.check()  # ImportBusy while a backup import is writing the files
         self._controller.apply_settings(settings)
         self._store.save(settings)
         self._icon.icon = create_icon(settings.enabled)

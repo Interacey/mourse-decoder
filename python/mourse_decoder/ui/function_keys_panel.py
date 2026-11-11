@@ -16,6 +16,7 @@ from tkinter import messagebox, ttk
 from ..controller import MorseController
 from ..function_keys import FunctionKeys, FunctionKeysStore, Slot, default_trigger
 from ..i18n import tr
+from ..import_gate import gate
 from . import function_keys_view as view
 from . import theme
 from .key_capture import CaptureBackend, ShortcutCaptureButton
@@ -49,6 +50,7 @@ class FunctionKeysPanel(tk.Frame):
         self._toast = toast or Toast(self.winfo_toplevel())
         self._capture_backend = capture_backend
         self._keys, self._load_warnings = store.load(controller.check_shortcut)
+        self._file_stamp = self._stamp()
         self._number = 0          # slot in the editor
         self._loading = False     # editor is being filled, don't report changes
         self._selecting = False   # we change the selection ourselves
@@ -358,6 +360,9 @@ class FunctionKeysPanel(tk.Frame):
         if self._store.read_only:
             self._show_error(tr("functionkeys.readonly"))
             return False
+        if gate.blocked():  # a backup import is writing the files; the editor keeps the edit, save again afterwards
+            self._show_error(tr("backup.err.busy"))
+            return False
         problems = self._problems(new)
         if problems:
             self._show_error("\n".join(problems))
@@ -378,6 +383,7 @@ class FunctionKeysPanel(tk.Frame):
             self._show_error(f"{tr('functionkeys.err.save')}: {exc}")
             return False
         self._keys = new
+        self._file_stamp = self._stamp()
         self._fill_list()
         self._update_notice()
         return True
@@ -427,6 +433,23 @@ class FunctionKeysPanel(tk.Frame):
             self._notice.grid_remove()
 
     def refresh(self) -> None:
-        """The settings may have changed (Morse key, shortcuts): the clash notice and the editor check follow."""
+        """The settings may have changed (Morse key, shortcuts): the clash notice and the editor check follow.
+
+        If the file was replaced behind our back (a backup import), the slots are read again first, otherwise
+        the next save would write the old table over the imported one.
+        """
+        if self._stamp() != self._file_stamp:
+            self._keys, self._load_warnings = self._store.load(self._controller.check_shortcut)
+            self._file_stamp = self._stamp()
+            self._fill_list()
+            self._load_editor(self._number or 13)
         self._update_notice()
         self._validate()
+
+    def _stamp(self) -> tuple[int, int] | None:
+        """Modification time and size of the file, None if it does not exist."""
+        try:
+            info = self._store.path.stat()
+        except OSError:
+            return None
+        return info.st_mtime_ns, info.st_size
