@@ -239,6 +239,10 @@ class MorseController:
         self._lock = threading.RLock()
         self._running = False
         self._calibrating = False
+        # letters and word gaps are muted from the engine's "measuring" marker 1 to the marker 0, not from
+        # the moment the flag changes: the marker sits in the event stream where the engine switched, so
+        # a letter keyed under one setting is judged under that setting
+        self._muted = False
         self._calibration_started = 0.0
         self._stopping = False  # set by stop() so a running macro ends before the engine is joined
         self._cycle_seen = 0
@@ -295,13 +299,13 @@ class MorseController:
         listener that was told ``on_calibration_ended``, or ``CALIBRATION_MAX_S`` after the start.
         The engine is reset on every change, with this effect:
 
-        * on: a letter keyed before the switch is dropped, so it does not mix with the measuring;
-        * off: a letter started while measuring is dropped, otherwise the practice presses would be
-          typed as one. Nothing from before the switch is lost, that was dropped at "on" and letters
-          are muted while measuring anyway.
+        * on: a letter whose pause ran out before the switch is typed, a half-keyed one is dropped;
+        * off: every letter of the measuring phase is dropped, also one that is still on its way to
+          ``_handle_letter`` when the flag changes, and a letter started while measuring is dropped, otherwise
+          the practice presses would be typed as one.
 
-        One race remains: a letter whose pause ran out just before the switch can still reach
-        ``_handle_letter`` after the flag is clear and is typed (a few ms wide).
+        The muting follows the engine's "measuring" marker, see ``_muted``; without a running engine
+        (no marker will come) it ends at once.
         """
         with self._lock:
             if on == self._calibrating:
@@ -313,6 +317,8 @@ class MorseController:
             self._engine.set_measuring(on)
             if self._running:
                 self._engine.reset()
+            elif not on:
+                self._muted = False
             return on
 
     def check_calibration_timeout(self) -> bool:
@@ -332,6 +338,8 @@ class MorseController:
             self._engine.set_measuring(False)
             if self._running:
                 self._engine.reset()
+            else:
+                self._muted = False
         if getattr(self._listener, "on_calibration_ended", None) is not None:
             self._notify("on_calibration_ended", reason)
 
@@ -340,6 +348,7 @@ class MorseController:
             if self._running:
                 return
             self._stopping = False
+            self._muted = False
             s = self._settings
             self._engine.configure(s.dot_threshold_ms, s.letter_gap_ms, s.word_gap_ms)
             self._apply_keys(s)
@@ -633,6 +642,8 @@ class MorseController:
                 self._handle_letter(payload)
             elif kind == "word_gap":
                 self._handle_word_gap()
+            elif kind == "measuring":
+                self._muted = payload == "1"
             elif kind in ("press_ms", "gap_ms"):
                 self._handle_timing(kind, payload)
             else:
@@ -655,7 +666,7 @@ class MorseController:
 
     def _handle_letter(self, sequence: str) -> None:
         with self._lock:
-            if not self._settings.enabled or self._calibrating:
+            if not self._settings.enabled or self._muted:
                 return  # engine keeps running, output is paused
             emission = self._decoder.decode(sequence)
         if emission is None:
@@ -666,7 +677,7 @@ class MorseController:
 
     def _handle_word_gap(self) -> None:
         with self._lock:
-            if not self._settings.enabled or self._calibrating:
+            if not self._settings.enabled or self._muted:
                 return
             emission = self._decoder.word_gap()
         if emission is not None:

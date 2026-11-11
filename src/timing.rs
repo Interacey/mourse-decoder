@@ -55,6 +55,10 @@ pub enum TimerOutput {
     /// Silence between the last release and a new press, reported when the press arrives.
     /// Only the engine worker in measuring mode emits it (calibration).
     Gap(Duration),
+    /// The worker has taken over a [`crate::engine::WorkerMessage::SetMeasuring`]. It sits in the
+    /// output stream at the exact place of the switch: everything before it came out under the old
+    /// setting, everything after it under the new one. Only sent in answer to that message.
+    Measuring(bool),
 }
 
 /// Error for an invalid configuration.

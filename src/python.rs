@@ -10,7 +10,9 @@
 //!   "symbol" of that release) and "gap_ms" (payload: whole milliseconds of silence since
 //!   the last release, sent when a new press arrives; none for the first press, after a
 //!   `reset()`, or for the repeats of a held key). Without measuring the stream has only
-//!   the first three kinds, exactly as before.
+//!   the first three kinds, exactly as before. Every `set_measuring()` call on a running
+//!   engine is answered by one "measuring" event (payload "1" or "0") at the exact place of
+//!   the switch in the stream: letters before it were keyed under the old setting.
 //! * `inject_text(text, char_delay_ms=None)`, `inject_backspaces(n)`: native text injection.
 //! * `begin_capture()`, `poll_capture()`, `cancel_capture()`: read the next key or
 //!   mouse button for the key binding.
@@ -77,6 +79,7 @@ fn to_python_event(output: TimerOutput) -> (&'static str, String) {
         // whole milliseconds, as text like the other payloads
         TimerOutput::Press(d) => ("press_ms", d.as_millis().to_string()),
         TimerOutput::Gap(d) => ("gap_ms", d.as_millis().to_string()),
+        TimerOutput::Measuring(on) => ("measuring", u8::from(on).to_string()),
     }
 }
 
@@ -193,7 +196,7 @@ impl PyMorseEngine {
         let mut state = lock_or_recover(&self.state);
         state.measuring = on;
         if let Some(handle) = &state.handle {
-            handle.send(WorkerMessage::SetMeasuring(on));
+            handle.send(WorkerMessage::SetMeasuring(on, Instant::now()));
         }
     }
 

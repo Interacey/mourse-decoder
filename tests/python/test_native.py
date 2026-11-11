@@ -399,8 +399,9 @@ def test_measuring_reports_press_before_symbol_and_gap_at_the_second_press():
         eng.feed_release()
         events.wait_for("symbol", 2)
         kinds = [k for k, _ in events.events]
-        assert kinds == ["press_ms", "symbol", "gap_ms", "press_ms", "symbol"]
-        press1, _, gap, press2, _ = (int(p) if k.endswith("_ms") else p for k, p in events.events)
+        assert kinds == ["measuring", "press_ms", "symbol", "gap_ms", "press_ms", "symbol"]
+        assert events.events[0] == ("measuring", "1")
+        press1, _, gap, press2, _ = (int(p) if k.endswith("_ms") else p for k, p in events.events[1:])
         assert 50 <= press1 < 400
         assert 100 <= gap < 600
         assert 40 <= press2 < 400
@@ -419,7 +420,18 @@ def test_measuring_can_be_switched_while_running(engine):
     events.wait_for("letter")
     kinds = [k for k, _ in events.events]
     # only the middle key press was measured: its gap and its hold time
-    assert kinds == ["symbol", "gap_ms", "press_ms", "symbol", "symbol", "letter"]
+    assert kinds == ["symbol", "measuring", "gap_ms", "press_ms", "symbol", "measuring", "symbol", "letter"]
+    assert [p for k, p in events.events if k == "measuring"] == ["1", "0"]
+
+
+def test_the_marker_comes_only_after_a_set_measuring_call(engine):
+    events = EventCollector()
+    engine.start(events, use_hook=False)
+    key(engine, 0.02)
+    events.wait_for("letter")
+    assert "measuring" not in [k for k, _ in events.events]
+    engine.set_measuring(False)  # even a switch to the same value is answered
+    assert events.wait_for("measuring") == ["0"]
 
 
 def test_stop_switches_measuring_off_and_start_uses_the_value_set_before():

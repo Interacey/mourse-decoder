@@ -37,6 +37,8 @@ class FakeEngine:
         self.reset_calls = 0
         self.measuring = False
         self.measuring_calls: list[bool] = []
+        self.hold_acks = False  # True: the "measuring" marker stays in ``pending_acks`` (a worker that lags)
+        self.pending_acks: list[str] = []
         self.started = False
         self.use_hook: bool | None = None
 
@@ -59,6 +61,14 @@ class FakeEngine:
     def set_measuring(self, on: bool) -> None:
         self.measuring = on
         self.measuring_calls.append(on)
+        if self.started:  # the real worker answers with a marker at the place of the switch
+            self.pending_acks.append("1" if on else "0")
+            if not self.hold_acks:
+                self.release_acks()
+
+    def release_acks(self) -> None:
+        while self.pending_acks:
+            self.emit("measuring", self.pending_acks.pop(0))
 
     def set_function_keys(self, entries: list[tuple[int, str, bool]]) -> None:
         if self.set_function_keys_error:

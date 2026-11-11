@@ -109,6 +109,8 @@ def test_the_real_engine_reports_the_press_before_the_symbol_and_the_gap_at_the_
         time.sleep(0.8)
     finally:
         engine.stop()
+    assert events[0] == ("measuring", "1")
+    events = events[1:]
     kinds = [kind for kind, _ in events]
     assert kinds == ["press_ms", "symbol", "gap_ms", "press_ms", "symbol", "letter"]
     values = {i: int(p) for i, (k, p) in enumerate(events) if k in ("press_ms", "gap_ms")}
@@ -325,3 +327,41 @@ def test_real_engine_sends_no_timing_events_unless_calibrating_and_stop_switches
     finally:
         controller.stop()
     assert engine.measuring is False
+
+
+def test_a_letter_of_the_measuring_phase_is_not_typed_when_it_arrives_after_switching_off(fake_engine, injector):
+    # the engine's "measuring" marker 0 is still on its way (a lagging worker) when the flag is cleared:
+    # the letter in front of it was keyed while measuring and has to stay silent
+    controller = make(fake_engine, injector)
+    controller.set_calibrating(True)
+    fake_engine.hold_acks = True
+    controller.set_calibrating(False)
+    assert not controller.calibrating
+    fake_engine.letters("...")
+    fake_engine.emit("word_gap")
+    assert injector.buffer == ""
+    fake_engine.release_acks()
+    fake_engine.letters("...")
+    assert injector.buffer == "S"
+
+
+def test_a_letter_keyed_before_switching_on_is_still_typed(fake_engine, injector):
+    controller = make(fake_engine, injector)
+    fake_engine.hold_acks = True
+    controller.set_calibrating(True)
+    fake_engine.letters("...")  # in front of marker 1
+    assert injector.buffer == "S"
+    fake_engine.release_acks()
+    fake_engine.letters("...")
+    assert injector.buffer == "S"  # muted from the marker on
+
+
+def test_stop_and_start_clear_the_muting_even_without_a_marker(fake_engine, injector):
+    controller = make(fake_engine, injector)
+    controller.set_calibrating(True)
+    fake_engine.hold_acks = True
+    controller.stop()
+    fake_engine.pending_acks.clear()  # the stopped worker never delivers the marker
+    controller.start()
+    fake_engine.letters("...")
+    assert injector.buffer == "S"
