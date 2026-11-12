@@ -46,7 +46,7 @@ def test_pause_by_shortcut_is_not_saved(fake_engine, injector, tmp_path):
     store.save(Settings(block_input=True))
     controller, tray = start(fake_engine, injector, store)
     pause_by_shortcut(fake_engine, tray)
-    assert (controller.settings.enabled, controller.settings.block_input) == (False, False)  # shown as paused
+    assert (controller.settings.enabled, controller.settings.block_input) == (False, True)  # shown as paused, blocking setting untouched
     saved = store.load()
     assert (saved.enabled, saved.block_input) == (True, True)
 
@@ -114,7 +114,7 @@ def test_real_engine_pause_save_restart(injector, tmp_path):
         assert (engine.block_input, engine.active) == (True, True)
         engine.active = False  # the shortcut's effect inside the hook
         tray._poll_block()
-        assert engine.block_input is False
+        assert engine.block_input is True  # the engine ANDs it with active
         tray._apply(controller.settings.replace(typing_delay_ms=30))
     finally:
         controller.stop()
@@ -125,3 +125,69 @@ def test_real_engine_pause_save_restart(injector, tmp_path):
         assert controller2.settings.typing_delay_ms == 30
     finally:
         controller2.stop()
+
+
+# One model for every way to switch Morse input: the shortcut, the tray menu and the settings switch change
+# `enabled` and nothing else. `block_input` is the saved setting at all times; the engine blocks only while
+# Morse input is on, so a pause never blocks and a resume blocks exactly when the setting says so.
+def by_shortcut(engine, controller, tray):
+    engine.active = not engine.active  # what the hook does
+    tray._poll_block()
+
+
+def by_menu(engine, controller, tray):
+    tray._apply(controller.settings.replace(enabled=not controller.settings.enabled))
+
+
+def by_form(engine, controller, tray):
+    tray._apply(controller.settings.replace(enabled=not controller.settings.enabled, letter_gap_ms=650))
+
+
+WAYS = {"shortcut": by_shortcut, "menu": by_menu, "form": by_form}
+
+
+@pytest.mark.parametrize("saved_block", [True, False])
+@pytest.mark.parametrize("second", WAYS)
+@pytest.mark.parametrize("first", WAYS)
+def test_every_way_gives_the_same_state(fake_engine, injector, tmp_path, first, second, saved_block):
+    store = SettingsStore(tmp_path)
+    store.save(Settings(block_input=saved_block))
+    controller, tray = start(fake_engine, injector, store)
+    expected_saved_enabled = True
+    on = True
+    for way in (first, second, first, second):  # off, on, off, on again
+        WAYS[way](fake_engine, controller, tray)
+        on = not on
+        if way != "shortcut":
+            expected_saved_enabled = on
+        assert controller.settings.enabled is on
+        assert fake_engine.active is on
+        assert controller.settings.block_input is saved_block
+        assert fake_engine.block_input is saved_block
+        assert controller.poll_active_toggle() is None  # the controller and the engine agree
+        saved = store.load()
+        assert (saved.enabled, saved.block_input) == (expected_saved_enabled, saved_block)
+    engine2 = type(fake_engine)()
+    again, _ = start(engine2, injector, store)
+    assert (engine2.active, engine2.block_input) == (expected_saved_enabled, saved_block)
+    assert again.settings.enabled is expected_saved_enabled
+
+
+@pytest.mark.skipif(not NATIVE_AVAILABLE, reason="Rust module not built")
+@pytest.mark.parametrize("first,second", [("shortcut", "menu"), ("menu", "shortcut")])
+def test_real_engine_shortcut_and_menu_agree(injector, tmp_path, first, second):
+    native = load_native()
+    store = SettingsStore(tmp_path)
+    store.save(Settings(block_input=True))
+    engine = native.MorseEngine(trigger="ScrollLock")
+    controller, tray = start(engine, injector, store)
+    try:
+        for way in (first, second):
+            WAYS[way](engine, controller, tray)
+        assert (engine.active, engine.block_input) == (True, True)  # off, then on again
+        assert (controller.settings.enabled, controller.settings.block_input) == (True, True)
+        WAYS[first](engine, controller, tray)
+        assert (engine.active, controller.settings.enabled) == (False, False)
+        assert controller.settings.block_input is True and engine.block_input is True  # the engine ANDs both
+    finally:
+        controller.stop()
