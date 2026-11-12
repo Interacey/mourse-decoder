@@ -23,7 +23,7 @@ from __future__ import annotations
 import ntpath
 import os
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import NamedTuple
 
@@ -111,8 +111,16 @@ def commands_in_file(path: Path) -> list[str]:
         values = [v for v in data["codes"].values() if isinstance(v, str)]
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return []
+    return commands_in_texts(values)
+
+
+def commands_in_texts(texts: Iterable[str], windows: bool = False) -> list[str]:
+    """The commands in ``texts`` that DO something when keyed, see ``commands_in_file``.
+
+    With ``windows`` a ``{WaitWindow …}`` is listed too (it waits for a window and then keys go to it).
+    """
     found: dict[str, None] = {}  # a dict keeps the order of first use
-    for text in values:
+    for text in texts:
         try:
             steps = parse(text, lambda _combo: None)  # every combo counts here, typos too
         except MacroError:
@@ -126,6 +134,8 @@ def commands_in_file(path: Path) -> list[str]:
                 found[f"{{Scroll {value.capitalize()}}}"] = None
             elif kind == "rollback":
                 found["{Rollback}"] = None
+            elif kind == "window" and windows:
+                found["{WaitWindow …}"] = None
             elif kind == "text":
                 if "\n" in value or "\r" in value:
                     found["{Enter}"] = None

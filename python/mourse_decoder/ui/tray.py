@@ -19,6 +19,7 @@ import pystray
 from ..controller import MorseController
 from ..dictionary import DictionaryManager
 from ..i18n import set_language, tr
+from ..import_gate import gate
 from ..settings import Settings, SettingsStore
 from ..triggers import binding_label
 from . import theme
@@ -33,6 +34,8 @@ POLL_INTERVAL_MS = 250
 
 
 class TrayApp:
+    _quit_pending = False  # Quit was asked for while a backup import was writing: done when it is over
+
     def __init__(
         self,
         controller: MorseController,
@@ -91,6 +94,9 @@ class TrayApp:
                 log.exception("Fehler in UI-Aufgabe")
         try:
             # one failing poll must not stop the others, and the loop must be scheduled again in any case
+            if self._quit_pending and not gate.blocked():
+                self._quit_pending = False
+                self.quit()
             polls = (
                 self._poll_block,
                 self._poll_cycle,
@@ -100,6 +106,8 @@ class TrayApp:
                 self._poll_calibration,
             )
             for poll in polls:
+                if poll in (self._poll_block, self._poll_cycle) and gate.blocked():
+                    continue  # a backup import is running: the key presses stay pending until it is done
                 try:
                     poll()
                 except Exception:  # noqa: BLE001
@@ -268,6 +276,7 @@ class TrayApp:
 
     def _apply(self, settings: Settings, runtime_only: bool = False) -> None:
         """Apply and save. Raises on errors, the caller shows them."""
+        gate.check()  # ImportBusy while a backup import is writing the files
         to_save, saved = self._to_save(settings, runtime_only)
         self._controller.apply_settings(settings)
         self._store.save(to_save)
@@ -296,6 +305,10 @@ class TrayApp:
         self._root.mainloop()
 
     def quit(self) -> None:
+        if gate.blocked():  # half an import on disk would be the result: wait for it, then quit
+            self._quit_pending = True
+            self._toast.show(tr("backup.quit_wait"), False)
+            return
         self._controller.stop()
         self._icon.stop()
         self._root.quit()
