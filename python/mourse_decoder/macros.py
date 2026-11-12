@@ -7,6 +7,7 @@
     "{Backspace 5}{Space 18}"            a key several times (count 1 to 1000, after a space)
     "{Clipboard}"                        type what is on the clipboard (e.g. a KeePass copy)
     "{File C:\\Users\\me\\doc.pdf}"        paste the file or folder (several: path|path)
+    "{Scrape Name: | \\n | => Hi $1}"    cut text out of the clipboard, type it in a template ({Ausschnitt …})
     "{Scroll Down}…{Scroll Stop}"        turn the mouse wheel until {Scroll Stop} or Esc ({Scroll Runter}/{Scroll Hoch})
     "{Wait 500}"                         pause 500 ms ({Warte 500})
     "{Delay 100}abc"                     type the characters after it 100 ms apart (0 to 10000; {Verzögerung 100})
@@ -24,6 +25,7 @@ import os
 import re
 from collections.abc import Callable
 from pathlib import Path
+from typing import NamedTuple
 
 from . import jsontext
 from .settings import TYPING_DELAY_RANGE
@@ -38,6 +40,10 @@ _SCROLL = re.compile(r"\s*scroll\s*(down|runter|up|hoch|stop|stopp|end|ende)\s*"
 # the value is checked in _build so that {Delay -5} and {Delay abc} get their own message
 _DELAY = re.compile(r"\s*(?:delay|verzögerung)\s*(\S*)\s*", _I)
 _ROLLBACK = re.compile(r"\s*(?:rollback|rückgängig)\s*", _I)
+_SCRAPE = re.compile(r"\s*(?:scrape|ausschnitt)(?:\s+(.*))?", _I | re.DOTALL)
+# an escape in a {Scrape} marker or template: \| \n \t \\ or \xHH (so \x7D is "}")
+_SCRAPE_ESCAPE = re.compile(r"\\(?:[|nt\\]|x[0-9A-Fa-f]{2})")
+_SCRAPE_TEMPLATE_TOKEN = re.compile(rf"\$\$|\$(\d+)|{_SCRAPE_ESCAPE.pattern}|.", re.DOTALL)
 _FILES = re.compile(r"\s*(?:file|files|datei|dateien|folder|ordner)\s+(.+?)\s*", _I)
 _LOOP = re.compile(r"\s*(?:loop|schleife)\s+(\d{1,5})(?:\s+([A-Za-z_][A-Za-z0-9_]*))?\s*", _I)
 _END_LOOP = re.compile(r"\s*(?:endloop|schleifenende)\s*", _I)
@@ -56,10 +62,14 @@ DEFAULT_COUNTER = "i"
 MAX_CALC_LENGTH = 200
 MAX_CALC_DEPTH = 32  # parentheses inside each other
 MAX_VALUE = 10**15  # no number in a calculation, result or not, is larger than this
+MAX_SCRAPE_INPUT = 200_000  # characters of clipboard text a {Scrape} reads
+MAX_SCRAPE_RESULT = 10_000  # characters one {Scrape} types; charged in full against MAX_EXPANDED_LENGTH
 
 # ("text", str) | ("keys", combo) | ("wait", seconds) | ("window", title part)
-# | ("clipboard", None) | ("files", [path, ...]) | ("scroll", "down" | "up" | "stop") | ("rollback", None)
+# | ("clipboard", None) | ("scrape", Scrape) | ("scraped", text)
+# | ("files", [path, ...]) | ("scroll", "down" | "up" | "stop") | ("rollback", None)
 # | ("delay", milliseconds)
+# parse() gives "scrape"; the controller turns it into "scraped" (plain text, kept out of the history) before typing.
 Step = tuple[str, object]
 
 
@@ -91,7 +101,7 @@ def resolve_path(raw: str) -> str:
 def commands_in_file(path: Path) -> list[str]:
     """Commands in the texts of an alphabet or smiley file that DO something when keyed.
 
-    Key combinations (``Win+R``), ``File``, ``Clipboard``, ``Scroll`` (reported by kind), and text with a
+    Key combinations (``Win+R``), ``File``, ``Clipboard``, ``Scrape``, ``Scroll`` (reported by kind), and text with a
     raw line break or tab: the injector types those as Return and Tab (reported as ``{Enter}`` and ``{Tab}``).
     Waiting and loops are harmless, plain text too. An unreadable file gives [] because importing it
     reports that anyway.
@@ -110,8 +120,8 @@ def commands_in_file(path: Path) -> list[str]:
         for kind, value in steps:
             if kind == "keys":
                 found[f"{{{value}}}"] = None
-            elif kind in ("files", "clipboard"):
-                found["{File …}" if kind == "files" else "{Clipboard}"] = None
+            elif kind in ("files", "clipboard", "scrape"):
+                found[{"files": "{File …}", "clipboard": "{Clipboard}", "scrape": "{Scrape …}"}[kind]] = None
             elif kind == "scroll":
                 found[f"{{Scroll {value.capitalize()}}}"] = None
             elif kind == "rollback":
@@ -134,6 +144,105 @@ def _split_paths(spec: str) -> list[str]:
 
 def _fail(message: str) -> MacroError:
     return MacroError(f"{message} Nichts getippt.")
+
+
+class Scrape(NamedTuple):
+    """A parsed {Scrape}: the (from, to) marker pairs and the template as text and pair numbers (1-based)."""
+
+    pairs: tuple[tuple[str, str], ...]
+    template: tuple[str | int, ...]
+
+
+def _unescape(raw: str) -> str:
+    """Resolve ``\\|``, ``\\n``, ``\\t``, ``\\\\`` and ``\\xHH``; any other backslash stays."""
+
+    def one(match: re.Match[str]) -> str:
+        code = match[0][1:]
+        if code[0] == "x":
+            return chr(int(code[1:], 16))
+        return {"n": "\n", "t": "\t"}.get(code, code)
+
+    return _SCRAPE_ESCAPE.sub(one, raw)
+
+
+def _split_fields(spec: str) -> list[str]:
+    """Cut at every ``|`` that no backslash escapes; the escapes stay in the fields for _unescape."""
+    fields, current, i = [], [], 0
+    while i < len(spec):
+        if spec[i] == "\\" and i + 1 < len(spec):
+            current.append(spec[i : i + 2])
+            i += 2
+            continue
+        if spec[i] == "|":
+            fields.append("".join(current))
+            current = []
+        else:
+            current.append(spec[i])
+        i += 1
+    fields.append("".join(current))
+    return fields
+
+
+def _parse_scrape(spec: str | None) -> Scrape:
+    """``from | to | … | => template``; everything that needs no clipboard is checked here."""
+    fields = [f.strip() for f in _split_fields(spec or "")]
+    if not fields[-1].startswith("=>"):
+        raise _fail("{Scrape …} braucht am Ende eine Vorlage: {Scrape von | bis | => $1}.")
+    template_raw, marker_fields = fields[-1][2:].strip(), fields[:-1]
+    if not marker_fields or len(marker_fields) % 2:
+        raise _fail("{Scrape …} braucht Paare aus Anfangs- und Endmarke vor der Vorlage.")
+    pairs = tuple((_unescape(a), _unescape(b)) for a, b in zip(marker_fields[::2], marker_fields[1::2], strict=True))
+    if not all(start for start, _ in pairs):
+        raise _fail("{Scrape …}: Eine Anfangsmarke ist leer.")
+    template: list[str | int] = []
+    for m in _SCRAPE_TEMPLATE_TOKEN.finditer(template_raw):
+        if m[1]:
+            number = int(m[1]) if len(m[1]) <= 9 else 0  # int() of 4301+ digits raises ValueError
+            if not 1 <= number <= len(pairs):
+                shown = m[1] if len(m[1]) <= 20 else m[1][:20] + "…"
+                raise _fail(f"{{Scrape …}}: ${shown} gibt es nicht, es sind {len(pairs)} Paare.")
+            template.append(number)
+        else:
+            char = "$" if m[0] == "$$" else _unescape(m[0])
+            if template and isinstance(template[-1], str):
+                template[-1] += char  # runs of text are one piece
+            else:
+                template.append(char)
+    return Scrape(pairs, tuple(template))
+
+
+def _show(marker: str) -> str:
+    return marker.replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t")
+
+
+def scrape_text(scrape: Scrape, text: str) -> str:
+    """Cut the parts out of ``text`` and put them into the template; MacroError if a marker is missing.
+
+    Plain text, no regex; case is ignored (re.IGNORECASE on the escaped marker, so the positions stay
+    those of the original text). Each pair is searched after the end of the previous one, first match
+    only. An empty end marker means the end of the line.
+    """
+    if len(text) > MAX_SCRAPE_INPUT:
+        raise _fail(f"Die Zwischenablage hat mehr als {MAX_SCRAPE_INPUT} Zeichen, zu viel für {{Scrape …}}.")
+    found: list[str] = []
+    pos = 0
+    for start, end in scrape.pairs:
+        begin = re.compile(re.escape(start), _I).search(text, pos)
+        if not begin:
+            raise _fail(f"Marke '{_show(start)}' nicht in der Zwischenablage gefunden.")
+        if end:
+            stop = re.compile(re.escape(end), _I).search(text, begin.end())
+            if not stop:
+                raise _fail(f"Marke '{_show(end)}' nicht in der Zwischenablage gefunden.")
+            cut, pos = stop.start(), stop.end()
+        else:
+            line_end = re.compile(r"[\r\n]").search(text, begin.end())
+            cut = pos = line_end.start() if line_end else len(text)
+        found.append(text[begin.end() : cut].strip())
+    size = sum(len(p) if isinstance(p, str) else len(found[p - 1]) for p in scrape.template)
+    if size > MAX_SCRAPE_RESULT:
+        raise _fail(f"{{Scrape …}} ergibt {size} Zeichen, höchstens {MAX_SCRAPE_RESULT} erlaubt.")
+    return "".join(p if isinstance(p, str) else found[p - 1] for p in scrape.template)
 
 
 class _CalcParser:
@@ -331,6 +440,8 @@ def _build(text: str, check_shortcut: Callable[[str], None]) -> list[tuple]:
             body.append(("step", ("window", window[1])))
         elif _CLIPBOARD.fullmatch(part):
             body.append(("step", ("clipboard", None)))
+        elif scrape := _SCRAPE.fullmatch(part):
+            body.append(("step", ("scrape", _parse_scrape(scrape[1]))))
         elif scroll := _SCROLL.fullmatch(part):
             kind = {"runter": "down", "hoch": "up", "stopp": "stop", "end": "stop", "ende": "stop"}.get(
                 scroll[1].lower(), scroll[1].lower()
@@ -382,7 +493,7 @@ def _expand(tree: list[tuple]) -> list[Step]:
                     spend(1)
                     run(node[3], {**env, node[2]: n})
             elif node[0] == "step":
-                spend(8)
+                spend(MAX_SCRAPE_RESULT if node[1][0] == "scrape" else 8)  # a scrape's length is known only later
                 if node[1][0] == "wait":
                     wait(node[1][1])
                 out.append((*node[1], False))

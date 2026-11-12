@@ -94,7 +94,7 @@ def test_parse_version_ignores_case_of_the_v():
 
 
 def test_this_is_version_0_1_7():
-    assert __version__ == "0.1.7"
+    assert __version__ == "0.1.8"
 
 
 # --- looking at the latest release ---
