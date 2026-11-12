@@ -203,7 +203,6 @@ class MorseController:
     POLL_S = 0.05  # how often waits look at the window title and the on/off switch
     TYPE_CHUNK = 100  # characters typed between two looks at the on/off switch (about 2 s)
     ERASE_CHUNK = 2000  # Backspaces sent between two looks at the on/off switch and Esc
-    RESUME_GAP_S = 5.0  # no UI tick for this long (ticks come every 250 ms) means the machine was asleep
     MODIFIER_TIMEOUT_S = 3.0  # a function key waits this long for Ctrl/Alt/Shift/Win to be let go
 
     def __init__(
@@ -216,10 +215,7 @@ class MorseController:
         decoder_factory: Callable[[DictionaryManager, str], Decoder] = create_decoder,
         use_hook: bool = True,
         scroller_factory: Callable[..., Scroller] = Scroller,
-        clock: Callable[[], float] = time.time,
     ) -> None:
-        self._clock = clock  # wall clock: it keeps counting while the machine sleeps
-        self._last_tick = 0.0
         self._engine = engine
         self._injector = injector
         self._dictionaries = dictionaries
@@ -284,8 +280,6 @@ class MorseController:
             self._undo_seen = int(self._engine.undo_count)
             self._engine.start(self._on_engine_event, use_hook=self._use_hook)
             self._running = True
-            self._last_tick = self._clock()
-            self._reassert_input()  # once more with the hook up: the saved blocking state must hold now
             try:
                 self._install_function_keys()
             except ValueError as exc:  # e.g. the Morse key was changed to a trigger a slot uses
@@ -346,38 +340,6 @@ class MorseController:
         self._engine.block_input = s.block_input
         # the engine only blocks while Morse input is on, so a paused app never eats the key
         self._engine.active = s.enabled
-
-    def _reassert_input(self) -> None:
-        """Write the saved blocking state and shortcuts into the engine again.
-
-        Not ``active``: the on/off shortcut changes it from the hook thread and ``poll_active_toggle``
-        mirrors that into the settings, so it must not be overwritten here.
-        """
-        s = self._settings
-        self._engine.block_shortcut = s.block_shortcut
-        self._engine.cycle_shortcut = s.cycle_shortcut
-        self._engine.undo_shortcut = s.undo_shortcut
-        self._engine.block_input = s.block_input
-
-    def check_input_state(self) -> bool:
-        """Watchdog tick, called from the UI loop. True if the engine had to be corrected.
-
-        Corrects two things: the engine's blocking flag differs from the saved setting (nothing in
-        the program changes it behind the settings' back, so this heals whatever did), and a long
-        gap between two ticks, which means the machine slept or was suspended. After a resume
-        Windows may have dropped parts of the hook state, so the settings are written again.
-        """
-        with self._lock:
-            if not self._running:
-                return False
-            now = self._clock()
-            gap, self._last_tick = now - self._last_tick, now
-            drifted = bool(self._engine.block_input) != self._settings.block_input
-            if drifted or gap > self.RESUME_GAP_S:
-                log.warning("Blockierung neu gesetzt (Abweichung=%s, Pause %.0f s)", drifted, gap)
-                self._reassert_input()
-                return True
-            return False
 
     def poll_active_toggle(self) -> Settings | None:
         """Settings after the shortcut toggled, else None.

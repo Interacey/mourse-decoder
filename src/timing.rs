@@ -20,6 +20,10 @@ use std::time::{Duration, Instant};
 ///
 /// The longest regular character has 7 symbols (`$` = `...-..-`). The cap protects
 /// against unbounded growth if someone keys forever without pausing; 32 leaves room.
+///
+/// A sequence that grows past this is reported with `MAX_SEQUENCE_LEN + 1` symbols, which no
+/// code table can contain (codes have 1 to 32 symbols), so it is unknown. Cutting it to 32
+/// would let a 40-symbol input hit a 32-symbol code.
 pub const MAX_SEQUENCE_LEN: usize = 32;
 
 /// A single Morse symbol.
@@ -248,7 +252,7 @@ impl MorseTimer {
     /// key released first).
     pub fn on_release_as(&mut self, at: Instant, symbol: Symbol) -> Option<Symbol> {
         self.pressed_at.take()?;
-        if self.buffer.len() < MAX_SEQUENCE_LEN {
+        if self.buffer.len() <= MAX_SEQUENCE_LEN {
             self.buffer.push(symbol.as_char());
         }
         self.last_release = Some(at);
@@ -556,7 +560,33 @@ mod tests {
             timer.on_release(t);
             t += ms(10);
         }
-        assert_eq!(timer.pending_sequence().len(), MAX_SEQUENCE_LEN);
+        // one symbol more than any code has: the letter is reported as too long, not cut to a valid length
+        assert_eq!(timer.pending_sequence().len(), MAX_SEQUENCE_LEN + 1);
+    }
+
+    #[test]
+    fn overlong_sequence_is_reported_longer_than_any_code() {
+        let mut timer = MorseTimer::new(TimingConfig::default());
+        let mut t = Instant::now();
+        fn keyed(timer: &mut MorseTimer, t: &mut Instant, count: usize) {
+            for _ in 0..count {
+                timer.on_press(*t);
+                *t += ms(500);
+                timer.on_release(*t); // dash
+                *t += ms(10);
+            }
+        }
+        keyed(&mut timer, &mut t, MAX_SEQUENCE_LEN + 8);
+        let out = timer.poll(t + ms(2000));
+        assert_eq!(
+            out,
+            vec![TimerOutput::Letter("-".repeat(MAX_SEQUENCE_LEN + 1))]
+        );
+        // exactly 32 symbols still arrive unchanged
+        t += ms(3000);
+        keyed(&mut timer, &mut t, MAX_SEQUENCE_LEN);
+        let out = timer.poll(t + ms(2000));
+        assert_eq!(out, vec![TimerOutput::Letter("-".repeat(MAX_SEQUENCE_LEN))]);
     }
 
     #[test]
