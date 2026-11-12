@@ -25,7 +25,7 @@ from mourse_decoder.settings import Settings, SettingsStore
 from test_backup import make_config, snapshot
 
 try:
-    from mourse_decoder.ui.tray import TrayApp
+    from mourse_decoder.ui.tray import TrayApp, saved_fields
 except Exception as exc:  # no display for pystray
     pytest.skip(f"UI modules not importable here: {exc!r}", allow_module_level=True)
 
@@ -35,9 +35,9 @@ PACKAGE = LOCALES.parent
 
 @pytest.fixture(autouse=True)
 def gate_is_free():
-    gate.end()
+    gate.reset()
     yield
-    gate.end()
+    gate.reset()
 
 
 class CalibrationListener(RecordingListener):
@@ -59,7 +59,7 @@ def real_tray(controller, store, sync=lambda: None):
     tray._controller = controller
     tray._store = store
     tray._dictionaries = controller._dictionaries
-    tray._saved_flags = {"enabled": controller.settings.enabled, "block_input": controller.settings.block_input}
+    tray._saved_flags = saved_fields(store)  # what TrayApp.__init__ does: the file's values, not the controller's
     tray._icon = SimpleNamespace(icon=None, update_menu=lambda: None, title="", notify=lambda *a: None)
     tray._window = SimpleNamespace(sync=lambda: sync())
     tray.toasts = []
@@ -572,7 +572,7 @@ def test_fallback_of_an_import_that_cannot_be_loaded_keeps_the_imported_file(imp
     )
     run_import(page, tk_root)
     s = controller.settings
-    assert (s.alphabet, s.smileys, s.letter_gap_ms) == ("latin", "", 777)  # fallback in memory, rest imported
+    assert (s.alphabet, s.smileys, s.letter_gap_ms) == ("latin", "gibts-nicht", 777)  # like the start: alphabet falls back, the smiley name stays
     assert dialogs.kinds()[-1] == "info" and "could not load" not in dialogs.calls[-1][2]
 
     def pause():
@@ -644,17 +644,6 @@ def test_quit_waits_from_the_first_job_of_the_page_until_the_import_is_done(impo
     assert quits == ["icon.stop", "root.quit"]
 
 
-def test_the_tray_menu_icon_and_tooltip_follow_an_import(fake_engine, injector, tmp_path):
-    config = fresh_config(tmp_path / "cfg")
-    controller, store, tray = start(fake_engine, injector, config)
-    built, titles = [], []
-    tray._build_menu = lambda: built.append("menu") or "menu"
-    tray._set_title = titles.append
-    tray._tooltip = lambda: "tip"
-    tray._rebuild_menu()
-    assert built == ["menu"] and tray._icon.menu == "menu" and titles == ["tip"] and tray._icon.icon is not None
-
-
 def test_the_main_window_rebuilds_the_tray_menu_after_an_import(tk_root, fake_engine, injector, tmp_path):
     import tkinter as tk
 
@@ -679,61 +668,6 @@ def test_the_main_window_rebuilds_the_tray_menu_after_an_import(tk_root, fake_en
         assert len(rebuilt) == before + 1  # the settings page reports an import: the tray menu is rebuilt
     finally:
         top.destroy()
-
-
-def test_gc_stays_off_while_a_backup_job_runs_and_tk_variables_are_freed_on_the_tk_thread(
-    import_panel, fake_engine, tk_root
-):
-    import gc
-    import time
-    import tkinter as tk
-
-    page, *_ = import_panel('{"alphabet": "german"}', '{"alphabet": "german", "letter_gap_ms": 777}')
-    freed_on: list[str] = []
-
-    class Var(tk.StringVar):
-        def __del__(self):
-            freed_on.append(threading.current_thread().name)
-            super().__del__()
-
-    class Holder:  # a cycle that only the collector can free, like a destroyed page
-        def __init__(self):
-            self.me = self
-            self.var = Var(tk_root)
-
-    Holder()
-    seen = {}
-
-    def work():
-        seen["gc_enabled"] = gc.isenabled()
-        junk = [[object()] for _ in range(300_000)]  # allocations that would start a collection
-        return len(junk)
-
-    results = []
-    started = time.monotonic()
-    page._start(work, lambda result, error: (results.append(result), page._finish()))
-    deadline = time.monotonic() + 30
-    while page._backup_running and time.monotonic() < deadline:
-        tk_root.update()
-        time.sleep(0.005)
-    assert results == [300_000] and seen["gc_enabled"] is False
-    assert gc.isenabled()
-    assert "backup" not in freed_on, "a Tk variable was freed on the worker thread"
-    assert time.monotonic() - started < 5
-
-
-def test_gc_is_back_on_when_the_page_is_closed_during_a_job(import_panel, fake_engine, tk_root):
-    import gc
-    import time
-
-    page, *_ = import_panel('{"alphabet": "german"}', '{"alphabet": "german"}')
-    release = threading.Event()
-    page._start(lambda: release.wait(10), lambda result, error: page._finish())
-    assert not gc.isenabled()
-    page.destroy()
-    assert gc.isenabled() and not gate.busy()
-    release.set()
-    time.sleep(0.05)
 
 
 @pytest.mark.parametrize("bad", ["Upper", "Latin", "dot.ted", "ünï", "//host/x", "-x"])
@@ -767,3 +701,362 @@ def test_valid_ids_and_old_files_give_no_warning_and_stay_byte_identical(tmp_pat
         store = SettingsStore(config)
         store.load()
         assert store.warnings == [] and (config / "settings.json").read_text(encoding="utf-8") == text
+
+
+# ---- second review round: saved values, fallback, gate holds, Tk variables, notices ----------------------------
+
+
+def fallback_setup(fake_engine, injector, tmp_path, name="neu"):
+    """The program started with settings.json naming an alphabet whose file is missing (start fallback: Latin)."""
+    from mourse_decoder.app import build_controller
+
+    config = tmp_path / "cfg"
+    (config / "alphabets").mkdir(parents=True)
+    (config / "smileys").mkdir()
+    (config / "settings.json").write_text(json.dumps({"alphabet": name}), encoding="utf-8")
+    store = SettingsStore(config)
+    dicts = DictionaryManager(user_directory=config / "alphabets", user_smiley_directory=config / "smileys")
+    controller, warnings = build_controller(fake_engine, injector, dicts, store.load())
+    controller.start()
+    tray = real_tray(controller, store)
+    assert controller.settings.alphabet == "latin" and warnings
+    return config, store, controller, tray
+
+
+def alphabet_on_disk(config) -> str:
+    return json.loads((config / "settings.json").read_text(encoding="utf-8"))["alphabet"]
+
+
+def test_start_fallback_then_an_alphabet_only_import_keeps_the_named_alphabet_in_the_file(
+    fake_engine, injector, tmp_path
+):
+    from mourse_decoder.ui.settings_panel import SettingsPanel
+
+    config, store, controller, tray = fallback_setup(fake_engine, injector, tmp_path)
+    assert tray._saved_flags["alphabet"] == "neu"  # the file's value, not the fallback the controller runs
+    (config / "alphabets" / "neu.json").write_text(
+        json.dumps({"id": "neu", "name": "Neu", "codes": {".": "e"}}), encoding="utf-8"
+    )
+    stand_in = SimpleNamespace(_controller=controller, _on_imported=None)
+    SettingsPanel._switch_without_saving(stand_in, controller.settings, store.load(), ("alphabets/neu.json",))
+    assert controller.settings.alphabet == "neu"  # the import made the named alphabet usable
+    tray._apply(controller.settings.replace(letter_gap_ms=700))
+    assert alphabet_on_disk(config) == "neu"
+
+
+def test_the_first_save_after_a_start_fallback_keeps_the_alphabet_of_the_file(fake_engine, injector, tmp_path):
+    config, store, controller, tray = fallback_setup(fake_engine, injector, tmp_path)
+    shortcut_pause(fake_engine, tray)
+    assert alphabet_on_disk(config) == "neu"
+    tray._apply(controller.settings.replace(word_gap_ms=1700))
+    assert alphabet_on_disk(config) == "neu"
+
+
+def test_choosing_the_fallback_alphabet_in_the_tray_menu_is_saved(fake_engine, injector, tmp_path):
+    config, store, controller, tray = fallback_setup(fake_engine, injector, tmp_path)
+    tray._change(alphabet="latin")  # a click on "Latin" in the menu: the user's choice, equal to what runs
+    assert alphabet_on_disk(config) == "latin"
+
+
+def test_choosing_the_fallback_alphabet_in_the_form_is_saved(import_panel, fake_engine, tk_root):
+    page, controller, store, tray, config, dialogs = import_panel(
+        '{"alphabet": "german"}', json.dumps({"alphabet": "chinese-telecode", "letter_gap_ms": 777})
+    )
+    run_import(page, tk_root)
+    assert controller.settings.alphabet == "latin" and alphabet_on_disk(config) == "chinese-telecode"
+    page._alphabet_var.set(next(a.name for a in page._dictionaries.available() if a.id == "latin"))
+    page._changed()  # a timing change or a refresh: no choice, the file keeps the name
+    assert alphabet_on_disk(config) == "chinese-telecode"
+    page._changed(chosen=("alphabet",))  # the user picks "Latin" in the box
+    assert alphabet_on_disk(config) == "latin"
+
+
+def test_importing_only_telecode_sqlite_activates_the_telecode_alphabet_the_file_names(
+    tk_root, fake_engine, injector, tmp_path
+):
+    from mourse_decoder.app import build_controller
+    from mourse_decoder.ui import theme
+    from mourse_decoder.ui.settings_panel import SettingsPanel
+    from test_backup_ui import FakeDialogs, NoCapture
+    from test_import_security import digit_sequences, make_bundle, make_telecode_db
+
+    theme.apply_theme(tk_root, "light")
+    set_language("en")
+    config = tmp_path / "cfg" / "MourseDecoder"
+    config.mkdir(parents=True)
+    (config / "settings.json").write_text('{"alphabet": "chinese-telecode"}', encoding="utf-8")
+    zip_path = make_bundle(
+        tmp_path / "t.zip", {"telecode.sqlite": make_telecode_db(tmp_path / "t.sqlite", {"0002": "中"})}
+    )
+    store = SettingsStore(config)
+    dicts = DictionaryManager(telecode_db=config / "telecode.sqlite")
+    controller, warnings = build_controller(fake_engine, injector, dicts, store.load())
+    controller.start()
+    assert controller.settings.alphabet == "latin" and warnings  # no database yet: start fallback
+    tray = real_tray(controller, store)
+    page = SettingsPanel(
+        tk_root, controller, dicts, tray._apply, capture_backend=NoCapture(),
+        backup_dialogs=FakeDialogs(open_=str(zip_path)), config_dir=config, on_imported=lambda: None,
+    )
+    tray._window = SimpleNamespace(sync=page.refresh)
+    page.pack()
+    try:
+        run_import(page, tk_root)
+        assert controller.settings.alphabet == "chinese-telecode"
+        seq = digit_sequences()
+        fake_engine.letters(*(seq[d] for d in "0002"))
+        assert injector.buffer.endswith("中")
+        assert alphabet_on_disk(config) == "chinese-telecode"
+    finally:
+        page.destroy()
+
+
+def test_an_import_with_a_missing_smiley_set_keeps_the_name_like_the_start_does(fake_engine, injector, tmp_path):
+    from mourse_decoder.ui.tray import take_over_imported
+
+    config = fresh_config(tmp_path / "cfg")
+    dicts = DictionaryManager(user_directory=config / "alphabets", user_smiley_directory=config / "smileys")
+    controller = MorseController(fake_engine, injector, dicts, Settings(), use_hook=False)
+    controller.start()
+    live = take_over_imported(controller, Settings(smileys="gibts-nicht", letter_gap_ms=777))
+    assert (live.smileys, live.letter_gap_ms) == ("gibts-nicht", 777)
+    assert controller.settings.smileys == "gibts-nicht" and dicts.smiley_set_id == ""
+    (config / "smileys" / "gibts-nicht.json").write_text(
+        json.dumps({"id": "gibts-nicht", "name": "Da", "codes": {"........-": "Z"}}), encoding="utf-8"
+    )
+    controller.apply_settings(controller.settings.replace(letter_gap_ms=650))  # a set that appears later is used
+    assert dicts.smiley_set_id == "gibts-nicht"
+
+
+def test_an_import_that_fails_for_another_reason_than_a_missing_file_is_not_hidden_by_a_fallback(
+    fake_engine, injector, tmp_path
+):
+    from mourse_decoder.ui.tray import take_over_imported
+
+    config = fresh_config(tmp_path / "cfg")
+    controller, store, tray = start(fake_engine, injector, config)
+    before = controller.settings
+    with pytest.raises(ValueError):
+        take_over_imported(controller, before.replace(dot_threshold_ms=-5, alphabet="fehlt"))
+    assert controller.settings == before
+
+
+def test_the_end_of_one_job_does_not_free_the_hold_of_another_page():
+    from mourse_decoder.import_gate import ImportGate
+
+    gate_ = ImportGate()
+    page_a, page_b = object(), object()
+    gate_.hold(page_b, True)
+    assert gate_.begin()  # page A's import
+    gate_.hold(page_a, True)
+    gate_.end()
+    gate_.hold(page_a, False)
+    assert gate_.busy()  # B still holds
+    gate_.hold(page_b, False)
+    assert not gate_.busy()
+    gate_.hold(page_b, True)
+    gate_.reset()
+    assert not gate_.busy()
+
+
+def test_the_gate_is_released_once_even_if_the_worker_and_the_destroy_event_race(
+    import_panel, monkeypatch
+):
+    import time
+
+    from mourse_decoder.ui.settings_panel import SettingsPanel
+
+    page, *_ = import_panel('{"alphabet": "german"}', '{"alphabet": "german"}')
+    ends: list[int] = []
+    monkeypatch.setattr(gate, "end", lambda: ends.append(1))
+    state = {"holds": False}
+
+    def read(_self):
+        value = state["holds"]
+        time.sleep(0.02)  # the other thread gets in between the check and the reset
+        return value
+
+    def write(_self, value):
+        state["holds"] = value
+
+    monkeypatch.setattr(SettingsPanel, "_holds_gate", property(read, write), raising=False)
+    for _ in range(5):
+        state["holds"] = True
+        threads = [threading.Thread(target=page._release_gate) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    assert len(ends) == 5
+
+
+def test_tk_objects_freed_by_the_collector_of_another_thread_are_parked_and_freed_on_the_tk_thread(tk_root):
+    import gc
+    import time
+    import tkinter as tk
+    from tkinter import font as tkfont
+
+    from mourse_decoder.ui import theme, tkfinalizers  # noqa: F401 - importing theme installs the finalizers
+
+    class Holder:  # a cycle that only the collector frees, like a destroyed page
+        def __init__(self):
+            self.me = self
+            self.vars = [tk.StringVar(tk_root) for _ in range(3)]
+            self.image = tk.PhotoImage(master=tk_root, width=1, height=1)
+            self.font = tkfont.Font(root=tk_root, family="Arial", size=9)
+
+    def alive(var_names, image, font):
+        call = tk_root.tk.call
+        exists = [tk_root.tk.getboolean(call("info", "exists", n)) for n in var_names]
+        return exists, image in call("image", "names"), font in call("font", "names")
+
+    holder = Holder()
+    names, image, font = [v._name for v in holder.vars], str(holder.image), holder.font.name
+    del holder
+    started = time.monotonic()
+    worker = threading.Thread(target=gc.collect)
+    worker.start()
+    while worker.is_alive():
+        tk_root.update()
+        time.sleep(0.005)
+    assert time.monotonic() - started < 2  # Tk waited about a second per object before
+    assert alive(names, image, font) == ([True] * 3, True, True)  # parked, not freed on the worker
+    assert tkfinalizers.drain() >= 5
+    assert alive(names, image, font) == ([False] * 3, False, False)
+
+
+def test_a_backup_job_does_not_touch_the_garbage_collector(import_panel, tk_root):
+    import gc
+    import time
+
+    page, *_ = import_panel('{"alphabet": "german"}', '{"alphabet": "german"}')
+    seen, results = [], []
+
+    def work():
+        seen.append(gc.isenabled())
+        return 1
+
+    page._start(work, lambda result, error: (results.append(result), page._finish()))
+    deadline = time.monotonic() + 20
+    while page._backup_running and time.monotonic() < deadline:
+        tk_root.update()
+        time.sleep(0.005)
+    assert results == [1] and seen == [True] and gc.isenabled()
+
+
+def test_a_backup_job_that_cannot_start_its_thread_leaves_the_page_usable(import_panel, monkeypatch):
+    import gc
+
+    page, *_ = import_panel('{"alphabet": "german"}', '{"alphabet": "german"}')
+    original = threading.Thread.start
+
+    def refuse(self, *args, **kwargs):
+        if self.name == "backup":
+            raise RuntimeError("can't start new thread")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(threading.Thread, "start", refuse)
+    with pytest.raises(RuntimeError):
+        page._start(lambda: 1, lambda result, error: None)
+    assert not page._backup_running and not page._job_running and not gate.busy() and gc.isenabled()
+
+
+@pytest.mark.parametrize("language", ["de", "de-saar", "en", "es", "fr", "it", "pt"])
+@pytest.mark.parametrize("field", ["alphabet", "smileys"])
+@pytest.mark.parametrize("bad", ["😀" * 40, "X" * 40, "‮" * 40])
+def test_the_notice_for_an_invalid_id_fits_a_tray_balloon(tmp_path, language, field, bad):
+    from mourse_decoder import app
+
+    set_language(language)
+    try:
+        (tmp_path / "settings.json").write_text(json.dumps({field: bad}), encoding="utf-8")
+        store = SettingsStore(tmp_path)
+        store.load()
+        (message,) = app.settings_warnings(store)
+        assert len(message.encode("utf-16-le")) // 2 < 256, (language, field, len(message))
+    finally:
+        set_language("en")
+
+
+def test_any_message_is_cut_to_what_a_balloon_accepts():
+    from mourse_decoder.ui.tray import fit_balloon
+
+    assert fit_balloon("short") == "short"
+    for text in ("x" * 600, "😀" * 300, "ab" * 128):
+        shown = fit_balloon(text)
+        assert len(shown.encode("utf-16-le")) // 2 <= 255 and shown.endswith("…")
+    assert fit_balloon("x" * 255) == "x" * 255
+
+
+def test_a_settings_file_that_is_thrown_away_gives_no_notice_about_its_ids(tmp_path):
+    (tmp_path / "settings.json").write_text(json.dumps({"alphabet": "Latin", "dot_threshold_ms": -5}), encoding="utf-8")
+    store = SettingsStore(tmp_path)
+    settings = store.load()
+    assert settings == Settings() and store.warnings == []
+    assert (tmp_path / "settings.json.bak").is_file()  # the file is kept for the user, like before
+
+
+def test_a_missing_smiley_set_is_logged_once_not_at_every_reload(fake_engine, injector, tmp_path, caplog):
+    import logging
+
+    config = fresh_config(tmp_path / "cfg")
+    dicts = DictionaryManager(user_directory=config / "alphabets", user_smiley_directory=config / "smileys")
+    with caplog.at_level(logging.WARNING, logger="mourse_decoder.controller"):
+        controller = MorseController(fake_engine, injector, dicts, Settings(smileys="fehlt"), use_hook=False)
+        controller.start()
+        for _ in range(3):
+            controller.reload_alphabet()
+    records = [r for r in caplog.records if "Smiley" in r.getMessage()]
+    assert len(records) == 1 and not records[0].exc_info, [r.getMessage() for r in records]
+
+
+def test_every_startup_notice_key_is_used_by_the_code_and_exists():
+    source = "\n".join(p.read_text(encoding="utf-8") for p in [*PACKAGE.glob("*.py"), *(PACKAGE / "ui").glob("*.py")])
+    used = set(re.findall(r"""["'](startup\.[a-z_]+)["']""", source))
+    english = json.loads((LOCALES / "en.json").read_text(encoding="utf-8"))["strings"]
+    assert {"startup.bad_alphabet_id", "startup.bad_smiley_id"} <= used
+    assert used <= set(english), sorted(used - set(english))
+    unused = [k for k in english if k.startswith("startup.") and k not in used]
+    assert unused == [], f"keys that nothing uses: {unused}"
+
+
+def test_the_tray_menu_follows_the_files_icon_and_tooltip(fake_engine, injector, tmp_path):
+    from mourse_decoder.ui.icon import create_icon
+
+    config = fresh_config(tmp_path / "cfg" / "MourseDecoder")
+    dicts = DictionaryManager(user_directory=config / "alphabets")
+    controller = MorseController(fake_engine, injector, dicts, Settings(), use_hook=False)
+    controller.start()
+    tray = real_tray(controller, SettingsStore(config))
+    tray._icon = SimpleNamespace(icon=None, menu=None, update_menu=lambda: None, title="")
+    titles = []
+    tray._set_title = titles.append
+    tray._tooltip = lambda: "tip"
+
+    def labels():
+        submenu = next(i.submenu for i in tray._icon.menu.items if i.submenu is not None)
+        return [item.text for item in submenu.items]
+
+    tray._rebuild_menu()  # the real menu, built from the alphabet files
+    assert "Größe ✓" in labels() and "Neu" not in labels()
+    (config / "alphabets" / "neu.json").write_text(
+        json.dumps({"id": "neu", "name": "Neu", "codes": {".": "e"}}), encoding="utf-8"
+    )
+    (config / "alphabets" / "mein.json").unlink()
+    controller.apply_settings(controller.settings.replace(enabled=False))
+    tray._rebuild_menu()  # what an import does through the main window
+    assert "Neu" in labels() and "Größe ✓" not in labels()
+    assert tray._icon.icon.tobytes() == create_icon(False).tobytes()
+    assert tray._icon.icon.tobytes() != create_icon(True).tobytes()
+    assert titles == ["tip", "tip"]
+
+
+def test_a_smiley_set_that_is_named_but_missing_does_not_block_an_alphabet_change(fake_engine, injector, tmp_path):
+    config = fresh_config(tmp_path / "cfg")
+    dicts = DictionaryManager(user_directory=config / "alphabets", user_smiley_directory=config / "smileys")
+    controller = MorseController(fake_engine, injector, dicts, Settings(smileys="fehlt"), use_hook=False)
+    controller.start()
+    controller.apply_settings(controller.settings.replace(alphabet="greek"))  # raised "Smiley-Set nicht gefunden"
+    assert controller.settings.alphabet == "greek" and controller.settings.smileys == "fehlt"
+    with pytest.raises(ValueError):  # asking for a missing set in this very change is still refused
+        controller.apply_settings(controller.settings.replace(smileys="auch-fehlt"))

@@ -8,6 +8,7 @@ function key macros), alphabet, smiley and language files read by the real loade
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -21,7 +22,8 @@ TELECODE_ALPHABET = DictionaryManager.TELECODE_ID
 _ID = re.compile(r"^[a-z0-9][a-z0-9_-]*\Z")
 # a value that has no brace, line break or tab cannot hold a command: skip the parser for it
 _MAY_HOLD_COMMANDS = re.compile(r"[{\n\r\t]")
-MAX_CODES_LOOKED_AT = 20_000
+# the list that is kept for one file; the file is risky from the first entry on, and what is looked at is not cut off
+MAX_COMMANDS_LISTED = 5_000
 
 
 @dataclass(frozen=True)
@@ -32,27 +34,45 @@ class Note:
     params: dict[str, str]
 
 
-def _codes(data: bytes) -> dict[str, Any]:
+def _typed_texts(data: bytes) -> list[tuple[str, Any]]:
+    """(label, text) of everything in an alphabet or smiley file that the decoder can type.
+
+    That is every value of ``codes`` and the ``word_separator`` (typed at every word pause, label
+    ``word_separator``). ``combining`` is typed only as the one character it forms with the letter before it
+    (``AlphabetDecoder._combine``), so it cannot hold a command; ``name`` and ``description`` are only shown.
+    """
     try:
         parsed = jsontext.loads(data.decode("utf-8-sig"), dict)
     except (UnicodeDecodeError, ValueError, RecursionError):
-        return {}
-    codes = parsed.get("codes") if isinstance(parsed, dict) else None
-    return codes if isinstance(codes, dict) else {}
+        return []
+    if not isinstance(parsed, dict):
+        return []
+    codes = parsed.get("codes")
+    texts: list[tuple[str, Any]] = [(str(c), t) for c, t in codes.items()] if isinstance(codes, dict) else []
+    if "word_separator" in parsed:
+        texts.append(("word_separator", parsed["word_separator"]))
+    return texts
 
 
 def commands_per_code(data: bytes) -> list[tuple[str, str, tuple[str, ...]]]:
-    """(code, text, commands) of every code of an alphabet or smiley file whose text does something when keyed.
+    """(code, text, commands) of every typed text of an alphabet or smiley file that does something when keyed.
 
-    Same judgement as the single-file import (``macros.commands_in_file``), one source for both.
+    Same judgement as the single-file import (``macros.commands_in_file``), one source for both. Every code is
+    looked at, however many there are (the size of the file is limited): a limit here would let a command stand
+    behind enough harmless codes.
     """
+    return commands_in_rows(_typed_texts(data))
+
+
+def commands_in_rows(rows: Iterable[tuple[str, Any]]) -> list[tuple[str, str, tuple[str, ...]]]:
+    """(label, text, commands) for the rows whose text does something when keyed (at most ``MAX_COMMANDS_LISTED``)."""
     found: list[tuple[str, str, tuple[str, ...]]] = []
-    for index, (code, text) in enumerate(_codes(data).items()):
-        if index >= MAX_CODES_LOOKED_AT:
-            break
+    for label, text in rows:
         if isinstance(text, str) and _MAY_HOLD_COMMANDS.search(text):
             if commands := macros.commands_in_texts([text], windows=True):
-                found.append((str(code), text, tuple(commands)))
+                found.append((str(label), text, tuple(commands)))
+                if len(found) >= MAX_COMMANDS_LISTED:
+                    break
     return found
 
 

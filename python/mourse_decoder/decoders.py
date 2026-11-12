@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import unicodedata
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 from .dictionary import Alphabet, AlphabetError, DictionaryManager
@@ -23,6 +23,9 @@ class Emission:
 
     text: str
     erase: int = 0
+    # True: ``text`` comes from a data file that is not meant to hold commands (the telecode database), so it is
+    # typed as it is and never read as a macro. Not part of the comparison: it changes how, not what.
+    plain: bool = field(default=False, compare=False)
 
 
 class Decoder(Protocol):
@@ -102,8 +105,9 @@ class TelecodeDecoder:
         char = self._store.lookup(code)
         if char is None:
             return Emission(digit)  # unknown code: leave the digits so the user sees them
-        # the fourth digit was never typed, so only three need erasing
-        return Emission(char, erase=self.CODE_LENGTH - 1)
+        # the fourth digit was never typed, so only three need erasing; the database is user data (it can come
+        # from a backup), so its text is never read as {Win+R}-style commands
+        return Emission(char, erase=self.CODE_LENGTH - 1, plain=True)
 
     def word_gap(self) -> Emission | None:
         self._buffer = ""  # drop a half-entered code, Chinese needs no spaces

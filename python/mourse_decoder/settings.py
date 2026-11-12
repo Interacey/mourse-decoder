@@ -373,6 +373,14 @@ def default_config_dir() -> Path:
     return base / "mourse-decoder"
 
 
+SHOWN_ID_LENGTH = 16  # the notice must stay under the 256 UTF-16 units of a tray balloon, in every language
+
+
+def _shown(value: str) -> str:
+    """An id from a file for a notice: control and direction-changing characters written out, cut short."""
+    return jsontext.display_text(value, SHOWN_ID_LENGTH)
+
+
 def _without_bad_ids(settings: Settings) -> tuple[Settings, list[tuple[str, dict[str, str]]]]:
     """An alphabet or smiley id that is not a valid id (a hand-edit, ``Latin``, ``//host/share/x``) went to the
     loaders as a file name and could never be loaded. The field goes back to its default and the rest of the
@@ -384,10 +392,10 @@ def _without_bad_ids(settings: Settings) -> tuple[Settings, list[tuple[str, dict
     notes: list[tuple[str, dict[str, str]]] = []
     if isinstance(settings.alphabet, str) and settings.alphabet and not is_valid_id(settings.alphabet):
         changes["alphabet"] = Settings.alphabet
-        notes.append(("startup.bad_alphabet_id", {"value": settings.alphabet[:40], "default": Settings.alphabet}))
+        notes.append(("startup.bad_alphabet_id", {"value": _shown(settings.alphabet), "default": Settings.alphabet}))
     if isinstance(settings.smileys, str) and settings.smileys and not is_valid_id(settings.smileys):
         changes["smileys"] = Settings.smileys
-        notes.append(("startup.bad_smiley_id", {"value": settings.smileys[:40]}))
+        notes.append(("startup.bad_smiley_id", {"value": _shown(settings.smileys)}))
     if changes:
         log.warning("Ungültige ID in den Einstellungen, Standardwert verwendet: %s", ", ".join(changes))
         return settings.replace(**changes), notes
@@ -438,6 +446,7 @@ class SettingsStore:
                 settings = relaxed
             return settings
         except (OSError, ValueError, TypeError) as exc:
+            self.warnings = []  # the file is thrown away: what it said about its ids no longer matters
             log.warning("Einstellungen ungültig (%s) – verwende Standardwerte", exc)
             self._backup_broken_file()
             return Settings()

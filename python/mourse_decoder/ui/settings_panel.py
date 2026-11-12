@@ -6,7 +6,6 @@ An invalid input, e.g. a half-typed number, isn't applied but reported below the
 from __future__ import annotations
 
 import functools
-import gc
 import json
 import logging
 import queue
@@ -25,7 +24,7 @@ from ..function_keys import FunctionKeys, FunctionKeysStore
 from ..i18n import available_languages, tr
 from ..import_gate import gate
 from ..settings import THEME_MODES, TYPING_DELAY_RANGE, Settings, SettingsStore, default_config_dir
-from . import theme
+from . import theme, tkfinalizers
 from .form import parse_form
 from .key_capture import CaptureBackend, KeyCaptureButton, ShortcutCaptureButton
 from .theme import Button, Card, ScrollFrame, Switch, field_box, label, list_box
@@ -146,8 +145,8 @@ class SettingsPanel(tk.Frame):
         self._backup_dialogs = backup_dialogs or BackupDialogs(self.winfo_toplevel())
         self._backup_running = False  # a backup job is on its way: buttons off, no settings changes
         self._closed = False
-        self._gc_paused = False  # gc is off while a backup job runs, see ``_gc_pause``
         self._holds_gate = False  # this page has the import gate: other saves are refused until _finish
+        self._gate_lock = threading.Lock()  # the Tk thread and the worker both release it, once
         self._job_running = False  # the worker thread is still inside its job
         self._deferred_change = False  # a form change was made while a job ran
         self._pre_import: Settings | None = None  # the settings before the telecode alphabet was let go
@@ -221,9 +220,13 @@ class SettingsPanel(tk.Frame):
         self._undo_button.pack()
 
         self._alphabet_var = tk.StringVar()
-        self._alphabet_box = self._combo(card.add_row(tr("settings.alphabet"), tr("settings.alphabet.hint")), self._alphabet_var)
+        self._alphabet_box = self._combo(
+            card.add_row(tr("settings.alphabet"), tr("settings.alphabet.hint")), self._alphabet_var, field="alphabet"
+        )
         self._smiley_var = tk.StringVar()
-        self._smiley_box = self._combo(card.add_row(tr("settings.smileys"), tr("settings.smileys.hint")), self._smiley_var)
+        self._smiley_box = self._combo(
+            card.add_row(tr("settings.smileys"), tr("settings.smileys.hint")), self._smiley_var, field="smileys"
+        )
 
         # display
         self._section(4, "settings.section.display")
@@ -293,11 +296,14 @@ class SettingsPanel(tk.Frame):
             row=row, column=0, sticky="w", padx=8, pady=(16 if row > 1 else 4, 8)
         )
 
-    def _combo(self, parent: tk.Misc, variable: tk.StringVar, values: list[str] | None = None) -> ttk.Combobox:
+    def _combo(
+        self, parent: tk.Misc, variable: tk.StringVar, values: list[str] | None = None, field: str | None = None
+    ) -> ttk.Combobox:
+        """``field``: the setting this box chooses; picking an entry saves it, even if it is what already runs."""
         box, combo = field_box(parent, ttk.Combobox, textvariable=variable, state="readonly", width=30, values=values or [])
         box.configure(width=300, height=40)
         box.pack()
-        combo.bind("<<ComboboxSelected>>", lambda _e: self._changed())
+        combo.bind("<<ComboboxSelected>>", lambda _e: self._changed(chosen=(field,) if field else ()))
         return combo
 
     def _show_key_hint(self, text: str) -> None:
@@ -359,8 +365,12 @@ class SettingsPanel(tk.Frame):
             self.after_cancel(self._job)
         self._job = self.after(TYPING_DELAY_MS, self._changed)
 
-    def _changed(self) -> None:
-        """Read the form and apply it right away (live preview)."""
+    def _changed(self, chosen: tuple[str, ...] = ()) -> None:
+        """Read the form and apply it right away (live preview).
+
+        ``chosen``: settings the user picked in a box of this form just now; they are saved even if they equal
+        what runs (after an import the program may run Latin while the file names an alphabet it could not load).
+        """
         if self._loading or self._busy:
             return
         if self._backup_running:  # an import writes settings.json itself: apply the change when the job is over
@@ -392,12 +402,15 @@ class SettingsPanel(tk.Frame):
             language=self._language_by_label.get(self._language_var.get(), current.language),
             theme=self._theme_by_label.get(self._theme_var.get(), current.theme),
         )
-        if settings == current:
+        if settings == current and not chosen:
             self._error.configure(text="")
             return
         self._busy = True
         try:
-            self._apply(settings)
+            if chosen:
+                self._apply(settings, chosen=chosen)
+            else:
+                self._apply(settings)
             self._error.configure(text="")
         except Exception as exc:  # noqa: BLE001 - e.g. a broken alphabet file
             self._busy = False
@@ -412,7 +425,6 @@ class SettingsPanel(tk.Frame):
         if event.widget is self:
             self._closed = True
             gate.hold(self, False)
-            self._gc_restore()
             if not self._job_running:  # else the worker releases the gate when it is done: it is still writing
                 self._release_gate()
             if self._worker_job is not None:
@@ -433,7 +445,6 @@ class SettingsPanel(tk.Frame):
         """
         self._set_backup_running(True)
         self._job_running = True
-        self._gc_pause()
         outcome: queue.Queue[tuple[Any, BaseException | None]] = queue.Queue()
 
         def run() -> None:
@@ -446,27 +457,17 @@ class SettingsPanel(tk.Frame):
                 if self._closed:  # the page was destroyed while the job ran: nobody is left to release the gate
                     self._release_gate()
 
-        threading.Thread(target=run, name="backup", daemon=True).start()
+        try:
+            threading.Thread(target=run, name="backup", daemon=True).start()
+        except BaseException:  # no thread: the page must not stay "busy" and the gate not taken
+            self._job_running = False
+            self._release_gate()
+            self._set_backup_running(False)
+            raise
         self._poll(outcome, done)
 
-    def _gc_pause(self) -> None:
-        """No garbage collection while the worker runs.
-
-        A collection frees the Tk variables of pages that were destroyed (reference cycles). Run on the worker
-        thread it would call Tk from there, and Tk waits for the main loop (about a second per variable and
-        "main thread is not in main loop" when the loop is only polled). The Tk thread collects afterwards.
-        """
-        if not self._gc_paused and gc.isenabled():
-            self._gc_paused = True
-            gc.disable()
-
-    def _gc_restore(self) -> None:
-        if self._gc_paused:
-            self._gc_paused = False
-            gc.enable()
-            gc.collect()  # on this thread, the one that may free Tk variables
-
     def _poll(self, outcome: queue.Queue, done: Callable[[Any, BaseException | None], None]) -> None:
+        tkfinalizers.drain()  # Tk objects of destroyed pages that the collector of another thread parked
         if self._closed:
             return
         try:
@@ -475,7 +476,6 @@ class SettingsPanel(tk.Frame):
             self._worker_job = self.after(WORKER_POLL_MS, self._poll, outcome, done)
             return
         self._worker_job = None
-        self._gc_restore()
         try:
             done(result, error)
         except Exception as exc:  # noqa: BLE001 - a traceback in a Tk callback would leave the page stuck
@@ -492,9 +492,11 @@ class SettingsPanel(tk.Frame):
                 self._changed()
 
     def _release_gate(self) -> None:
-        if self._holds_gate:
+        with self._gate_lock:  # the worker and ``_on_destroy`` can both get here: only the first lets go
+            if not self._holds_gate:
+                return
             self._holds_gate = False
-            gate.end()
+        gate.end()
 
     def _error_text(self, error: BaseException) -> str:
         """The message of a failed job in the current language; a restore point is always named."""
@@ -784,7 +786,7 @@ class SettingsPanel(tk.Frame):
         controller = self._controller
         target = before
         wanted = before.replace(alphabet=disk.alphabet, smileys=disk.smileys)  # only the choice, never on/off
-        if wanted != before and any(w.startswith(("alphabets/", "smileys/")) for w in written):
+        if wanted != before and any(w.startswith(("alphabets/", "smileys/")) or w == backup.TELECODE_FILE for w in written):
             try:
                 controller.apply_settings(wanted)
                 target = wanted

@@ -14,6 +14,7 @@ import os
 import re
 import threading
 import time
+import unicodedata
 from collections import deque
 from collections.abc import Callable
 from typing import NamedTuple, Protocol
@@ -239,6 +240,7 @@ class MorseController:
         self._lock = threading.RLock()
         self._running = False
         self._calibrating = False
+        self._smiley_warned: set[str] = set()
         # letters and word gaps are muted from the engine's "measuring" marker 1 to the marker 0, not from
         # the moment the flag changes: the marker sits in the event stream where the engine switched, so
         # a letter keyed under one setting is judged under that setting
@@ -270,7 +272,7 @@ class MorseController:
         try:
             dictionaries.set_smileys(settings.smileys)
         except ValueError as exc:  # set deleted or broken: start without smileys instead of crashing
-            log.warning("Smiley-Set '%s' nicht ladbar (%s) – Smileys aus", settings.smileys, exc)
+            self._warn_smileys(settings.smileys, exc)
         # build the decoder now so a bad alphabet fails at startup, not on the first letter
         self._decoder: Decoder = decoder_factory(dictionaries, settings.alphabet)
         # one entry per character so ``erase`` can pop entries 1:1; maxlen caps memory
@@ -373,7 +375,13 @@ class MorseController:
         with self._lock:
             self._muted = False  # only now: a letter of the measuring phase may still have been on its way
 
-    def apply_settings(self, new: Settings) -> None:
+    def apply_settings(self, new: Settings, lenient_smileys: bool = False) -> None:
+        """Apply ``new``; nothing changes if that fails.
+
+        ``lenient_smileys`` (an import loading settings.json, like the start of the program): a smiley set that
+        is not there is no reason to refuse the rest, the name stays in the settings and the set is loaded by
+        the next apply that finds it.
+        """
         errors = new.validate() or self._function_keys.clashes(new)
         if errors:
             raise ValueError("; ".join(errors))
@@ -387,7 +395,15 @@ class MorseController:
             if changed or stale:
                 # build the new decoder first, if that fails nothing changes
                 try:
-                    self._dictionaries.set_smileys(new.smileys)
+                    try:
+                        self._dictionaries.set_smileys(new.smileys)
+                    except ValueError as exc:  # SmileyError: file missing or broken
+                        # refused only if this change asks for the set; a name that is already in the settings must
+                        # not block an alphabet change (it did not at the start either: the smileys stay off)
+                        if stale or (new.smileys != old.smileys and not lenient_smileys):
+                            raise
+                        self._warn_smileys(new.smileys, exc)
+                        self._dictionaries.set_smileys("")
                     decoder = self._decoder_factory(self._dictionaries, new.alphabet)
                 except Exception:
                     try:
@@ -629,7 +645,9 @@ class MorseController:
         with self._lock:
             try:  # the active smiley set may be one of the files that changed
                 self._dictionaries.set_smileys(self._settings.smileys)
-            except Exception:  # noqa: BLE001 - a set that is gone: keep the codes in memory, the alphabet reload goes on
+            except ValueError as exc:  # SmileyError: a set that is not there (yet); the alphabet reload goes on
+                self._warn_smileys(self._settings.smileys, exc)
+            except Exception:  # noqa: BLE001 - keep the codes in memory, the alphabet reload goes on
                 log.exception("Smiley-Set konnte nicht neu geladen werden")
             self._dictionaries.invalidate()
             decoder = self._decoder_factory(self._dictionaries, self._settings.alphabet)  # raises: old decoder stays
@@ -637,6 +655,12 @@ class MorseController:
             self._decoder = decoder
             self._close_decoder(replaced)
             self._engine.reset()
+
+    def _warn_smileys(self, name: str, exc: Exception) -> None:
+        """A named smiley set that cannot be loaded: say so once per name, not at every reload."""
+        if name not in self._smiley_warned:
+            self._smiley_warned.add(name)
+            log.warning("Smiley-Set '%s' nicht ladbar (%s) – Smileys aus", name, exc)
 
     @staticmethod
     def _close_decoder(old) -> None:
@@ -734,7 +758,13 @@ class MorseController:
         length of the previous output alone. Text that Esc cut short is not counted.
         """
         # typing takes a few ms, so do it outside the lock to not block apply_settings
-        steps = macros.parse(emission.text, self._injector.check_shortcut)  # first, so a broken macro changes nothing
+        if emission.plain:
+            # typed as it is: no braces, no commands; control characters would be typed as Enter or Tab
+            text = "".join(c for c in emission.text if unicodedata.category(c) != "Cc")
+            steps: list[macros.Step] = [("text", text)] if text else []
+        else:
+            # parsed first, so a broken macro changes nothing
+            steps = macros.parse(emission.text, self._injector.check_shortcut)
         self._check_paths(steps)
         steps = self._resolve_scrapes(steps)  # a missing marker before any key press stops the macro before it types
         self._set_typing_delay(effective_typing_delay(self._settings.typing_delay_ms, typing_delay_ms))

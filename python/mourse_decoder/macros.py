@@ -109,6 +109,8 @@ def commands_in_file(path: Path) -> list[str]:
     try:
         data = jsontext.loads(Path(path).read_text(encoding="utf-8-sig"), dict)
         values = [v for v in data["codes"].values() if isinstance(v, str)]
+        if isinstance(data.get("word_separator"), str):  # typed at every word pause, like a code
+            values.append(data["word_separator"])
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return []
     return commands_in_texts(values)

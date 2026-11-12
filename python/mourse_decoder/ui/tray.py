@@ -17,12 +17,13 @@ from tkinter import messagebox
 import pystray
 
 from ..controller import MorseController
-from ..dictionary import DictionaryManager
+from ..dictionary import AlphabetError, DictionaryManager
 from ..i18n import set_language, tr
 from ..import_gate import gate
 from ..settings import Settings, SettingsStore
+from ..telecode import TelecodeError
 from ..triggers import binding_label
-from . import theme
+from . import theme, tkfinalizers
 from .icon import create_icon
 from .main_window import MainWindow
 from .splash import Splash
@@ -31,39 +32,54 @@ from .toast import Toast
 log = logging.getLogger(__name__)
 
 POLL_INTERVAL_MS = 250
-# what settings.json says and the program does not always do: the switches the on/off shortcut flips at run
-# time, and the alphabet and smiley set, which fall back (in memory only) when the named one cannot be loaded
+# What settings.json says and the program does not always run: the switches the on/off shortcut flips at run time,
+# and the alphabet, which falls back to the default in memory when the named one cannot be loaded (at the start and
+# after an import). The tray keeps the file's values (``saved_fields``) and writes them back unless the user
+# changes them, so a pause or a fallback never rewrites the file.
 SAVED_FIELDS = ("enabled", "block_input", "alphabet", "smileys")
+
+
+def saved_fields(store: SettingsStore) -> dict[str, object]:
+    """The values of ``SAVED_FIELDS`` that settings.json holds now (not what the controller runs)."""
+    on_disk = SettingsStore(store.directory).load()  # a new store: the warnings of ``store`` stay as they are
+    return {name: getattr(on_disk, name) for name in SAVED_FIELDS}
+
+
+BALLOON_UNITS = 255  # NOTIFYICONDATA.szInfo holds 256 UTF-16 units including the end mark
+
+
+def fit_balloon(message: str) -> str:
+    """``message`` cut so that a tray balloon accepts it (pystray raises "string too long" above 255 units)."""
+    if len(message.encode("utf-16-le")) // 2 <= BALLOON_UNITS:
+        return message
+    out, used = [], 1  # one unit for the ellipsis
+    for char in message:
+        units = 2 if ord(char) > 0xFFFF else 1
+        if used + units > BALLOON_UNITS:
+            break
+        out.append(char)
+        used += units
+    return "".join(out) + "…"
 
 
 def take_over_imported(controller: MorseController, settings: Settings) -> Settings:
     """Apply the settings of an imported ``settings.json``; returns what the controller really runs.
 
-    Like at the start of the program (``app.build_controller``), an alphabet or smiley set that cannot be loaded
-    (the file is not in the backup, telecode.sqlite is missing) is replaced by the default / none in memory, so
-    the rest of the import still takes effect. The file on disk keeps what the import wrote.
-    Raises the first error if no replacement helps (e.g. a shortcut clash).
+    The same rules as at the start of the program (``app.build_controller``): an alphabet that cannot be loaded
+    (it is not in the backup, telecode.sqlite is missing) is replaced by the default in memory, and a smiley set
+    that is not there leaves the name in the settings and the smileys off until it appears. The rest of the file
+    takes effect; the file on disk keeps what the import wrote. Anything else (e.g. a shortcut clash) is raised.
     """
     try:
-        controller.apply_settings(settings)
+        controller.apply_settings(settings, lenient_smileys=True)
         return settings
-    except Exception as first:  # noqa: BLE001
-        log.warning("Import: Einstellungen nicht ladbar (%s), Ersatz wird gesucht", first)
-        default = Settings()
-        for changes in (
-            {"alphabet": default.alphabet},
-            {"smileys": default.smileys},
-            {"alphabet": default.alphabet, "smileys": default.smileys},
-        ):
-            candidate = settings.replace(**changes)
-            if candidate == settings:
-                continue
-            try:
-                controller.apply_settings(candidate)
-                return candidate
-            except Exception:  # noqa: BLE001
-                continue
-        raise first
+    except (AlphabetError, TelecodeError) as first:
+        fallback = settings.replace(alphabet=Settings().alphabet)
+        if fallback == settings:
+            raise
+        log.warning("Import: Alphabet '%s' nicht ladbar (%s), Standard wird verwendet", settings.alphabet, first)
+        controller.apply_settings(fallback, lenient_smileys=True)
+        return fallback
 
 
 class TrayApp:
@@ -83,7 +99,7 @@ class TrayApp:
         self._dictionaries = dictionaries
         self._store = store
         # what settings.json says about the two switches the on/off shortcut flips at run time
-        self._saved_flags = {name: getattr(controller.settings, name) for name in SAVED_FIELDS}
+        self._saved_flags = saved_fields(store)
         self._ui_queue: queue.Queue[Callable[[], None]] = queue.Queue()
 
         self._root = tk.Tk()
@@ -116,6 +132,7 @@ class TrayApp:
         self._ui_queue.put(func)
 
     def _drain_queue(self) -> None:
+        tkfinalizers.drain()
         while True:
             try:
                 func = self._ui_queue.get_nowait()
@@ -161,7 +178,7 @@ class TrayApp:
             return
         self._hook_error_shown = True
         log.error("Tastatur-Hook ausgefallen: %s", error)
-        self._icon.notify(error, tr("tray.error"))
+        self._icon.notify(fit_balloon(error), tr("tray.error"))
         self._toast.show(error, False)
 
     def _poll_block(self) -> None:
@@ -196,7 +213,7 @@ class TrayApp:
             return
         alphabet, position, total = target
         try:
-            self._apply(self._controller.settings.replace(alphabet=alphabet))
+            self._apply(self._controller.settings.replace(alphabet=alphabet), chosen=("alphabet",))
         except Exception as exc:  # noqa: BLE001 - e.g. a broken alphabet file
             log.exception("Umschalten auf %s fehlgeschlagen", alphabet)
             self._toast.show(f"{tr('err.apply')}: {exc}", False)
@@ -244,7 +261,8 @@ class TrayApp:
         self.call_in_ui(update)
 
     def on_error(self, message: str) -> None:
-        self.call_in_ui(lambda: self._icon.notify(message, tr("tray.error")))
+        shown = fit_balloon(message)
+        self.call_in_ui(lambda: self._icon.notify(shown, tr("tray.error")))
 
     def _tooltip(self) -> str:
         s = self._controller.settings
@@ -288,28 +306,30 @@ class TrayApp:
     def _change(self, **changes: object) -> None:
         """Change from the tray menu: show errors instead of raising."""
         try:
-            self._apply(self._controller.settings.replace(**changes))
+            self._apply(self._controller.settings.replace(**changes), chosen=tuple(changes))
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror(tr("app.name"), f"{tr('err.apply')}:\n{exc}")
 
-    def _to_save(self, settings: Settings, runtime_only: bool) -> tuple[Settings, dict[str, bool]]:
-        """The settings to write, and the saved switch values after that.
+    def _to_save(
+        self, settings: Settings, runtime_only: bool, chosen: tuple[str, ...] = ()
+    ) -> tuple[Settings, dict[str, object]]:
+        """The settings to write, and the saved values of ``SAVED_FIELDS`` after that.
 
-        ``enabled``, ``block_input`` (and the alphabet and smiley set, if the running ones are only a fallback)
-        are written only when the user changed them (form, tray menu).
-        A pause by the on/off shortcut (``runtime_only``) and any other save made while paused keep the
-        values that are on disk, so the next start blocks again.
+        Those fields are written only when the user changed them (form, tray menu, cycle shortcut): a changed
+        value, or one in ``chosen`` (picked explicitly, even if it equals what runs). A pause by the on/off
+        shortcut (``runtime_only``) and any other save, made while paused or while a fallback alphabet runs,
+        keep the values that are on disk, so the next start blocks again and the named alphabet is still named.
         """
         current = self._controller.settings
         saved = dict(self._saved_flags)
         if not runtime_only:
             for name in saved:
-                if getattr(settings, name) != getattr(current, name):
+                if getattr(settings, name) != getattr(current, name) or name in chosen:
                     saved[name] = getattr(settings, name)
         return settings.replace(**saved), saved
 
-    def _apply(self, settings: Settings, runtime_only: bool = False) -> None:
-        """Apply and save. Raises on errors, the caller shows them."""
+    def _apply(self, settings: Settings, runtime_only: bool = False, chosen: tuple[str, ...] = ()) -> None:
+        """Apply and save. Raises on errors, the caller shows them. ``chosen``: see ``_to_save``."""
         gate.check()  # ImportBusy while a backup import is writing the files
         if gate.loading():
             # the import loads the settings.json it wrote: that is what is saved, whatever the program runs
@@ -320,7 +340,7 @@ class TrayApp:
             live = take_over_imported(self._controller, wanted)
             to_save, saved = settings, {name: getattr(settings, name) for name in SAVED_FIELDS}
         else:
-            to_save, saved = self._to_save(settings, runtime_only)
+            to_save, saved = self._to_save(settings, runtime_only, chosen)
             self._controller.apply_settings(settings)
             live = settings
         self._store.save(to_save)

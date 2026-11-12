@@ -43,6 +43,8 @@ from .function_keys import FILE_NAME as _FUNCTION_KEYS_NAME
 from .function_keys import SCHEMA_VERSION as FUNCTION_KEYS_SCHEMA_VERSION
 from .function_keys import FunctionKeys, FunctionKeysStore
 from .import_gate import gate
+from .jsontext import HIDING as _HIDING
+from .jsontext import SCRATCH_PREFIX, display_text
 from .settings import Settings, SettingsStore, is_valid_id
 
 FORMAT_NAME = "mourse-decoder-backup"
@@ -80,10 +82,6 @@ _RESERVED = {
     *(f"com{n}" for n in range(1, 10)), *(f"lpt{n}" for n in range(1, 10)),
 }
 _SHORT_NAME = re.compile(r"~[0-9]")  # 8.3 names such as ALPHAB~1.json
-# bidi controls and zero-width characters that hide what a name says; ZWJ and ZWNJ stay (real scripts need them)
-_HIDING = {
-    chr(c) for c in (0x061C, 0x200B, 0x200E, 0x200F, 0x2060, 0xFEFF, *range(0x202A, 0x202F), *range(0x2066, 0x206A))
-}
 _TEMP_SUFFIX = ".mourse-tmp"
 
 
@@ -236,23 +234,6 @@ class ImportResult:
 
 
 # names and display
-
-
-def display_text(text: str, limit: int | None = None) -> str:
-    """``text`` with control, bidi and zero-width characters written out (``\\u202e``), cut at ``limit``."""
-    out: list[str] = []
-    for char in text:
-        category = unicodedata.category(char)
-        if char in ("\n", "\r", "\t"):
-            out.append({"\n": "\\n", "\r": "\\r", "\t": "\\t"}[char])
-        elif category in ("Cc", "Cs", "Zl", "Zp") or char in _HIDING or category == "Cf":
-            out.append(f"\\u{ord(char):04x}" if ord(char) < 0x10000 else f"\\U{ord(char):08x}")
-        else:
-            out.append(char)
-    shown = "".join(out)
-    if limit is not None and len(shown) > limit:
-        shown = shown[:limit] + "…"
-    return shown
 
 
 def _reserved(stem: str) -> bool:
@@ -591,7 +572,7 @@ atexit.register(_clean_scratch)
 @contextmanager
 def _scratch():
     """A temporary folder outside the config folder; removed at the end, also after an error."""
-    path = Path(tempfile.mkdtemp(prefix="mourse-backup-"))
+    path = Path(tempfile.mkdtemp(prefix=SCRATCH_PREFIX))
     _live_scratch.add(path)
     try:
         yield path
@@ -751,11 +732,37 @@ def _summaries(keys: FunctionKeys) -> tuple[SlotSummary, ...]:
 def _command_summaries(files: dict[str, bytes], changed: set[str]) -> tuple[CommandSummary, ...]:
     out: list[CommandSummary] = []
     for name, data in files.items():
-        if name in changed and name.split("/")[0] in ("alphabets", "smileys"):
-            for code, text, commands in backup_content.commands_per_code(data):
+        if name in changed and (name.split("/")[0] in ("alphabets", "smileys") or name == TELECODE_FILE):
+            found = _telecode_commands(data) if name == TELECODE_FILE else backup_content.commands_per_code(data)
+            for code, text, commands in found:
                 shown = display_text(text, MACRO_SUMMARY_LENGTH)
                 out.append(CommandSummary(name, display_text(code, 40), shown, commands))
     return tuple(out)
+
+
+def _telecode_commands(data: bytes) -> list[tuple[str, str, tuple[str, ...]]]:
+    """(code, text, commands) of the entries of a telecode database whose text would do something as a macro.
+
+    The program types telecode text as it is (``Emission.plain``), so this is no danger at run time; a database
+    with a ``{Win+R}`` as a character is not what the build tool writes, and a backup should say so. Every row is
+    looked at, within the same time limit as the structure check (a check that takes longer refuses the file).
+    """
+    with _scratch() as folder:
+        copy = folder / TELECODE_FILE
+        copy.write_bytes(data)
+        conn = None
+        try:
+            conn = sqlite3.connect(f"{copy.resolve().as_uri()}?mode=ro", uri=True)
+            conn.execute("PRAGMA trusted_schema = OFF")
+            deadline = time.monotonic() + SQLITE_CHECK_SECONDS
+            conn.set_progress_handler(lambda: 1 if time.monotonic() > deadline else 0, 10_000)
+            rows = ((str(code), char) for code, char in conn.execute("SELECT code, char FROM telecode"))
+            return backup_content.commands_in_rows(rows)
+        except sqlite3.Error as exc:
+            raise BackupError("sqlite_error", name=TELECODE_FILE, error=exc, path=TELECODE_FILE) from exc
+        finally:
+            if conn is not None:
+                conn.close()
 
 
 @dataclass(frozen=True)
@@ -958,7 +965,7 @@ def _load(
         name
         for name in manifest.get("restore_created", [])
         if name not in skipped and name not in files and _regular(config_dir / name, config_dir)
-    )
+    ) if _is_own_restore_point(Path(zip_path), config_dir) else ()
     checked = _validate_files(config_dir, files, check_shortcut, set(removed))
     return _Loaded(manifest, files, digest, checked.keys, checked.warnings, checked.notes, removed)
 
@@ -1056,6 +1063,25 @@ def _is_restore_point(path: Path) -> bool:
     )
 
 
+def _restore_point_name(config_dir: Path) -> re.Pattern[str]:
+    return re.compile(re.escape(config_dir.name) + r"-backup-(\d{8}-\d{6})(?:-(\d+))?\.zip\Z")
+
+
+def _is_own_restore_point(zip_path: Path, config_dir: Path) -> bool:
+    """A restore point of this config folder: next to it, named like the ones this feature writes, marked as one.
+
+    Only such a zip may delete files of the config folder (``restore_created``). A zip from anywhere else that
+    claims to be one is imported like any bundle: its list of files to remove is ignored.
+    """
+    try:
+        same_place = Path(zip_path).resolve().parent == config_dir.resolve().parent
+    except OSError:
+        return False
+    return same_place and bool(_restore_point_name(config_dir).fullmatch(Path(zip_path).name)) and _is_restore_point(
+        Path(zip_path)
+    )
+
+
 def prune_restore_points(
     config_dir: Path, keep: int = KEEP_RESTORE_POINTS, protect: Path | None = None
 ) -> list[Path]:
@@ -1066,7 +1092,7 @@ def prune_restore_points(
     time, not by the local time in the name (a clock set back, the end of summer time), and ``protect`` (the
     restore point that was just written) is never deleted.
     """
-    pattern = re.compile(re.escape(config_dir.name) + r"-backup-(\d{8}-\d{6})(?:-(\d+))?\.zip\Z")
+    pattern = _restore_point_name(config_dir)
     found: list[tuple[int, str, Path]] = []
     try:
         for path in config_dir.parent.iterdir():

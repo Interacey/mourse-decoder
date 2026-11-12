@@ -17,9 +17,9 @@ from test_integration_interactions import run_import, shortcut_pause, start
 
 @pytest.fixture(autouse=True)
 def gate_is_free():
-    gate.end()
+    gate.reset()
     yield
-    gate.end()
+    gate.reset()
 
 
 @pytest.fixture
@@ -66,7 +66,7 @@ def panel(tk_root, fake_engine, injector, tmp_path):
         page.destroy()
 
 
-def test_alphabet_only_import_while_paused_by_shortcut_resumes_input(panel, fake_engine, tk_root):
+def test_alphabet_only_import_keeps_a_shortcut_pause(panel, fake_engine, tk_root):
     page, controller, store, tray, config, dialogs, _ = panel(
         '{"alphabet": "german", "block_input": true}', None, extra_alphabet=True
     )
@@ -81,7 +81,7 @@ def test_alphabet_only_import_while_paused_by_shortcut_resumes_input(panel, fake
     assert fake_engine.active is False, "import of alphabets only resumed Morse input (pause lost)"
 
 
-def test_pause_pressed_during_import_is_reverted(panel, fake_engine, tk_root, monkeypatch):
+def test_pause_pressed_during_the_import_is_applied_after_it(panel, fake_engine, tk_root, monkeypatch):
     page, controller, store, tray, config, dialogs, _ = panel(
         '{"alphabet": "german", "block_input": true}', '{"alphabet": "german", "block_input": true, "letter_gap_ms": 700}',
         extra_alphabet=False,
@@ -100,7 +100,7 @@ def test_pause_pressed_during_import_is_reverted(panel, fake_engine, tk_root, mo
     assert fake_engine.active is False, "pause pressed during the import was undone by the import's load"
 
 
-def test_quit_while_the_confirmation_is_open_does_not_stop_the_import(panel, fake_engine, tk_root):
+def test_quit_during_the_confirmation_waits_for_the_import(panel, fake_engine, tk_root):
     page, controller, store, tray, config, dialogs, _ = panel(
         '{"alphabet": "german"}', '{"alphabet": "german", "letter_gap_ms": 777}', extra_alphabet=False
     )
@@ -126,7 +126,7 @@ def test_quit_while_the_confirmation_is_open_does_not_stop_the_import(panel, fak
 
 
 @pytest.mark.parametrize("alphabet", ["chinese-telecode", "fehlt"])
-def test_import_whose_settings_cannot_be_loaded_is_overwritten_by_the_next_save(panel, fake_engine, tk_root, alphabet):
+def test_import_whose_settings_cannot_be_loaded_is_not_overwritten_by_the_next_save(panel, fake_engine, tk_root, alphabet):
     page, controller, store, tray, config, dialogs, _ = panel(
         '{"alphabet": "german", "letter_gap_ms": 600}',
         json.dumps({"alphabet": alphabet, "letter_gap_ms": 777}), extra_alphabet=False,
@@ -143,7 +143,7 @@ def test_import_whose_settings_cannot_be_loaded_is_overwritten_by_the_next_save(
 
 
 @pytest.mark.parametrize("with_settings", [False, True])
-def test_a_smiley_set_named_in_settings_that_was_missing_is_not_switched_to(
+def test_a_smiley_set_named_in_settings_that_was_missing_is_switched_to_after_the_import(
     tk_root, fake_engine, injector, tmp_path, with_settings
 ):
     from mourse_decoder.controller import MorseController
@@ -187,7 +187,7 @@ def test_a_smiley_set_named_in_settings_that_was_missing_is_not_switched_to(
         page.destroy()
 
 
-def test_restoring_an_own_backup_with_unchanged_settings_while_paused_resumes_input(panel, fake_engine, tk_root):
+def test_restoring_an_own_backup_with_unchanged_settings_keeps_the_pause(panel, fake_engine, tk_root):
     same = '{"alphabet": "german", "block_input": true}'
     page, controller, store, tray, config, dialogs, _ = panel(same, same, extra_alphabet=True)
     shortcut_pause(fake_engine, tray)
@@ -198,7 +198,7 @@ def test_restoring_an_own_backup_with_unchanged_settings_while_paused_resumes_in
     assert fake_engine.active is False
 
 
-def test_own_backup_settings_byte_identical_paused_resumes(tk_root, fake_engine, injector, tmp_path):
+def test_restoring_an_alphabet_from_an_own_backup_keeps_the_pause(tk_root, fake_engine, injector, tmp_path):
     from mourse_decoder.settings import Settings, SettingsStore
     from mourse_decoder.ui import theme
     from mourse_decoder.ui.settings_panel import SettingsPanel

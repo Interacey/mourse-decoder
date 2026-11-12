@@ -535,10 +535,10 @@ class FakeTray:
         poll.__name__ = f"_poll_{name}"
         return poll
 
-    def _to_save(self, settings, runtime_only):
+    def _to_save(self, settings, runtime_only, chosen=()):
         from mourse_decoder.ui.tray import TrayApp
 
-        return TrayApp._to_save(self, settings, runtime_only)
+        return TrayApp._to_save(self, settings, runtime_only, chosen)
 
     def apply(self, settings):
         from mourse_decoder.ui.tray import TrayApp

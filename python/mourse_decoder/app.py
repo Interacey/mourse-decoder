@@ -14,6 +14,7 @@ from .controller import MorseController, NativeInjector
 from .dictionary import AlphabetError, DictionaryManager
 from .function_keys import FunctionKeysStore
 from .i18n import set_language, tr
+from .jsontext import clean_orphaned_scratch, display_text
 from .settings import Settings, SettingsStore
 from .telecode import TelecodeError
 
@@ -236,6 +237,10 @@ def main(argv: list[str] | None = None) -> int:
 
     store = SettingsStore()
     settings = store.load()
+    try:  # check folders of a backup check that a killed process left behind (copies of the settings and macros)
+        clean_orphaned_scratch()
+    except Exception:  # noqa: BLE001 - housekeeping must never stop the program
+        log.exception("Temporäre Backup-Ordner nicht aufgeräumt")
     set_language(settings.language, store.directory / "languages")  # startup warnings use it
     notices = settings_warnings(store)
     dictionaries = DictionaryManager(
@@ -251,7 +256,10 @@ def main(argv: list[str] | None = None) -> int:
         controller.start()
         for warning in notices + startup_warnings + _start_function_keys(controller, store.directory, injector):
             print(f"Warnung: {warning}", file=sys.stderr, flush=True)
-        print(f"Morse-Decoder läuft (Taster: {settings.trigger}, Alphabet: {settings.alphabet}). Strg+C beendet.")
+        print(
+            f"Morse-Decoder läuft (Taster: {display_text(settings.trigger)}, "
+            f"Alphabet: {display_text(settings.alphabet)}). Strg+C beendet."
+        )
         try:
             while True:
                 time.sleep(0.1)

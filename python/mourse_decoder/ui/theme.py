@@ -17,6 +17,10 @@ from tkinter import ttk
 
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageTk
 
+from . import tkfinalizers
+
+tkfinalizers.install()  # Tk variables, images and fonts are freed on the Tk thread only
+
 
 @dataclass(frozen=True)
 class Palette:

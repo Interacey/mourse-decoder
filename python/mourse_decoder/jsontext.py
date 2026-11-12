@@ -11,6 +11,9 @@ import json
 import os
 import re
 import shutil
+import tempfile
+import time
+import unicodedata
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -227,3 +230,55 @@ def backup_file(path: Path, move: bool) -> None:
             shutil.copy2(path, target)
     except OSError:
         pass
+
+
+# bidi controls and zero-width characters that hide what a text says; ZWJ and ZWNJ stay (real scripts need them)
+HIDING = {
+    chr(c) for c in (0x061C, 0x200B, 0x200E, 0x200F, 0x2060, 0xFEFF, *range(0x202A, 0x202F), *range(0x2066, 0x206A))
+}
+
+
+def display_text(text: str, limit: int | None = None) -> str:
+    """``text`` with control, bidi and zero-width characters written out (``\\u202e``), cut at ``limit``."""
+    out: list[str] = []
+    for char in text:
+        category = unicodedata.category(char)
+        if char in ("\n", "\r", "\t"):
+            out.append({"\n": "\\n", "\r": "\\r", "\t": "\\t"}[char])
+        elif category in ("Cc", "Cs", "Zl", "Zp") or char in HIDING or category == "Cf":
+            out.append(f"\\u{ord(char):04x}" if ord(char) < 0x10000 else f"\\U{ord(char):08x}")
+        else:
+            out.append(char)
+    shown = "".join(out)
+    if limit is not None and len(shown) > limit:
+        shown = shown[:limit] + "…"
+    return shown
+
+
+SCRATCH_PREFIX = "mourse-backup-"
+ORPHAN_AGE_SECONDS = 24 * 3600
+
+
+def clean_orphaned_scratch(max_age_seconds: float = ORPHAN_AGE_SECONDS, parent: Path | None = None) -> list[Path]:
+    """Remove scratch folders that an earlier run left behind (a process that was killed mid-check).
+
+    They hold copies of settings.json, function_keys.json and alphabets. Only folders of the temp folder that
+    carry this program's prefix are touched, and only when they were last changed more than ``max_age_seconds``
+    ago, so the folder of a program that is running right now stays. Returns what was removed.
+    """
+    removed: list[Path] = []
+    try:
+        folder = Path(parent) if parent is not None else Path(tempfile.gettempdir())
+        candidates = [p for p in folder.iterdir() if p.name.startswith(SCRATCH_PREFIX)]
+    except OSError:
+        return removed
+    cutoff = time.time() - max_age_seconds
+    for path in candidates:
+        try:
+            if path.is_symlink() or not path.is_dir() or path.stat().st_mtime > cutoff:
+                continue
+            shutil.rmtree(path)
+            removed.append(path)
+        except OSError:
+            continue  # in use or not ours to delete: leave it
+    return removed

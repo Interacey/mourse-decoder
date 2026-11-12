@@ -43,6 +43,12 @@ class ImportGate:
         with self._guard:
             self._running = False
             self._allowed = 0
+
+    def reset(self) -> None:
+        """Everything off, other pages' holds included (tests; the program never needs it)."""
+        with self._guard:
+            self._running = False
+            self._allowed = 0
             self._holders.clear()
 
     def hold(self, owner: object, on: bool) -> None:
