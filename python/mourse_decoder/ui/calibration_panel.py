@@ -10,6 +10,7 @@ from .. import calibration
 from ..calibration import DASH, DOT, LETTER, WORD
 from ..controller import MorseController
 from ..i18n import tr
+from ..import_gate import ImportBusy
 from ..settings import Settings
 from . import theme
 from .theme import Button, Card, label
@@ -195,6 +196,9 @@ class CalibrationPanel(tk.Frame):
         try:
             new = calibration.apply_proposal(self._controller.settings, proposal)
             self._apply_settings(new)
+        except ImportBusy:  # a backup import is writing the files: say so, not "refused"
+            self._notes.set(tr("backup.err.busy"))
+            return
         except Exception as exc:  # noqa: BLE001 - the settings page shows every refusal the same way
             # the text of Settings.validate is German only: log it, show the localized sentence
             log.warning("Kalibrierung: Werte nicht übernommen: %s", exc, exc_info=not isinstance(exc, ValueError))

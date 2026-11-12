@@ -58,6 +58,11 @@ class ImportGate:
         with self._guard:
             return self._running and not self._allowed
 
+    def loading(self) -> bool:
+        """True while the import loads its new files into the program (inside ``allow``)."""
+        with self._guard:
+            return self._running and self._allowed > 0
+
     def check(self) -> None:
         """Raise ``ImportBusy`` while a change must not be saved."""
         if self.blocked():

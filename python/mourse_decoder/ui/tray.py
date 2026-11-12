@@ -266,6 +266,9 @@ class TrayApp:
         A pause by the on/off shortcut (``runtime_only``) and any other save made while paused keep the
         values that are on disk, so the next start blocks again.
         """
+        if gate.loading():
+            # an import brought settings.json: what the file now says about the switches is the saved value
+            return settings, {name: getattr(settings, name) for name in self._saved_flags}
         current = self._controller.settings
         saved = dict(self._saved_flags)
         if not runtime_only:

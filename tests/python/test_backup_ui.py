@@ -523,8 +523,9 @@ class FakeTray:
         self._ui_queue = __import__("queue").Queue()
         self._root = MagicMock()
         self._quit_pending = False
+        self._saved_flags = {"enabled": controller.settings.enabled, "block_input": controller.settings.block_input}
         self._drain_queue = lambda: None  # the loop schedules itself again with this
-        for name in ("block", "cycle", "undo", "function_keys", "hook"):
+        for name in ("block", "cycle", "undo", "function_keys", "hook", "calibration"):
             setattr(self, f"_poll_{name}", self._recorder(name))
 
     def _recorder(self, name):
@@ -533,6 +534,11 @@ class FakeTray:
 
         poll.__name__ = f"_poll_{name}"
         return poll
+
+    def _to_save(self, settings, runtime_only):
+        from mourse_decoder.ui.tray import TrayApp
+
+        return TrayApp._to_save(self, settings, runtime_only)
 
     def apply(self, settings):
         from mourse_decoder.ui.tray import TrayApp
