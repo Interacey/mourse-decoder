@@ -53,6 +53,16 @@ pub enum TimerOutput {
     Letter(String),
     /// A longer pause (>= word_gap) after at least one letter.
     WordGap,
+    /// How long the key was held, reported right before the [`TimerOutput::Symbol`] of the
+    /// same release. Only the engine worker in measuring mode emits it (calibration).
+    Press(Duration),
+    /// Silence between the last release and a new press, reported when the press arrives.
+    /// Only the engine worker in measuring mode emits it (calibration).
+    Gap(Duration),
+    /// The worker has taken over a [`crate::engine::WorkerMessage::SetMeasuring`]. It sits in the
+    /// output stream at the exact place of the switch: everything before it came out under the old
+    /// setting, everything after it under the new one. Only sent in answer to that message.
+    Measuring(bool),
 }
 
 /// Error for an invalid configuration.
@@ -201,6 +211,16 @@ impl MorseTimer {
 
     pub fn is_pressed(&self) -> bool {
         self.pressed_at.is_some()
+    }
+
+    /// How long the key has been held at time `at`, `None` if it is not held.
+    pub fn held_for(&self, at: Instant) -> Option<Duration> {
+        self.pressed_at.map(|p| at.saturating_duration_since(p))
+    }
+
+    /// Silence between the last release and `at`, `None` before the first release.
+    pub fn silence_before(&self, at: Instant) -> Option<Duration> {
+        self.last_release.map(|r| at.saturating_duration_since(r))
     }
 
     /// The sequence collected so far that isn't finished yet.

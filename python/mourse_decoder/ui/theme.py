@@ -584,6 +584,10 @@ def draw_glyph(canvas: tk.Canvas, name: str, cx: float, cy: float, color: str, t
         canvas.create_oval(x + 1, y + 1, x + 17, y + 17, fill="", outline=color, width=2, tags=tag)
         canvas.create_line(x + 9, y + 8, x + 9, y + 13, **line)
         canvas.create_oval(x + 8, y + 4, x + 10, y + 6, fill=color, outline=color, tags=tag)
+    elif name == "calibration":  # ruler with ticks
+        canvas.create_line(x, y + 14, x + 18, y + 14, **line)
+        for i, height in enumerate((9, 5, 9, 5, 9)):
+            canvas.create_line(x + 1 + i * 4, y + 14, x + 1 + i * 4, y + 14 - height, **line)
     elif name == "sidebar":  # window with a sidebar
         canvas.create_rectangle(x + 1, y + 2, x + 17, y + 16, fill="", outline=color, width=2, tags=tag)
         canvas.create_line(x + 7, y + 2, x + 7, y + 16, **line)

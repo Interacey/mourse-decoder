@@ -36,16 +36,38 @@ pub enum WorkerMessage {
     ReleaseAs(Instant, Symbol),
     Configure(TimingConfig),
     Reset,
+    /// Switches the measuring of press times and gaps on or off (see [`run_worker_with`]).
+    /// It sits in the same queue as the key events, so it takes effect exactly between the
+    /// events sent before and after it (the timestamp is the moment of the switch). The worker also resets
+    /// the timer then, in the same step, and answers with
+    /// [`TimerOutput::Measuring`] at that place of the output stream.
+    SetMeasuring(bool, Instant),
     Shutdown,
 }
 
 /// Processing loop. Blocks until `Shutdown` arrives or all senders are gone.
 ///
 /// A free function so tests can call it synchronously with a prepared channel.
-pub fn run_worker<F>(rx: Receiver<WorkerMessage>, config: TimingConfig, mut sink: F)
+pub fn run_worker<F>(rx: Receiver<WorkerMessage>, config: TimingConfig, sink: F)
 where
     F: FnMut(TimerOutput),
 {
+    run_worker_with(rx, config, false, sink)
+}
+
+/// Like [`run_worker`]; with `measure` it also reports [`TimerOutput::Gap`] when a press
+/// arrives and [`TimerOutput::Press`] right before the symbol of a release. Symbols,
+/// letters and word gaps come out exactly as without it. `measure` is the start value,
+/// [`WorkerMessage::SetMeasuring`] changes it while running.
+pub fn run_worker_with<F>(
+    rx: Receiver<WorkerMessage>,
+    config: TimingConfig,
+    measure: bool,
+    mut sink: F,
+) where
+    F: FnMut(TimerOutput),
+{
+    let mut measure = measure;
     let mut timer = MorseTimer::new(config);
 
     loop {
@@ -86,22 +108,51 @@ where
                 }
             }
             Some(WorkerMessage::Press(at)) => {
+                // a repeated press of a held key is no new press and has no gap
+                let gap = if measure && !timer.is_pressed() {
+                    timer.silence_before(at)
+                } else {
+                    None
+                };
                 for out in timer.on_press(at) {
                     sink(out);
                 }
+                if let Some(gap) = gap {
+                    sink(TimerOutput::Gap(gap));
+                }
             }
             Some(WorkerMessage::Release(at)) => {
+                let held = timer.held_for(at).filter(|_| measure);
                 if let Some(symbol) = timer.on_release(at) {
+                    if let Some(held) = held {
+                        sink(TimerOutput::Press(held));
+                    }
                     sink(TimerOutput::Symbol(symbol));
                 }
             }
             Some(WorkerMessage::ReleaseAs(at, fixed)) => {
+                let held = timer.held_for(at).filter(|_| measure);
                 if let Some(symbol) = timer.on_release_as(at, fixed) {
+                    if let Some(held) = held {
+                        sink(TimerOutput::Press(held));
+                    }
                     sink(TimerOutput::Symbol(symbol));
                 }
             }
             Some(WorkerMessage::Configure(cfg)) => timer.set_config(cfg),
             Some(WorkerMessage::Reset) => timer.reset(),
+            Some(WorkerMessage::SetMeasuring(on, at)) => {
+                // pauses that ran out before the switch (by its own timestamp, like every event, so a
+                // lagging worker does not cut a letter early) still belong to the old setting
+                for out in timer.poll(at) {
+                    sink(out);
+                }
+                measure = on;
+                sink(TimerOutput::Measuring(on)); // the marker the controller sorts letters by
+                                                  // a half-keyed letter and the last release belong to the old phase. Done here and not by a
+                                                  // separate Reset message: a press queued in between would still catch up a due pause
+                timer.reset();
+            }
             // a half-keyed sequence is dropped on stop on purpose, a letter typed
             // afterwards would be a surprise
             Some(WorkerMessage::Shutdown) => break,
@@ -121,10 +172,18 @@ impl EngineHandle {
     where
         F: FnMut(TimerOutput) + Send + 'static,
     {
+        Self::spawn_with(config, false, sink)
+    }
+
+    /// Like [`Self::spawn`]; with `measure` the sink also gets press durations and gaps.
+    pub fn spawn_with<F>(config: TimingConfig, measure: bool, sink: F) -> io::Result<Self>
+    where
+        F: FnMut(TimerOutput) + Send + 'static,
+    {
         let (tx, rx) = mpsc::channel();
         let thread = thread::Builder::new()
             .name("morse-worker".into()) // easier debugging and profiling
-            .spawn(move || run_worker(rx, config, sink))?;
+            .spawn(move || run_worker_with(rx, config, measure, sink))?;
         Ok(Self {
             tx,
             thread: Some(thread),
@@ -202,6 +261,252 @@ mod tests {
                 TimerOutput::Letter(".-".into()),
             ]
         );
+    }
+
+    #[test]
+    fn measuring_reports_press_before_symbol_and_gap_at_the_next_press() {
+        let (tx, rx) = mpsc::channel();
+        let past = Instant::now() - ms(10_000);
+        tx.send(WorkerMessage::Press(past)).unwrap();
+        tx.send(WorkerMessage::Press(past + ms(10))).unwrap(); // key repeat: no gap, no change
+        tx.send(WorkerMessage::Release(past + ms(50))).unwrap(); // dash (threshold 20)
+        tx.send(WorkerMessage::Press(past + ms(80))).unwrap();
+        tx.send(WorkerMessage::Release(past + ms(85))).unwrap(); // dot
+        drop(tx);
+        let mut outputs = Vec::new();
+        run_worker_with(rx, fast_config(), true, |o| outputs.push(o));
+        assert_eq!(
+            outputs,
+            vec![
+                TimerOutput::Press(ms(50)),
+                TimerOutput::Symbol(Symbol::Dash),
+                TimerOutput::Gap(ms(30)),
+                TimerOutput::Press(ms(5)),
+                TimerOutput::Symbol(Symbol::Dot),
+                TimerOutput::Letter("-.".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn measuring_is_off_by_default_and_the_stream_has_only_the_old_events() {
+        let (tx, rx) = mpsc::channel();
+        let past = Instant::now() - ms(10_000);
+        tx.send(WorkerMessage::Press(past)).unwrap();
+        tx.send(WorkerMessage::Press(past + ms(10))).unwrap();
+        tx.send(WorkerMessage::Release(past + ms(50))).unwrap();
+        tx.send(WorkerMessage::Press(past + ms(80))).unwrap();
+        tx.send(WorkerMessage::Release(past + ms(85))).unwrap();
+        drop(tx);
+        let mut outputs = Vec::new();
+        run_worker(rx, fast_config(), |o| outputs.push(o));
+        assert_eq!(
+            outputs,
+            vec![
+                TimerOutput::Symbol(Symbol::Dash),
+                TimerOutput::Symbol(Symbol::Dot),
+                TimerOutput::Letter("-.".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn set_measuring_switches_between_events_of_one_session() {
+        let (tx, rx) = mpsc::channel();
+        let past = Instant::now() - ms(10_000);
+        let key = |press: u64, release: u64| {
+            [
+                WorkerMessage::Press(past + ms(press)),
+                WorkerMessage::Release(past + ms(release)),
+            ]
+        };
+        let send =
+            |messages: [WorkerMessage; 2]| messages.into_iter().for_each(|m| tx.send(m).unwrap());
+        send(key(0, 50)); // off: symbol only
+        tx.send(WorkerMessage::SetMeasuring(true, past + ms(55)))
+            .unwrap();
+        send(key(80, 85)); // on: press 5 (the switch forgot the earlier release, so no gap)
+        send(key(100, 105)); // on: gap 15 and press 5
+        tx.send(WorkerMessage::SetMeasuring(false, past + ms(110)))
+            .unwrap();
+        send(key(130, 180)); // off again, the open letter ".." is gone
+        drop(tx);
+        let mut outputs = Vec::new();
+        run_worker(rx, fast_config(), |o| outputs.push(o));
+        assert_eq!(
+            outputs,
+            vec![
+                TimerOutput::Symbol(Symbol::Dash),
+                TimerOutput::Measuring(true),
+                TimerOutput::Press(ms(5)),
+                TimerOutput::Symbol(Symbol::Dot),
+                TimerOutput::Gap(ms(15)),
+                TimerOutput::Press(ms(5)),
+                TimerOutput::Symbol(Symbol::Dot),
+                TimerOutput::Measuring(false),
+                TimerOutput::Symbol(Symbol::Dash),
+                TimerOutput::Letter("-".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_key_held_while_measuring_switches_is_forgotten_by_the_switch() {
+        let (tx, rx) = mpsc::channel();
+        let past = Instant::now() - ms(10_000);
+        tx.send(WorkerMessage::Press(past)).unwrap();
+        tx.send(WorkerMessage::SetMeasuring(true, past + ms(10)))
+            .unwrap();
+        tx.send(WorkerMessage::Release(past + ms(50))).unwrap();
+        drop(tx);
+        let mut outputs = Vec::new();
+        run_worker(rx, fast_config(), |o| outputs.push(o));
+        assert_eq!(outputs, vec![TimerOutput::Measuring(true)]);
+    }
+
+    #[test]
+    fn a_letter_that_is_due_when_measuring_switches_comes_out_before_the_marker() {
+        // the pause of "." ran out 10 s ago, but the switch is already in the queue: the letter belongs
+        // to the old setting, so it has to precede the marker (and not be eaten by a following reset)
+        let (tx, rx) = mpsc::channel();
+        let past = Instant::now() - ms(10_000);
+        tx.send(WorkerMessage::Press(past)).unwrap();
+        tx.send(WorkerMessage::Release(past + ms(5))).unwrap();
+        tx.send(WorkerMessage::SetMeasuring(true, past + ms(500)))
+            .unwrap();
+        tx.send(WorkerMessage::Reset).unwrap();
+        drop(tx);
+        let mut outputs = Vec::new();
+        run_worker(rx, fast_config(), |o| outputs.push(o));
+        assert_eq!(
+            outputs,
+            vec![
+                TimerOutput::Symbol(Symbol::Dot),
+                TimerOutput::Letter(".".into()),
+                TimerOutput::Measuring(true),
+            ]
+        );
+    }
+
+    #[test]
+    fn switching_resets_the_timer_in_the_same_step_without_a_separate_reset() {
+        // "." is due at the switch (before the marker). The press that follows is queued right behind
+        // the switch: it must not catch up anything or measure a gap to the old phase
+        let (tx, rx) = mpsc::channel();
+        let past = Instant::now() - ms(10_000);
+        tx.send(WorkerMessage::Press(past)).unwrap();
+        tx.send(WorkerMessage::Release(past + ms(5))).unwrap();
+        tx.send(WorkerMessage::SetMeasuring(true, past + ms(500)))
+            .unwrap();
+        tx.send(WorkerMessage::Press(past + ms(520))).unwrap();
+        tx.send(WorkerMessage::Release(past + ms(525))).unwrap();
+        drop(tx);
+        let mut outputs = Vec::new();
+        run_worker(rx, fast_config(), |o| outputs.push(o));
+        assert_eq!(
+            outputs,
+            vec![
+                TimerOutput::Symbol(Symbol::Dot),
+                TimerOutput::Letter(".".into()),
+                TimerOutput::Measuring(true),
+                TimerOutput::Press(ms(5)),
+                TimerOutput::Symbol(Symbol::Dot),
+                TimerOutput::Letter(".".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_half_keyed_letter_is_dropped_by_the_switch_off() {
+        let (tx, rx) = mpsc::channel();
+        let past = Instant::now() - ms(10_000);
+        tx.send(WorkerMessage::Press(past)).unwrap();
+        tx.send(WorkerMessage::Release(past + ms(5))).unwrap();
+        tx.send(WorkerMessage::SetMeasuring(false, past + ms(10)))
+            .unwrap(); // pause not over yet
+        drop(tx);
+        let mut outputs = Vec::new();
+        run_worker(rx, fast_config(), |o| outputs.push(o));
+        assert_eq!(
+            outputs,
+            vec![
+                TimerOutput::Symbol(Symbol::Dot),
+                TimerOutput::Measuring(false)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_letter_started_after_the_switch_is_after_the_marker() {
+        let (tx, rx) = mpsc::channel();
+        let past = Instant::now() - ms(10_000);
+        tx.send(WorkerMessage::SetMeasuring(true, past)).unwrap();
+        tx.send(WorkerMessage::Press(past)).unwrap();
+        tx.send(WorkerMessage::Release(past + ms(5))).unwrap();
+        drop(tx);
+        let mut outputs = Vec::new();
+        run_worker(rx, fast_config(), |o| outputs.push(o));
+        assert_eq!(outputs[0], TimerOutput::Measuring(true));
+        assert!(outputs.contains(&TimerOutput::Letter(".".into())));
+    }
+
+    #[test]
+    fn a_reset_with_measuring_on_forgets_the_gap_and_the_open_letter() {
+        let (tx, rx) = mpsc::channel();
+        let past = Instant::now() - ms(10_000);
+        tx.send(WorkerMessage::SetMeasuring(true, past)).unwrap();
+        tx.send(WorkerMessage::Press(past)).unwrap();
+        tx.send(WorkerMessage::Release(past + ms(50))).unwrap();
+        tx.send(WorkerMessage::Reset).unwrap();
+        tx.send(WorkerMessage::Press(past + ms(90))).unwrap(); // no earlier release: no gap
+        tx.send(WorkerMessage::Release(past + ms(95))).unwrap();
+        drop(tx);
+        let mut outputs = Vec::new();
+        run_worker(rx, fast_config(), |o| outputs.push(o));
+        assert_eq!(
+            outputs,
+            vec![
+                TimerOutput::Measuring(true),
+                TimerOutput::Press(ms(50)),
+                TimerOutput::Symbol(Symbol::Dash),
+                TimerOutput::Press(ms(5)),
+                TimerOutput::Symbol(Symbol::Dot),
+                TimerOutput::Letter(".".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn measuring_leaves_symbols_and_letters_unchanged() {
+        let run = |measure: bool| {
+            let (tx, rx) = mpsc::channel();
+            let past = Instant::now() - ms(10_000);
+            for (press, release) in [(0, 5), (10, 50), (400, 405)] {
+                tx.send(WorkerMessage::Press(past + ms(press))).unwrap();
+                tx.send(WorkerMessage::Release(past + ms(release))).unwrap();
+            }
+            drop(tx);
+            let mut outputs = Vec::new();
+            run_worker_with(rx, fast_config(), measure, |o| outputs.push(o));
+            outputs
+        };
+        let plain: Vec<_> = run(true)
+            .into_iter()
+            .filter(|o| !matches!(o, TimerOutput::Press(_) | TimerOutput::Gap(_)))
+            .collect();
+        assert_eq!(plain, run(false));
+    }
+
+    #[test]
+    fn measuring_reports_nothing_for_the_first_press_or_a_release_without_press() {
+        let (tx, rx) = mpsc::channel();
+        let past = Instant::now() - ms(10_000);
+        tx.send(WorkerMessage::Release(past)).unwrap(); // started while held
+        tx.send(WorkerMessage::Press(past + ms(5))).unwrap();
+        drop(tx);
+        let mut outputs = Vec::new();
+        run_worker_with(rx, fast_config(), true, |o| outputs.push(o));
+        assert!(outputs.is_empty());
     }
 
     #[test]
