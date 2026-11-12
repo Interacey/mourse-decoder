@@ -33,9 +33,15 @@ def make_config(root: Path) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     (root / "settings.json").write_text('{"alphabet": "de"}', encoding="utf-8")
     (root / "function_keys.json").write_text(json.dumps({"schema_version": 1, "slots": []}), encoding="utf-8")
+    content = {  # files the program's own loaders accept
+        "alphabets": {"codes": {".": "e"}},
+        "smileys": {"codes": {".-": "x"}},
+        "languages": {"strings": {}},
+    }
     for folder, name in (("alphabets", "mein.json"), ("smileys", "set.json"), ("languages", "xx.json")):
         (root / folder).mkdir(exist_ok=True)
-        (root / folder / name).write_text(json.dumps({"id": name[:-5], "name": "Größe ✓"}, ensure_ascii=False), encoding="utf-8")
+        data = {"id": name[:-5], "name": "Größe ✓", **content[folder]}
+        (root / folder / name).write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
     return root
 
 
@@ -96,9 +102,11 @@ def test_round_trip_into_an_empty_folder_gives_the_same_bytes(cfg, bundle, tmp_p
     target = tmp_path / "new" / "MourseDecoder"
     result = import_bundle(bundle, target)
     assert snapshot(target) == snapshot(cfg)
-    assert result.restore_point is None  # nothing there to protect
     assert len(result.written) == 5
-    assert not list(tmp_path.glob("new/*"))[1:]  # no temp or backup files next to the config
+    # the restore point of an import into an empty folder holds no files but lists the ones the import created
+    assert sorted(p.name for p in (tmp_path / "new").iterdir()) == ["MourseDecoder", result.restore_point.name]
+    import_bundle(result.restore_point, target)  # "undo": what the import created is gone again
+    assert snapshot(target) == {}
 
 
 def test_bak_and_temp_files_are_not_exported(cfg, tmp_path):

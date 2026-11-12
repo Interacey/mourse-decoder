@@ -84,6 +84,7 @@ def make_panel(tk_root, fake_engine, injector, tmp_path):
         page = SettingsPanel(
             tk_root, controller, DictionaryManager(), apply,
             capture_backend=NoCapture(), backup_dialogs=dialogs, config_dir=config,
+            on_imported=lambda: [hook() for hook in hooks],
         )
         page.pack()
         tk_root.update()
@@ -340,8 +341,8 @@ def test_macros_in_a_bundle_get_a_warning_with_a_summary_and_three_choices(make_
     assert dialogs.kinds() == ["choose"]  # cancel: nothing happens
     text = dialogs.calls[0][2]
     assert "WARNING" in text and "F13 (F13): {Win+R}{WaitWindow Run}powershell" in text
-    assert "[{Win+...}, {WaitWindow}]" in text and "Commands that act outside the typed text" in text
-    assert "Yes: import everything" in text and "No: import without function_keys.json" in text and "Cancel" in text
+    assert "[{Win+R}, {WaitWindow …}, {Enter}]" in text and "Commands that act outside the typed text" in text
+    assert "Yes: import everything" in text and "No: import without the files that contain macros or commands" in text and "Cancel" in text
     assert snapshot(page.config) == before and not list(page.config.parent.glob("*backup*"))
 
 
@@ -388,7 +389,7 @@ def test_unusable_function_keys_offer_the_rest_without_them(make_panel, tmp_path
     page._import_backup()
     settle(page)
     assert dialogs.kinds() == ["ask", "ask", "info"]
-    assert "function_keys.json is not usable" in dialogs.calls[0][2] and "without them" in dialogs.calls[0][2]
+    assert "function_keys.json is not usable" in dialogs.calls[0][2] and "without it" in dialogs.calls[0][2]
     assert (page.config / "function_keys.json").read_bytes() == own
     assert page.controller.settings.alphabet == "greek"
 
@@ -521,6 +522,7 @@ class FakeTray:
         self.polled: list[str] = []
         self._ui_queue = __import__("queue").Queue()
         self._root = MagicMock()
+        self._quit_pending = False
         self._drain_queue = lambda: None  # the loop schedules itself again with this
         for name in ("block", "cycle", "undo", "function_keys", "hook"):
             setattr(self, f"_poll_{name}", self._recorder(name))
@@ -689,3 +691,302 @@ def test_errors_are_shown_in_the_current_language(make_panel):
         assert page._error_text(backup.BackupError("free text, no code")) == "free text, no code"
     finally:
         set_language("en")
+
+
+# review round 2
+
+
+def alpha_bytes(alphabet_id: str, codes: dict | None = None) -> bytes:
+    return json.dumps({"id": alphabet_id, "name": alphabet_id, "codes": codes or {".-": "a"}}).encode()
+
+
+def zip_of(tmp_path: Path, files: dict[str, bytes], name: str = "r2.zip") -> Path:
+    from test_backup import build_zip
+
+    return build_zip(tmp_path / name, files)
+
+
+def test_commands_in_alphabets_ask_the_three_way_question_and_no_leaves_them_out(make_panel, tmp_path):
+    files = {
+        "alphabets/evil.json": alpha_bytes("evil", {".-": "{Win+R}notepad{Enter}"}),
+        "alphabets/plain.json": alpha_bytes("plain"),
+    }
+    dialogs = FakeDialogs(open_=str(zip_of(tmp_path, files)), choice=False)
+    page = make_panel(dialogs)
+    page._import_backup()
+    settle(page)
+    assert dialogs.kinds() == ["choose", "info"]
+    text = dialogs.calls[0][2]
+    assert "WARNING" in text and "alphabets/evil.json [.-]: {Win+R}notepad{Enter} [{Win+R}, {Enter}]" in text
+    assert (page.config / "alphabets" / "plain.json").exists() and not (page.config / "alphabets" / "evil.json").exists()
+
+
+def test_the_choice_without_macros_shows_its_own_result_and_fails_before_anything_is_written(make_panel, tmp_path):
+    files = {"settings.json": b'{"trigger": "F13"}', "function_keys.json": json.dumps(
+        {"schema_version": 1, "slots": [{"slot": 14, "trigger": "F14", "macro": "{Win+R}"}]}).encode()}
+    dialogs = FakeDialogs(open_=str(zip_of(tmp_path, files)), choice=False)
+    page = make_panel(dialogs)
+    (page.config / "function_keys.json").write_text(
+        json.dumps({"schema_version": 1, "slots": [{"slot": 13, "trigger": "F13", "macro": "old"}]}))
+    before = snapshot(page.config)
+    page._import_backup()
+    settle(page)
+    assert dialogs.kinds() == ["choose", "error"]
+    assert "Importing without those files is not possible" in dialogs.calls[0][2]  # said before the choice
+    assert "would clash" in dialogs.calls[1][2]
+    assert snapshot(page.config) == before and not list(page.config.parent.glob("*backup*"))
+
+
+def test_all_macros_are_in_the_confirmation_risky_ones_first(make_panel, tmp_path):
+    from mourse_decoder.function_keys import default_trigger
+
+    slots = [{"slot": n, "trigger": f"F{n}", "macro": f"plain {n}"} for n in range(13, 25)]
+    slots += [{"slot": n, "trigger": f"Ctrl+Alt+F{n}", "macro": f"plain {n}"} for n in range(1, 9)]
+    slots.append({"slot": 40, "trigger": default_trigger(40), "macro": "{Win+R}"})
+    files = {"function_keys.json": json.dumps({"schema_version": 1, "slots": slots}).encode()}
+    dialogs = FakeDialogs(open_=str(zip_of(tmp_path, files)), choice=None)
+    page = make_panel(dialogs)
+    page._import_backup()
+    settle(page)
+    text = dialogs.calls[0][2]
+    assert all(f"plain {n}" in text for n in [*range(1, 9), *range(13, 25)])  # nothing cut off
+    assert text.index("F40") < text.index("plain 13")  # the risky one first
+
+
+def test_the_dialog_scrolls_and_returns_the_choice(tk_root):
+    import tkinter as tk
+
+    from mourse_decoder.ui.settings_panel import BackupDialogs
+
+    set_language("en")
+    long_text = "\n".join(f"line {n}" for n in range(300))
+    dialogs = BackupDialogs(tk_root)
+
+    def press(index: int) -> None:
+        top = next(w for w in tk_root.winfo_children() if isinstance(w, tk.Toplevel))
+        frames = [w for w in top.winfo_children() if isinstance(w, tk.Frame)]
+        text = next(w for f in frames for w in f.winfo_children() if isinstance(w, tk.Text))
+        bar = next(w for f in frames for w in f.winfo_children() if isinstance(w, tk.Scrollbar))
+        assert "line 299" in text.get("1.0", "end") and bar is not None  # everything is there, behind a scroll bar
+        buttons = [w for f in frames for w in f.winfo_children() if isinstance(w, tk.Button)]
+        buttons[index].invoke()
+
+    for index, expected in ((0, True), (1, False), (2, None)):
+        tk_root.after(300, press, index)
+        assert dialogs.choose("t", long_text) is expected
+
+
+def test_the_confirmation_does_not_depend_on_a_user_language_file(make_panel, tmp_path):
+    from mourse_decoder import i18n
+
+    languages = tmp_path / "userlang"
+    languages.mkdir()
+    # a language file that arrived with an earlier import and drops the warning and the list from the dialog
+    (languages / "xx.json").write_text(json.dumps({"id": "xx", "name": "XX", "strings": {
+        "backup.import.confirm": "Import?", "backup.import.warn.macros": "", "backup.import.slot": "",
+        "backup.import.choice": ""}}), encoding="utf-8")
+    files = {"function_keys.json": json.dumps(
+        {"schema_version": 1, "slots": [{"slot": 13, "trigger": "F13", "macro": "{Win+R}"}]}).encode()}
+    dialogs = FakeDialogs(open_=str(zip_of(tmp_path, files)), choice=None)
+    page = make_panel(dialogs)
+    try:
+        i18n.set_language("xx", languages)
+        assert i18n.current_language() == "xx" and i18n.tr("backup.import.confirm") == "Import?"
+        page._import_backup()
+        settle(page)
+    finally:
+        i18n.set_language("en", None)
+    text = dialogs.calls[0][2]
+    assert "WARNING" in text and "F13 (F13): {Win+R}" in text and "Yes: import everything" in text
+
+
+def test_an_import_of_alphabets_alone_does_not_rewrite_settings_json(make_panel, tmp_path):
+    page = make_panel(FakeDialogs(open_=str(zip_of(tmp_path, {"alphabets/neu.json": alpha_bytes("neu")}))))
+    own = (page.config / "settings.json").read_bytes()
+    page._import_backup()
+    settle(page)
+    assert (page.config / "settings.json").read_bytes() == own
+    assert page.controller.settings.alphabet == "latin"  # and the program was not switched to the file's "de"
+
+
+def test_an_alphabet_the_settings_file_names_is_switched_to_when_the_import_brings_it(
+    fake_engine, injector, tk_root, tmp_path
+):
+    from mourse_decoder.ui import theme
+    from mourse_decoder.ui.settings_panel import SettingsPanel
+
+    theme.apply_theme(tk_root, "light")
+    set_language("en")
+    config = make_config(tmp_path / "cfg" / "MourseDecoder")
+    (config / "settings.json").write_text('{"alphabet": "neu"}')  # the program fell back to latin at start
+    own = (config / "settings.json").read_bytes()
+    manager = DictionaryManager(user_directory=config / "alphabets")
+    controller = MorseController(fake_engine, injector, manager, Settings(), use_hook=False)
+    controller.start()
+    dialogs = FakeDialogs(open_=str(zip_of(tmp_path, {"alphabets/neu.json": alpha_bytes("neu")})))
+    page = SettingsPanel(tk_root, controller, manager, controller.apply_settings, capture_backend=NoCapture(),
+                         backup_dialogs=dialogs, config_dir=config)
+    page.pack()
+    page.root = tk_root
+    try:
+        page._import_backup()
+        settle(page)
+        assert controller.settings.alphabet == "neu"
+        assert (config / "settings.json").read_bytes() == own  # the file was not overwritten with the fallback
+    finally:
+        page.destroy()
+        controller.stop()
+
+
+def test_a_change_during_an_export_is_applied_when_it_is_over(make_panel):
+    page = make_panel(FakeDialogs())
+    release = threading.Event()
+    page._start(lambda: release.wait(5), lambda *_: page._finish())
+    page._notify.set(False)
+    page.root.update()
+    assert page.controller.settings.notifications is True  # held back while the job runs
+    release.set()
+    settle(page)
+    page.root.update()
+    assert page.controller.settings.notifications is False  # nothing was lost
+    assert SettingsStore(page.config).load().notifications is False
+
+
+def test_a_change_during_an_import_is_reported_not_lost_silently(make_panel, tmp_path):
+    release, inside = threading.Event(), threading.Event()
+    real = backup.import_bundle
+
+    def slow(*args, **kwargs):
+        inside.set()
+        release.wait(10)
+        return real(*args, **kwargs)
+
+    dialogs = FakeDialogs(open_=str(make_source(tmp_path, '{"alphabet": "greek"}')))
+    page = make_panel(dialogs)
+    backup.import_bundle, original = slow, backup.import_bundle
+    try:
+        page._import_backup()
+        deadline = time.monotonic() + 20
+        while not inside.is_set() and time.monotonic() < deadline:
+            page.root.update()
+            time.sleep(0.005)
+        page._notify.set(False)  # the user flips a switch while the import runs
+        page.root.update()
+        release.set()
+        settle(page)
+    finally:
+        backup.import_bundle = original
+        release.set()
+    assert page.controller.settings.alphabet == "greek" and page.controller.settings.notifications is True
+    assert page._notify.get() is True  # the form shows the imported state, not a value nobody has
+    assert "was not applied" in page._error.cget("text")
+
+
+def test_an_imported_smiley_set_is_active_at_once(fake_engine, injector, tk_root, tmp_path):
+    from mourse_decoder.ui import theme
+    from mourse_decoder.ui.settings_panel import SettingsPanel
+
+    theme.apply_theme(tk_root, "light")
+    set_language("en")
+    config = make_config(tmp_path / "cfg" / "MourseDecoder")
+    (config / "smileys" / "mine.json").write_bytes(
+        json.dumps({"id": "mine", "codes": {"...---...": "OLD"}}).encode())
+    manager = DictionaryManager(user_directory=config / "alphabets", user_smiley_directory=config / "smileys")
+    controller = MorseController(fake_engine, injector, manager, Settings(smileys="mine"), use_hook=False)
+    controller.start()
+    new = zip_of(tmp_path, {"smileys/mine.json": json.dumps({"id": "mine", "codes": {"...---...": "NEW"}}).encode()})
+    dialogs = FakeDialogs(open_=str(new))
+    page = SettingsPanel(tk_root, controller, manager, controller.apply_settings, capture_backend=NoCapture(),
+                         backup_dialogs=dialogs, config_dir=config)
+    page.pack()
+    page.root = tk_root
+    try:
+        assert manager.select("latin").codes["...---..."] == "OLD"
+        page._import_backup()
+        settle(page)
+        assert manager.select("latin").codes["...---..."] == "NEW"
+        assert "active now" in dialogs.calls[-1][2]
+    finally:
+        page.destroy()
+
+
+def test_a_telecode_database_can_be_imported_while_the_telecode_alphabet_is_active(fake_engine, injector, tk_root, tmp_path):
+    from mourse_decoder.telecode import build_database
+    from mourse_decoder.ui import theme
+    from mourse_decoder.ui.settings_panel import SettingsPanel
+
+    theme.apply_theme(tk_root, "light")
+    set_language("en")
+    config = make_config(tmp_path / "cfg" / "MourseDecoder")
+    build_database([("0001", "一")], config / "telecode.sqlite")
+    build_database([("0001", "丁")], tmp_path / "new.sqlite")
+    manager = DictionaryManager(user_directory=config / "alphabets", telecode_db=config / "telecode.sqlite")
+    controller = MorseController(
+        fake_engine, injector, manager, Settings(alphabet=DictionaryManager.TELECODE_ID), use_hook=False
+    )
+    controller.start()
+    assert controller._decoder._store.lookup("0001") == "一"
+    zip_path = zip_of(tmp_path, {"telecode.sqlite": (tmp_path / "new.sqlite").read_bytes()})
+    dialogs = FakeDialogs(open_=str(zip_path))
+    page = SettingsPanel(tk_root, controller, manager, controller.apply_settings, capture_backend=NoCapture(),
+                         backup_dialogs=dialogs, config_dir=config)
+    page.pack()
+    page.root = tk_root
+    try:
+        page._import_backup()
+        settle(page)
+        assert dialogs.kinds() == ["ask", "info"], dialogs.calls  # no "Access denied" on Windows
+        assert controller.settings.alphabet == DictionaryManager.TELECODE_ID  # back on the alphabet it was on
+        assert controller._decoder._store.lookup("0001") == "丁"  # and reading the new file
+        assert "restart" not in dialogs.calls[-1][2].lower()
+    finally:
+        page.destroy()
+        controller.stop()
+
+
+def test_a_failed_import_brings_the_telecode_alphabet_back(fake_engine, injector, tk_root, tmp_path, monkeypatch):
+    from mourse_decoder.telecode import build_database
+    from mourse_decoder.ui import theme
+    from mourse_decoder.ui.settings_panel import SettingsPanel
+
+    theme.apply_theme(tk_root, "light")
+    set_language("en")
+    config = make_config(tmp_path / "cfg" / "MourseDecoder")
+    build_database([("0001", "一")], config / "telecode.sqlite")
+    build_database([("0001", "丁")], tmp_path / "new.sqlite")
+    manager = DictionaryManager(user_directory=config / "alphabets", telecode_db=config / "telecode.sqlite")
+    controller = MorseController(
+        fake_engine, injector, manager, Settings(alphabet=DictionaryManager.TELECODE_ID), use_hook=False
+    )
+    controller.start()
+    zip_path = zip_of(tmp_path, {"telecode.sqlite": (tmp_path / "new.sqlite").read_bytes()})
+    monkeypatch.setattr(backup, "import_bundle", lambda *a, **k: (_ for _ in ()).throw(backup.BackupError("busy")))
+    dialogs = FakeDialogs(open_=str(zip_path))
+    page = SettingsPanel(tk_root, controller, manager, controller.apply_settings, capture_backend=NoCapture(),
+                         backup_dialogs=dialogs, config_dir=config)
+    page.pack()
+    page.root = tk_root
+    try:
+        page._import_backup()
+        settle(page)
+        assert dialogs.kinds() == ["ask", "error"]
+        assert controller.settings.alphabet == DictionaryManager.TELECODE_ID
+        assert controller._decoder._store.lookup("0001") == "一"
+    finally:
+        page.destroy()
+        controller.stop()
+
+
+def test_an_undo_through_the_restore_point_removes_what_the_import_created(make_panel, tmp_path):
+    files = {"alphabets/neu.json": alpha_bytes("neu")}
+    dialogs = FakeDialogs(open_=str(zip_of(tmp_path, files)))
+    page = make_panel(dialogs)
+    page._import_backup()
+    settle(page)
+    restore = next(page.config.parent.glob("MourseDecoder-backup-*.zip"))
+    assert (page.config / "alphabets" / "neu.json").exists()
+    dialogs.open_ = str(restore)
+    page._import_backup()
+    settle(page)
+    assert not (page.config / "alphabets" / "neu.json").exists()
+    assert "Delete: alphabets/neu.json" in dialogs.calls[-2][2] and "removed" in dialogs.calls[-1][2]

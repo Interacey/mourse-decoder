@@ -5,6 +5,8 @@ An invalid input, e.g. a half-typed number, isn't applied but reported below the
 
 from __future__ import annotations
 
+import functools
+import json
 import logging
 import queue
 import threading
@@ -15,7 +17,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Any
 
-from .. import backup
+from .. import backup, i18n
 from ..controller import MorseController
 from ..dictionary import DictionaryManager
 from ..function_keys import FunctionKeys, FunctionKeysStore
@@ -28,10 +30,31 @@ from .key_capture import CaptureBackend, KeyCaptureButton, ShortcutCaptureButton
 from .theme import Button, Card, ScrollFrame, Switch, field_box, label, list_box
 
 PREVIEW_LINES = 12  # file names listed in the import confirmation
-PREVIEW_SLOTS = 8   # macros listed in the import confirmation
+MAX_COMMAND_LINES = 100  # entries with commands from alphabet and smiley files listed in the confirmation
 WORKER_POLL_MS = 50  # how often the Tk thread looks for the result of a backup job
 
 log = logging.getLogger(__name__)
+
+
+@functools.lru_cache(maxsize=16)
+def _builtin_strings(code: str) -> dict[str, str]:
+    try:
+        return json.loads((i18n.BUILTIN_LOCALE_DIR / f"{code}.json").read_text(encoding="utf-8"))["strings"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return {}
+
+
+def _trusted(key: str, **values: object) -> str:
+    """Like ``tr``, but only from the built-in language files. The text of an import confirmation must not
+    come from a language file in the user's folder: one that arrived with an earlier import could drop the
+    warning from it."""
+    text = _builtin_strings(i18n.current_language()).get(key) or _builtin_strings(i18n.DEFAULT_LANGUAGE).get(key) or key
+    if not values:
+        return text
+    try:
+        return i18n._formatter.vformat(text, (), values)
+    except (KeyError, IndexError, ValueError):
+        return text
 
 _TIMING_FIELDS = (
     ("dot_threshold_ms", "timing.dot"),
@@ -65,8 +88,38 @@ class BackupDialogs:
         return messagebox.askyesno(title, text, parent=self._parent)
 
     def choose(self, title: str, text: str) -> bool | None:
-        """Yes (True), No (False) or Cancel (None); the text says what each one does."""
-        return messagebox.askyesnocancel(title, text, parent=self._parent, icon="warning")
+        """Yes (True), No (False) or Cancel (None); the text says what each one does.
+
+        A window with a scroll bar: the list of macros of a backup can be long and must be readable in full.
+        """
+        top = tk.Toplevel(self._parent)
+        top.title(title)
+        top.transient(self._parent)
+        outcome: list[bool | None] = [None]
+
+        def close(value: bool | None) -> None:
+            outcome[0] = value
+            top.destroy()
+
+        frame = tk.Frame(top)
+        frame.pack(fill="both", expand=True, padx=8, pady=8)
+        box = tk.Text(frame, wrap="word", width=96, height=26)
+        bar = tk.Scrollbar(frame, command=box.yview)
+        box.configure(yscrollcommand=bar.set)
+        box.insert("1.0", text)
+        box.configure(state="disabled")
+        bar.pack(side="right", fill="y")
+        box.pack(side="left", fill="both", expand=True)
+        buttons = tk.Frame(top)
+        buttons.pack(pady=(0, 8))
+        for label_key, value in (("backup.btn.yes", True), ("backup.btn.no", False), ("backup.btn.cancel", None)):
+            tk.Button(buttons, text=tr(label_key), width=14, command=lambda v=value: close(v)).pack(side="left", padx=4)
+        top.protocol("WM_DELETE_WINDOW", lambda: close(None))
+        top.bind("<Escape>", lambda _e: close(None))
+        top.wait_visibility()  # a grab on a window that is not on screen yet fails on some systems
+        top.grab_set()
+        top.wait_window()
+        return outcome[0]
 
     def info(self, title: str, text: str) -> None:
         messagebox.showinfo(title, text, parent=self._parent)
@@ -85,6 +138,7 @@ class SettingsPanel(tk.Frame):
         capture_backend: CaptureBackend | None = None,
         backup_dialogs: BackupDialogs | None = None,
         config_dir: Path | None = None,
+        on_imported: Callable[[], None] | None = None,
     ) -> None:
         super().__init__(master, bg=theme.P.bg)
         # the window, not this page: a language change rebuilds the pages while a dialog may still be open
@@ -93,6 +147,9 @@ class SettingsPanel(tk.Frame):
         self._closed = False
         self._holds_gate = False  # this page has the import gate: other saves are refused until _finish
         self._job_running = False  # the worker thread is still inside its job
+        self._deferred_change = False  # a form change was made while a job ran
+        self._pre_import: Settings | None = None  # the settings before the telecode alphabet was let go
+        self._on_imported = on_imported  # refreshes the pages that are not this one
         self._worker_job: str | None = None
         self._backup_buttons: list[Button] = []
         self.bind("<Destroy>", self._on_destroy, add="+")
@@ -302,7 +359,10 @@ class SettingsPanel(tk.Frame):
 
     def _changed(self) -> None:
         """Read the form and apply it right away (live preview)."""
-        if self._loading or self._busy or self._backup_running:  # an import writes settings.json itself
+        if self._loading or self._busy:
+            return
+        if self._backup_running:  # an import writes settings.json itself: apply the change when the job is over
+            self._deferred_change = True
             return
         if self._job is not None:
             self.after_cancel(self._job)
@@ -403,6 +463,9 @@ class SettingsPanel(tk.Frame):
         self._release_gate()
         if not self._closed:
             self._set_backup_running(False)
+            if self._deferred_change:  # a change made during the job: nothing was lost, apply it now
+                self._deferred_change = False
+                self._changed()
 
     def _release_gate(self) -> None:
         if self._holds_gate:
@@ -478,70 +541,136 @@ class SettingsPanel(tk.Frame):
 
         self._start(work, lambda preview, error: self._inspected(source, exclude, preview, error))
 
-    def _inspected(self, source: Path, exclude: tuple[str, ...], preview: backup.Preview | None, error: BaseException | None) -> None:
+    def _inspected(
+        self, source: Path, exclude: tuple[str, ...], preview: backup.Preview | None, error: BaseException | None
+    ) -> None:
         dialogs = self._backup_dialogs
         if error is not None:
-            # the one file that can be left out: offer the rest of the backup without it
-            if (
-                getattr(error, "path", None) == backup.FUNCTION_KEYS_FILE
-                and backup.FUNCTION_KEYS_FILE not in exclude
-                and dialogs.ask(tr("backup.err.import"), self._error_text(error) + "\n\n" + tr("backup.import.skipkeys.ask"))
+            # a file that can be left out: offer the rest of the backup without it
+            culprit = getattr(error, "path", None)
+            if culprit and culprit not in exclude and dialogs.ask(
+                tr("backup.err.import"), self._error_text(error) + "\n\n" + tr("backup.import.skipfile.ask", name=culprit)
             ):
-                self._inspect(source, (*exclude, backup.FUNCTION_KEYS_FILE))
+                self._inspect(source, (*exclude, culprit))
                 return
             self._finish()
-            if getattr(error, "path", None) != backup.FUNCTION_KEYS_FILE or backup.FUNCTION_KEYS_FILE in exclude:
+            if not culprit or culprit in exclude:
                 self._show_error("backup.err.import", error)
             return
         assert preview is not None
-        if not preview.count("add") and not preview.count("replace"):
+        if not any(preview.count(status) for status in ("add", "replace", "remove")):
             self._finish()
             dialogs.info(tr("backup.import"), tr("backup.import.nothing"))
             return
         text = self._confirm_text(preview)
-        if preview.slots:
-            choice = dialogs.choose(tr("backup.import"), text + "\n\n" + tr("backup.import.choice"))
+        chosen = exclude
+        if preview.risky_files:
+            choice = dialogs.choose(tr("backup.import"), text + "\n\n" + _trusted("backup.import.choice"))
             if choice is None:
                 self._finish()
                 return
-            if choice is False:
-                exclude = (*exclude, backup.FUNCTION_KEYS_FILE)
+            if choice is False:  # the import without macros was checked on its own: what it says is what happens
+                if preview.safe_error is not None:
+                    self._finish()
+                    self._show_error("backup.err.import", preview.safe_error)
+                    return
+                chosen = (*exclude, *preview.risky_files)
         elif not dialogs.ask(tr("backup.import"), text):
             self._finish()
             return
         config, check, digest = self._config_dir, self._controller.check_shortcut, preview.sha256
+        taken = preview.safe if chosen != exclude and preview.safe is not None else preview
 
         def work() -> backup.ImportResult:
-            return backup.import_bundle(source, config, exclude=exclude, expected_sha256=digest, check_shortcut=check)
+            return backup.import_bundle(source, config, exclude=chosen, expected_sha256=digest, check_shortcut=check)
 
         if not gate.begin():  # a second import cannot be running, but a refused start must not leave the page stuck
             self._finish()
             self._show_error("backup.err.import", backup.BackupError("busy"))
             return
         self._holds_gate = True
+        self._before_import(taken)
         self._start(work, self._imported)
 
+    def _before_import(self, preview: backup.Preview) -> None:
+        """Let go of what the files about to be replaced are held by.
+
+        The telecode decoder keeps ``telecode.sqlite`` open; Windows does not replace an open file, and a decoder
+        that stays would go on reading the old one. The program switches to Latin for the time of the import and
+        comes back to the alphabet afterwards (``_load_into_running_app``).
+        """
+        controller = self._controller
+        self._pre_import = controller.settings
+        touched = {e.path for e in preview.entries if e.status in ("add", "replace", "remove")}
+        if backup.TELECODE_FILE in touched and controller.settings.alphabet == DictionaryManager.TELECODE_ID:
+            try:
+                controller.apply_settings(controller.settings.replace(alphabet=Settings().alphabet))
+            except Exception:  # noqa: BLE001 - then the import may fail on Windows, and says so
+                log.exception("Backup: Telecode-Alphabet nicht freigegeben")
+
+    def _restore_alphabet(self) -> None:
+        """After a failed import: back to the alphabet the program had before ``_before_import``."""
+        before = self._pre_import
+        if before is not None and self._controller.settings != before:
+            try:
+                self._controller.apply_settings(before)
+            except Exception:  # noqa: BLE001
+                log.exception("Backup: Alphabet nicht wiederhergestellt")
+        self._pre_import = None
+
     def _confirm_text(self, preview: backup.Preview) -> str:
+        """The confirmation. Its texts come from the built-in language files only: a language file of the user
+        (or of an earlier import) could drop the warning from them."""
         changes = [e for e in preview.entries if e.status != "unchanged"]
-        listed = "\n".join(f"{tr('backup.status.' + e.status)}: {e.label}" for e in changes[:PREVIEW_LINES])
+        listed = "\n".join(f"{_trusted('backup.status.' + e.status)}: {e.label}" for e in changes[:PREVIEW_LINES])
         if len(changes) > PREVIEW_LINES:
-            listed += "\n" + tr("backup.import.more", count=len(changes) - PREVIEW_LINES)
+            listed += "\n" + _trusted("backup.import.more", count=len(changes) - PREVIEW_LINES)
         blocks: list[str] = []
         if preview.slots:
             lines = [
-                tr("backup.import.slot", slot=s.slot, trigger=s.trigger or "-", macro=s.macro,
-                   risks=(" [" + ", ".join(s.risks) + "]") if s.risks else "")
-                for s in preview.slots[:PREVIEW_SLOTS]
+                _trusted(
+                    "backup.import.slot", slot=s.slot, trigger=s.trigger or "-", macro=s.macro,
+                    risks=(" [" + ", ".join(s.risks) + "]") if s.risks else "",
+                )
+                for s in preview.slots  # all of them, the risky ones first; the dialog scrolls
             ]
-            if len(preview.slots) > PREVIEW_SLOTS:
-                lines.append(tr("backup.import.more", count=len(preview.slots) - PREVIEW_SLOTS))
-            warning = tr("backup.import.warn.macros", count=len(preview.slots))
+            warning = _trusted("backup.import.warn.macros", count=len(preview.slots))
             if preview.risky:
-                warning += " " + tr("backup.import.warn.risky", commands=", ".join(sorted({r for s in preview.slots for r in s.risks})))
+                found = sorted({r for s in preview.slots for r in s.risks} | {r for c in preview.commands for r in c.risks})
+                warning += " " + _trusted("backup.import.warn.risky", commands=", ".join(found))
             blocks.append(warning + "\n" + "\n".join(lines))
+        if preview.commands:
+            shown = preview.commands[:MAX_COMMAND_LINES]
+            lines = [
+                _trusted(
+                    "backup.import.command", path=c.path, code=c.code, text=c.text, risks=", ".join(c.risks)
+                )
+                for c in shown
+            ]
+            if len(preview.commands) > len(shown):
+                lines.append(_trusted("backup.import.more_commands", count=len(preview.commands) - len(shown)))
+            blocks.append(
+                _trusted("backup.import.warn.commands", count=len(preview.commands)) + "\n" + "\n".join(lines)
+            )
         if preview.warnings:
-            blocks.append(tr("backup.import.notes", notes="\n".join(backup.display_text(w, 200) for w in preview.warnings[:5])))
-        return tr(
+            blocks.append(
+                _trusted("backup.import.notes", notes="\n".join(backup.display_text(w, 200) for w in preview.warnings[:5]))
+            )
+        if preview.notes:
+            blocks.append(
+                _trusted("backup.import.notes", notes="\n".join(_trusted(f"backup.warn.{n.code}", **n.params) for n in preview.notes))
+            )
+        if preview.risky_files:
+            if preview.safe is not None:
+                blocks.append(
+                    _trusted(
+                        "backup.import.safe", add=preview.safe.count("add"), replace=preview.safe.count("replace"),
+                        files=", ".join(backup.display_text(f) for f in preview.risky_files),
+                    )
+                )
+            elif preview.safe_error is not None:
+                blocks.append(_trusted("backup.import.safe_error", error=self._error_text(preview.safe_error)))
+        return _trusted(
             "backup.import.confirm",
             add=preview.count("add"), replace=preview.count("replace"), unchanged=preview.count("unchanged"),
             version=backup.display_text(str(preview.manifest.get("app_version", "?")), 40),
@@ -552,45 +681,57 @@ class SettingsPanel(tk.Frame):
     def _imported(self, result: backup.ImportResult | None, error: BaseException | None) -> None:
         dialogs = self._backup_dialogs
         if error is not None:
+            self._restore_alphabet()
             self._finish()
+            self._deferred_change = False
             self._show_error("backup.err.import", error)
             return
         assert result is not None
-        problem, restart = self._load_into_running_app(result.written)
+        problem, restart = self._load_into_running_app(result)
+        self._pre_import = None
+        if self._deferred_change:  # a form change during the import is not applied to the imported state
+            self._deferred_change = False
+            self._error.configure(text=tr("backup.change_dropped"))
         self._finish()
         text = (
             tr("backup.import.done", path=result.restore_point) if result.restore_point else tr("backup.import.done.nopoint")
         )
+        if result.removed:
+            text += "\n\n" + tr("backup.import.removed", count=len(result.removed))
         if restart:
             text += "\n\n" + tr("backup.import.restart", what=", ".join(tr(f"backup.restart.{key}") for key in restart))
         if problem:
             text += "\n\n" + tr("backup.import.apply_failed", reason=problem)
         dialogs.info(tr("backup.import"), text)
 
-    def _load_into_running_app(self, written: tuple[str, ...]) -> tuple[str, list[str]]:
+    def _load_into_running_app(self, result: backup.ImportResult) -> tuple[str, list[str]]:
         """Make the program use the imported files now, through the same paths a change in the UI takes.
 
         Without this the running program keeps the old state in memory and its next save (tray menu,
         settings form, function key editor) writes it over the import. Returns (reason if something could not
         be loaded, keys of what only a restart reads). The settings go through ``apply_settings`` of the app
         (which also saves them and refreshes every page); the function keys are cleared first, because the
-        old keys may clash with the new Morse key and the other way round.
+        old keys may clash with the new Morse key and the other way round. ``settings.json`` is only written
+        when it was imported: after an import of alphabets alone the file keeps what it says, and the
+        alphabet or smiley set it names is switched to now if the import made it usable again.
         """
         controller, config = self._controller, self._config_dir
-        restart = [key for key, folder in (("languages", "languages/"),) if any(w.startswith(folder) for w in written)]
-        if backup.TELECODE_FILE in written:
-            restart.append("telecode")
+        written = (*result.written, *result.removed)
+        restart = ["languages"] if any(w.startswith("languages/") for w in written) else []
+        before = self._pre_import or controller.settings
         previous = controller.function_keys
         keys_loaded = False
         try:
-            settings = SettingsStore(config).load() if backup.SETTINGS_FILE in written else controller.settings
             keys = None
             if backup.FUNCTION_KEYS_FILE in written:
                 keys, _warnings = FunctionKeysStore(config).load(controller.check_shortcut)
                 controller.apply_function_keys(FunctionKeys())
                 keys_loaded = True
             with gate.allow():  # the saves of the import itself pass the gate
-                self._apply(settings)  # the app also refreshes its pages; the function keys page reloads its file
+                if backup.SETTINGS_FILE in written:
+                    self._apply(SettingsStore(config).load())  # the app also refreshes its pages
+                else:
+                    self._switch_without_saving(before, SettingsStore(config).load(), written)
             self.refresh()  # in any case: a form that still shows the old values would save them with the next change
             if keys is not None:
                 controller.apply_function_keys(keys)
@@ -605,3 +746,20 @@ class SettingsPanel(tk.Frame):
                     log.exception("Backup: alte Funktionstasten nicht wiederhergestellt")
             return str(exc), restart
         return "", restart
+
+    def _switch_without_saving(self, before: Settings, disk: Settings, written: tuple[str, ...]) -> None:
+        """``settings.json`` was not imported: go back to the settings from before the import, or, if alphabets
+        or smiley sets came and the file names one of them that was missing so far, to what the file says.
+        Nothing is saved: the file already holds what the user chose."""
+        controller = self._controller
+        target = before
+        if disk != before and any(w.startswith(("alphabets/", "smileys/")) for w in written):
+            try:
+                controller.apply_settings(disk)
+                target = disk
+            except Exception:  # noqa: BLE001 - still not usable: stay as it was
+                log.info("Backup: Auswahl aus settings.json weiter nicht ladbar", exc_info=True)
+        if target is not disk and controller.settings != target:
+            controller.apply_settings(target)
+        if self._on_imported is not None:
+            self._on_imported()  # the other pages (alphabet list, function keys) read the new files

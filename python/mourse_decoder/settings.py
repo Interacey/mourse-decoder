@@ -183,6 +183,11 @@ def typing_delay_error(value: object) -> str | None:
     return None
 
 
+def is_valid_id(value: object) -> bool:
+    """True for an alphabet or smiley set id: the file name pattern, so an id can never be a path (``//host/x``)."""
+    return isinstance(value, str) and bool(_ID_PATTERN.match(value))
+
+
 @dataclass(frozen=True)
 class Settings:
     dot_threshold_ms: int = 200  # shorter press is a dot
@@ -229,8 +234,12 @@ class Settings:
         errors.extend(self._key_errors())
         if not isinstance(self.alphabet, str) or not self.alphabet:
             errors.append("Es muss ein Alphabet gewählt sein.")
+        elif not is_valid_id(self.alphabet):
+            errors.append(f"Ungültige Alphabet-ID '{self.alphabet}' (nur a-z, 0-9, '-' und '_').")
         if not isinstance(self.smileys, str):
             errors.append("'smileys' muss ein Text sein (ID des Smiley-Sets oder leer).")
+        elif self.smileys and not is_valid_id(self.smileys):
+            errors.append(f"Ungültige Smiley-Set-ID '{self.smileys}' (nur a-z, 0-9, '-' und '_').")
         if not isinstance(self.enabled, bool):
             errors.append("'enabled' muss true oder false sein.")
         if not isinstance(self.language, str) or not self.language:
@@ -364,6 +373,21 @@ def default_config_dir() -> Path:
     return base / "mourse-decoder"
 
 
+def _without_bad_ids(settings: Settings) -> Settings:
+    """An alphabet or smiley id that is not a valid id (a hand-edit, ``Latin``, ``//host/share/x``) went to the
+    loaders as a file name and could never be loaded. The field goes back to its default and the rest of the
+    file is kept, instead of the whole file being thrown away."""
+    changes: dict[str, str] = {}
+    if isinstance(settings.alphabet, str) and settings.alphabet and not is_valid_id(settings.alphabet):
+        changes["alphabet"] = Settings.alphabet
+    if isinstance(settings.smileys, str) and settings.smileys and not is_valid_id(settings.smileys):
+        changes["smileys"] = Settings.smileys
+    if changes:
+        log.warning("Ungültige ID in den Einstellungen, Standardwert verwendet: %s", ", ".join(changes))
+        return settings.replace(**changes)
+    return settings
+
+
 class SettingsStore:
     FILE_NAME = "settings.json"
 
@@ -394,7 +418,7 @@ class SettingsStore:
             data = jsontext.loads(self.path.read_text(encoding="utf-8-sig"), dict)
             if not isinstance(data, dict):
                 raise ValueError("Wurzelelement ist kein Objekt")
-            settings = Settings.from_dict(data)
+            settings = _without_bad_ids(Settings.from_dict(data))
             errors = settings.validate()
             if errors:
                 # files saved before the key/shortcut clash check: keep the rest, drop the clashing shortcut

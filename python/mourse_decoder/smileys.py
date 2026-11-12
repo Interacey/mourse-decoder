@@ -112,6 +112,8 @@ def load_smiley_codes(
     """Code table of a set; an empty id means no set and gives an empty table."""
     if not set_id:
         return {}
+    if not _ID_PATTERN.match(set_id):  # the id becomes a file name: no path, no UNC share (//host/x)
+        raise SmileyError(f"Ungültige Smiley-Set-ID {set_id!r}")
     for directory, _ in _directories(builtin_dir, user_dir):
         path = directory / f"{set_id}.json"
         if path.is_file():

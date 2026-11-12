@@ -34,6 +34,8 @@ POLL_INTERVAL_MS = 250
 
 
 class TrayApp:
+    _quit_pending = False  # Quit was asked for while a backup import was writing: done when it is over
+
     def __init__(
         self,
         controller: MorseController,
@@ -90,6 +92,9 @@ class TrayApp:
                 log.exception("Fehler in UI-Aufgabe")
         try:
             # one failing poll must not stop the others, and the loop must be scheduled again in any case
+            if self._quit_pending and not gate.blocked():
+                self._quit_pending = False
+                self.quit()
             polls = (self._poll_block, self._poll_cycle, self._poll_undo, self._poll_function_keys, self._poll_hook)
             for poll in polls:
                 if poll in (self._poll_block, self._poll_cycle) and gate.blocked():
@@ -264,6 +269,10 @@ class TrayApp:
         self._root.mainloop()
 
     def quit(self) -> None:
+        if gate.blocked():  # half an import on disk would be the result: wait for it, then quit
+            self._quit_pending = True
+            self._toast.show(tr("backup.quit_wait"), False)
+            return
         self._controller.stop()
         self._icon.stop()
         self._root.quit()

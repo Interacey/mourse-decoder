@@ -536,6 +536,10 @@ class MorseController:
     def reload_alphabet(self) -> None:
         """Reload the active alphabet after its file changed."""
         with self._lock:
+            try:  # the active smiley set may be one of the files that changed
+                self._dictionaries.set_smileys(self._dictionaries.smiley_set_id)
+            except Exception:  # noqa: BLE001 - a set that is gone: keep the codes in memory, the alphabet reload goes on
+                log.exception("Smiley-Set konnte nicht neu geladen werden")
             self._dictionaries.invalidate()
             decoder = self._decoder_factory(self._dictionaries, self._settings.alphabet)  # raises: old decoder stays
             replaced = self._decoder
