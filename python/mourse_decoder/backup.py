@@ -14,6 +14,7 @@ Everything here may run in a worker thread: nothing touches Tk, and every failur
 
 from __future__ import annotations
 
+import atexit
 import dataclasses
 import hashlib
 import io
@@ -574,14 +575,29 @@ def _load_bundle(data: bytes, source: str = "The file") -> tuple[dict[str, Any],
     return manifest, files
 
 
+_live_scratch: set[Path] = set()  # folders that exist right now; the exit hook removes what is left
+
+
+def _clean_scratch() -> None:
+    """At the end of the process (a thread that is killed with it never reaches its ``finally``)."""
+    for path in list(_live_scratch):
+        shutil.rmtree(path, ignore_errors=True)
+        _live_scratch.discard(path)
+
+
+atexit.register(_clean_scratch)
+
+
 @contextmanager
 def _scratch():
     """A temporary folder outside the config folder; removed at the end, also after an error."""
     path = Path(tempfile.mkdtemp(prefix="mourse-backup-"))
+    _live_scratch.add(path)
     try:
         yield path
     finally:
         shutil.rmtree(path, ignore_errors=True)
+        _live_scratch.discard(path)
 
 
 class _Warnings(logging.Handler):

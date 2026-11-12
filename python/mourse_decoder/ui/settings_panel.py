@@ -6,6 +6,7 @@ An invalid input, e.g. a half-typed number, isn't applied but reported below the
 from __future__ import annotations
 
 import functools
+import gc
 import json
 import logging
 import queue
@@ -145,6 +146,7 @@ class SettingsPanel(tk.Frame):
         self._backup_dialogs = backup_dialogs or BackupDialogs(self.winfo_toplevel())
         self._backup_running = False  # a backup job is on its way: buttons off, no settings changes
         self._closed = False
+        self._gc_paused = False  # gc is off while a backup job runs, see ``_gc_pause``
         self._holds_gate = False  # this page has the import gate: other saves are refused until _finish
         self._job_running = False  # the worker thread is still inside its job
         self._deferred_change = False  # a form change was made while a job ran
@@ -409,6 +411,8 @@ class SettingsPanel(tk.Frame):
     def _on_destroy(self, event: tk.Event) -> None:
         if event.widget is self:
             self._closed = True
+            gate.hold(self, False)
+            self._gc_restore()
             if not self._job_running:  # else the worker releases the gate when it is done: it is still writing
                 self._release_gate()
             if self._worker_job is not None:
@@ -417,6 +421,7 @@ class SettingsPanel(tk.Frame):
 
     def _set_backup_running(self, running: bool) -> None:
         self._backup_running = running
+        gate.hold(self, running)  # Quit waits from the first job (checking, the open question) to the last step
         for button in self._backup_buttons:
             button.set_enabled(not running)
 
@@ -428,6 +433,7 @@ class SettingsPanel(tk.Frame):
         """
         self._set_backup_running(True)
         self._job_running = True
+        self._gc_pause()
         outcome: queue.Queue[tuple[Any, BaseException | None]] = queue.Queue()
 
         def run() -> None:
@@ -443,6 +449,23 @@ class SettingsPanel(tk.Frame):
         threading.Thread(target=run, name="backup", daemon=True).start()
         self._poll(outcome, done)
 
+    def _gc_pause(self) -> None:
+        """No garbage collection while the worker runs.
+
+        A collection frees the Tk variables of pages that were destroyed (reference cycles). Run on the worker
+        thread it would call Tk from there, and Tk waits for the main loop (about a second per variable and
+        "main thread is not in main loop" when the loop is only polled). The Tk thread collects afterwards.
+        """
+        if not self._gc_paused and gc.isenabled():
+            self._gc_paused = True
+            gc.disable()
+
+    def _gc_restore(self) -> None:
+        if self._gc_paused:
+            self._gc_paused = False
+            gc.enable()
+            gc.collect()  # on this thread, the one that may free Tk variables
+
     def _poll(self, outcome: queue.Queue, done: Callable[[Any, BaseException | None], None]) -> None:
         if self._closed:
             return
@@ -452,6 +475,7 @@ class SettingsPanel(tk.Frame):
             self._worker_job = self.after(WORKER_POLL_MS, self._poll, outcome, done)
             return
         self._worker_job = None
+        self._gc_restore()
         try:
             done(result, error)
         except Exception as exc:  # noqa: BLE001 - a traceback in a Tk callback would leave the page stuck
@@ -745,6 +769,12 @@ class SettingsPanel(tk.Frame):
                 except Exception:  # noqa: BLE001
                     log.exception("Backup: alte Funktionstasten nicht wiederhergestellt")
             return str(exc), restart
+        finally:
+            if self._on_imported is not None:  # pages, tray menu and icon read the new files and state
+                try:
+                    self._on_imported()
+                except Exception:  # noqa: BLE001 - the import itself is done
+                    log.exception("Backup: Seiten nicht aktualisiert")
         return "", restart
 
     def _switch_without_saving(self, before: Settings, disk: Settings, written: tuple[str, ...]) -> None:
@@ -753,13 +783,12 @@ class SettingsPanel(tk.Frame):
         Nothing is saved: the file already holds what the user chose."""
         controller = self._controller
         target = before
-        if disk != before and any(w.startswith(("alphabets/", "smileys/")) for w in written):
+        wanted = before.replace(alphabet=disk.alphabet, smileys=disk.smileys)  # only the choice, never on/off
+        if wanted != before and any(w.startswith(("alphabets/", "smileys/")) for w in written):
             try:
-                controller.apply_settings(disk)
-                target = disk
+                controller.apply_settings(wanted)
+                target = wanted
             except Exception:  # noqa: BLE001 - still not usable: stay as it was
                 log.info("Backup: Auswahl aus settings.json weiter nicht ladbar", exc_info=True)
-        if target is not disk and controller.settings != target:
+        if controller.settings != target:
             controller.apply_settings(target)
-        if self._on_imported is not None:
-            self._on_imported()  # the other pages (alphabet list, function keys) read the new files

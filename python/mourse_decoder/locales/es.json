@@ -263,6 +263,8 @@
     "alpha.copy.id_suffix": "-copia",
     "alpha.copy.name_suffix": " (Copia)",
     "startup.alphabet_fallback": "No se pudo cargar el alfabeto '{id}' ({msg}); se usa 'latin'.",
+    "startup.bad_alphabet_id": "settings.json: «{value}» no es un ID de alfabeto válido (permitido: a-z, 0-9, \"-\" y \"_\"). El programa usa «{default}»; elige de nuevo el alfabeto en la página de ajustes.",
+    "startup.bad_smiley_id": "settings.json: «{value}» no es un ID de conjunto de smileys válido (permitido: a-z, 0-9, \"-\" y \"_\"). El programa no usa ningún conjunto de smileys; elige uno de nuevo en la página Smileys.",
     "app.already_running": "Mourse Decoder ya se está ejecutando (véase el icono de la bandeja).",
     "alpha.title.deleted": "Alfabeto eliminado",
     "alpha.status.builtin": "Incluido y de solo lectura. Usa «Crear copia» para modificarlo.",

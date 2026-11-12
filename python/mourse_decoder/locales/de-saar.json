@@ -263,6 +263,8 @@
     "alpha.copy.id_suffix": "-kopie",
     "alpha.copy.name_suffix": " (Kopie)",
     "startup.alphabet_fallback": "Alphabet '{id}' lossd sich net lade ({msg}) – 'latin' werd genumme.",
+    "startup.bad_alphabet_id": "settings.json: \"{value}\" is kä gültichi Alphabet-ID (erlaubt: a-z, 0-9, \"-\" un \"_\"). 's Programm nemmt stattdesse \"{default}\"; such 's Alphabet uff de Eistellungsseit nei aus.",
+    "startup.bad_smiley_id": "settings.json: \"{value}\" is kä gültichi Smiley-Set-ID (erlaubt: a-z, 0-9, \"-\" un \"_\"). 's Programm nemmt stattdesse kää Smiley-Set; such uff de Seit Smileys eens nei aus.",
     "app.already_running": "Mourse Decoder laaft schun (Symbol im Infobereich vun de Taskleischt).",
     "alpha.title.deleted": "Alphabet gelöscht",
     "alpha.status.builtin": "Is schun dabei un gesperrt. Mach e „Kopie“, wenn de was ännere willscht.",

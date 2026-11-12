@@ -195,7 +195,7 @@ class MainWindow:
         if name == "settings":
             from .settings_panel import SettingsPanel
 
-            page = SettingsPanel(stack, c, d, apply, on_imported=self.sync)
+            page = SettingsPanel(stack, c, d, apply, on_imported=self._changed)
         elif name == "alphabets":
             from .alphabet_panel import AlphabetPanel
 

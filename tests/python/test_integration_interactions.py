@@ -166,16 +166,16 @@ def test_import_after_a_shortcut_pause_keeps_the_imported_switches(
 
     assert dialogs.kinds()[-1] == "info" and "error" not in dialogs.kinds()
     assert file_flags(config) == (bundle_enabled, False)  # the import wrote them, the live-load kept them
-    assert (controller.settings.enabled, controller.settings.block_input) == (bundle_enabled, False)
-    assert (fake_engine.active, fake_engine.block_input) == (bundle_enabled, False)
-    assert tray._saved_flags == {"enabled": bundle_enabled, "block_input": False}
+    assert (controller.settings.enabled, controller.settings.block_input) == (False, False)
+    assert (fake_engine.active, fake_engine.block_input) == (False, False)
+    assert (tray._saved_flags["enabled"], tray._saved_flags["block_input"]) == (bundle_enabled, False)
 
     tray._apply(controller.settings.replace(letter_gap_ms=730))  # a later change of something else
 
     assert file_flags(config) == (bundle_enabled, False)
     assert SettingsStore(config).load().letter_gap_ms == 730
-    assert (controller.settings.enabled, controller.settings.block_input) == (bundle_enabled, False)
-    assert (fake_engine.active, fake_engine.block_input) == (bundle_enabled, False)
+    assert (controller.settings.enabled, controller.settings.block_input) == (False, False)
+    assert (fake_engine.active, fake_engine.block_input) == (False, False)
     assert fake_engine.configure_calls[-1][1] == 730
 
 
@@ -451,7 +451,7 @@ def test_settings_replace_with_a_hostile_id_is_refused_by_validate_apply_and_sav
     with pytest.raises(ValueError):
         tray._apply(bad)
     assert snapshot(config) == files and controller.settings != bad
-    assert tray._saved_flags == {"enabled": True, "block_input": False}
+    assert (tray._saved_flags["enabled"], tray._saved_flags["block_input"]) == (True, False)
 
 
 def test_a_bundle_with_a_hostile_id_is_refused_before_anything_is_written(tmp_path):
@@ -538,3 +538,232 @@ def test_every_literal_tr_key_and_backup_error_code_of_the_code_exists():
     for phase in calibration.PHASES:
         missing += [k for k in (f"calibration.step.{phase}", f"calibration.hint.{phase}") if k not in strings]
     assert missing == []
+
+
+# ---- findings of the blind reviews (reproductions of the reviewer are in test_review_import_interactions.py) ----
+
+
+def test_a_pending_shortcut_press_survives_any_apply_that_does_not_set_the_switch(fake_engine, injector, tmp_path):
+    config = fresh_config(tmp_path / "cfg")
+    controller, store, tray = start(fake_engine, injector, config)
+    fake_engine.active = False  # the hook flipped it, the poll has not run yet
+    controller.apply_settings(controller.settings.replace(letter_gap_ms=700))
+    assert fake_engine.active is False
+    toggled = controller.poll_active_toggle()
+    assert toggled is not None and toggled.enabled is False  # the poll still sees the press
+
+
+def test_apply_that_sets_the_switch_itself_wins_over_the_engine_state(fake_engine, injector, tmp_path):
+    config = fresh_config(tmp_path / "cfg")
+    controller, store, tray = start(fake_engine, injector, config)
+    controller.apply_settings(controller.settings.replace(enabled=False))  # tray menu
+    assert fake_engine.active is False
+    controller.apply_settings(controller.settings.replace(enabled=True))
+    assert fake_engine.active is True
+    fake_engine.active = False
+    controller.apply_settings(controller.settings.replace(enabled=True, letter_gap_ms=650))  # keeps the press
+    assert fake_engine.active is False
+
+
+def test_fallback_of_an_import_that_cannot_be_loaded_keeps_the_imported_file(import_panel, fake_engine, tk_root):
+    page, controller, store, tray, config, dialogs = import_panel(
+        '{"alphabet": "german", "letter_gap_ms": 600}',
+        json.dumps({"alphabet": "chinese-telecode", "letter_gap_ms": 777, "smileys": "gibts-nicht"}),
+    )
+    run_import(page, tk_root)
+    s = controller.settings
+    assert (s.alphabet, s.smileys, s.letter_gap_ms) == ("latin", "", 777)  # fallback in memory, rest imported
+    assert dialogs.kinds()[-1] == "info" and "could not load" not in dialogs.calls[-1][2]
+
+    def pause():
+        shortcut_pause(fake_engine, tray)
+
+    def timing():
+        tray._apply(controller.settings.replace(word_gap_ms=1800))
+
+    for change in (pause, timing):
+        change()
+        on_disk = json.loads((config / "settings.json").read_text(encoding="utf-8"))
+        assert (on_disk["alphabet"], on_disk["smileys"], on_disk["letter_gap_ms"]) == (
+            "chinese-telecode", "gibts-nicht", 777,
+        )
+    # the user choosing another alphabet is saved
+    tray._apply(controller.settings.replace(alphabet="greek"))
+    assert json.loads((config / "settings.json").read_text(encoding="utf-8"))["alphabet"] == "greek"
+
+
+def test_a_smiley_set_that_is_still_missing_does_not_break_later_changes(fake_engine, injector, tmp_path):
+    config = fresh_config(tmp_path / "cfg")
+    (config / "settings.json").write_text('{"alphabet": "latin", "smileys": "neu"}', encoding="utf-8")
+    dicts = DictionaryManager(user_directory=config / "alphabets", user_smiley_directory=config / "smileys")
+    store = SettingsStore(config)
+    controller = MorseController(fake_engine, injector, dicts, store.load(), use_hook=False)
+    controller.start()
+    controller.apply_settings(controller.settings.replace(letter_gap_ms=640))  # no error, set still missing
+    assert dicts.smiley_set_id == "" and controller.settings.smileys == "neu"
+    (config / "smileys" / "neu.json").write_text(
+        json.dumps({"id": "neu", "name": "Neu", "codes": {"........-": "Z"}}), encoding="utf-8"
+    )
+    controller.apply_settings(controller.settings.replace(letter_gap_ms=650))  # now it loads
+    assert dicts.smiley_set_id == "neu"
+    fake_engine.letters("........-")
+    assert injector.buffer == "Z"
+
+
+def test_scratch_folders_are_removed_at_exit_even_if_their_thread_never_finishes():
+    manager = backup._scratch()
+    path = manager.__enter__()
+    try:
+        assert path.is_dir() and path in backup._live_scratch
+        backup._clean_scratch()
+        assert not path.exists() and path not in backup._live_scratch
+    finally:
+        manager.__exit__(None, None, None)  # still fine after the hook ran
+
+
+def test_quit_waits_from_the_first_job_of_the_page_until_the_import_is_done(import_panel, fake_engine, tk_root):
+    import time
+
+    page, controller, store, tray, config, dialogs = import_panel(
+        '{"alphabet": "german"}', '{"alphabet": "german", "letter_gap_ms": 777}'
+    )
+    quits: list[str] = []
+    tray._root = SimpleNamespace(after=lambda ms, f: None, quit=lambda: quits.append("root.quit"))
+    tray._icon.stop = lambda: quits.append("icon.stop")
+    page._import_backup()  # the check job is running now
+    assert gate.busy()
+    tray.quit()
+    assert quits == [] and tray._quit_pending
+    deadline = time.monotonic() + 20
+    while page._backup_running and time.monotonic() < deadline:
+        tk_root.update()
+        time.sleep(0.005)
+    assert not gate.busy()
+    assert json.loads((config / "settings.json").read_text(encoding="utf-8"))["letter_gap_ms"] == 777  # import was done
+    tray._drain_queue()
+    assert quits == ["icon.stop", "root.quit"]
+
+
+def test_the_tray_menu_icon_and_tooltip_follow_an_import(fake_engine, injector, tmp_path):
+    config = fresh_config(tmp_path / "cfg")
+    controller, store, tray = start(fake_engine, injector, config)
+    built, titles = [], []
+    tray._build_menu = lambda: built.append("menu") or "menu"
+    tray._set_title = titles.append
+    tray._tooltip = lambda: "tip"
+    tray._rebuild_menu()
+    assert built == ["menu"] and tray._icon.menu == "menu" and titles == ["tip"] and tray._icon.icon is not None
+
+
+def test_the_main_window_rebuilds_the_tray_menu_after_an_import(tk_root, fake_engine, injector, tmp_path):
+    import tkinter as tk
+
+    from mourse_decoder.ui import theme
+    from mourse_decoder.ui.main_window import MainWindow
+
+    theme.apply_theme(tk_root, "light")
+    set_language("en")
+    config = fresh_config(tmp_path / "cfg" / "MourseDecoder")
+    controller, store, tray = start(fake_engine, injector, config)
+    rebuilt = []
+    top = tk.Toplevel(tk_root)
+    try:
+        window = MainWindow(
+            top, controller, DictionaryManager(), apply_settings=tray._apply,
+            on_alphabets_changed=lambda: rebuilt.append(1), on_hide=lambda: None, on_quit=lambda: None,
+            config_dir=config,
+        )
+        page = window._page_widget("settings")
+        before = len(rebuilt)
+        page._on_imported()
+        assert len(rebuilt) == before + 1  # the settings page reports an import: the tray menu is rebuilt
+    finally:
+        top.destroy()
+
+
+def test_gc_stays_off_while_a_backup_job_runs_and_tk_variables_are_freed_on_the_tk_thread(
+    import_panel, fake_engine, tk_root
+):
+    import gc
+    import time
+    import tkinter as tk
+
+    page, *_ = import_panel('{"alphabet": "german"}', '{"alphabet": "german", "letter_gap_ms": 777}')
+    freed_on: list[str] = []
+
+    class Var(tk.StringVar):
+        def __del__(self):
+            freed_on.append(threading.current_thread().name)
+            super().__del__()
+
+    class Holder:  # a cycle that only the collector can free, like a destroyed page
+        def __init__(self):
+            self.me = self
+            self.var = Var(tk_root)
+
+    Holder()
+    seen = {}
+
+    def work():
+        seen["gc_enabled"] = gc.isenabled()
+        junk = [[object()] for _ in range(300_000)]  # allocations that would start a collection
+        return len(junk)
+
+    results = []
+    started = time.monotonic()
+    page._start(work, lambda result, error: (results.append(result), page._finish()))
+    deadline = time.monotonic() + 30
+    while page._backup_running and time.monotonic() < deadline:
+        tk_root.update()
+        time.sleep(0.005)
+    assert results == [300_000] and seen["gc_enabled"] is False
+    assert gc.isenabled()
+    assert "backup" not in freed_on, "a Tk variable was freed on the worker thread"
+    assert time.monotonic() - started < 5
+
+
+def test_gc_is_back_on_when_the_page_is_closed_during_a_job(import_panel, fake_engine, tk_root):
+    import gc
+    import time
+
+    page, *_ = import_panel('{"alphabet": "german"}', '{"alphabet": "german"}')
+    release = threading.Event()
+    page._start(lambda: release.wait(10), lambda result, error: page._finish())
+    assert not gc.isenabled()
+    page.destroy()
+    assert gc.isenabled() and not gate.busy()
+    release.set()
+    time.sleep(0.05)
+
+
+@pytest.mark.parametrize("bad", ["Upper", "Latin", "dot.ted", "ünï", "//host/x", "-x"])
+@pytest.mark.parametrize("field", ["alphabet", "smileys"])
+def test_an_invalid_id_in_settings_json_is_reported_not_silently_reset(tmp_path, field, bad):
+    from mourse_decoder import app
+
+    set_language("en")
+    config = tmp_path / "cfg"
+    config.mkdir()
+    text = json.dumps({field: bad, "dot_threshold_ms": 250}, ensure_ascii=False).encode("utf-8")
+    (config / "settings.json").write_bytes(text)
+    store = SettingsStore(config)
+    settings = store.load()
+    assert getattr(settings, field) == getattr(Settings(), field) and settings.dot_threshold_ms == 250
+    messages = app.settings_warnings(store)
+    assert len(messages) == 1 and bad[:40] in messages[0] and "settings.json" in messages[0]
+    assert (config / "settings.json").read_bytes() == text  # the file is still as the user left it
+    set_language("de")
+    try:
+        assert app.settings_warnings(store)[0] != messages[0]
+    finally:
+        set_language("en")
+
+
+def test_valid_ids_and_old_files_give_no_warning_and_stay_byte_identical(tmp_path):
+    config = tmp_path / "cfg"
+    config.mkdir()
+    for text in (OLD_FILE, '{"alphabet": "mein_alphabet-2", "smileys": "my-set_1"}', '{"smileys": ""}'):
+        (config / "settings.json").write_text(text, encoding="utf-8")
+        store = SettingsStore(config)
+        store.load()
+        assert store.warnings == [] and (config / "settings.json").read_text(encoding="utf-8") == text

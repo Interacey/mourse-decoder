@@ -52,6 +52,14 @@ def build_controller(engine, injector, dictionaries, settings: Settings, listene
         return MorseController(engine, injector, dictionaries, fallback, listener=listener), [warning]
 
 
+def settings_warnings(store: SettingsStore) -> list[str]:
+    """What ``store.load`` changed in the settings on its own (an invalid id), in the program's language.
+
+    The file is not touched here; the next save writes the replaced value, so this message comes first.
+    """
+    return [tr(key, **values) for key, values in store.warnings]
+
+
 def acquire_single_instance(name: str = MUTEX_NAME) -> bool:
     """True if this is the only instance (named mutex, Windows only; other systems always True)."""
     if sys.platform != "win32":
@@ -229,6 +237,7 @@ def main(argv: list[str] | None = None) -> int:
     store = SettingsStore()
     settings = store.load()
     set_language(settings.language, store.directory / "languages")  # startup warnings use it
+    notices = settings_warnings(store)
     dictionaries = DictionaryManager(
         telecode_db=store.directory / "telecode.sqlite",
         user_directory=store.directory / "alphabets",
@@ -240,7 +249,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.headless:
         controller, startup_warnings = build_controller(engine, injector, dictionaries, settings, _ConsoleListener())
         controller.start()
-        for warning in startup_warnings + _start_function_keys(controller, store.directory, injector):
+        for warning in notices + startup_warnings + _start_function_keys(controller, store.directory, injector):
             print(f"Warnung: {warning}", file=sys.stderr, flush=True)
         print(f"Morse-Decoder läuft (Taster: {settings.trigger}, Alphabet: {settings.alphabet}). Strg+C beendet.")
         try:
@@ -263,7 +272,7 @@ def main(argv: list[str] | None = None) -> int:
     tray = TrayApp(controller, dictionaries, store, start_hidden=args.minimized, hook_error=native.hook_error)
     controller.set_listener(tray)  # breaks the tray <-> controller cycle
     controller.start()
-    for warning in startup_warnings + _start_function_keys(controller, store.directory, injector):
+    for warning in notices + startup_warnings + _start_function_keys(controller, store.directory, injector):
         tray.on_error(warning)
     show_update_result(store.directory)
     try:

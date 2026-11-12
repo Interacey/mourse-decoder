@@ -263,6 +263,8 @@
     "alpha.copy.id_suffix": "-copia",
     "alpha.copy.name_suffix": " (Cópia)",
     "startup.alphabet_fallback": "Não foi possível carregar o alfabeto '{id}' ({msg}); a usar 'latin'.",
+    "startup.bad_alphabet_id": "settings.json: «{value}» não é um ID de alfabeto válido (permitido: a-z, 0-9, \"-\" e \"_\"). O programa usa «{default}»; escolha o alfabeto de novo nas definições.",
+    "startup.bad_smiley_id": "settings.json: «{value}» não é um ID de conjunto de smileys válido (permitido: a-z, 0-9, \"-\" e \"_\"). O programa não usa nenhum conjunto de smileys; escolha um de novo na página Smileys.",
     "app.already_running": "O Mourse Decoder já está em execução (veja o ícone na área de notificação).",
     "alpha.title.deleted": "Alfabeto eliminado",
     "alpha.status.builtin": "Incluído e só de leitura. Use «Criar cópia» para o alterar.",

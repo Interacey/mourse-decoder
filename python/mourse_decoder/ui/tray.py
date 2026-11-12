@@ -31,6 +31,39 @@ from .toast import Toast
 log = logging.getLogger(__name__)
 
 POLL_INTERVAL_MS = 250
+# what settings.json says and the program does not always do: the switches the on/off shortcut flips at run
+# time, and the alphabet and smiley set, which fall back (in memory only) when the named one cannot be loaded
+SAVED_FIELDS = ("enabled", "block_input", "alphabet", "smileys")
+
+
+def take_over_imported(controller: MorseController, settings: Settings) -> Settings:
+    """Apply the settings of an imported ``settings.json``; returns what the controller really runs.
+
+    Like at the start of the program (``app.build_controller``), an alphabet or smiley set that cannot be loaded
+    (the file is not in the backup, telecode.sqlite is missing) is replaced by the default / none in memory, so
+    the rest of the import still takes effect. The file on disk keeps what the import wrote.
+    Raises the first error if no replacement helps (e.g. a shortcut clash).
+    """
+    try:
+        controller.apply_settings(settings)
+        return settings
+    except Exception as first:  # noqa: BLE001
+        log.warning("Import: Einstellungen nicht ladbar (%s), Ersatz wird gesucht", first)
+        default = Settings()
+        for changes in (
+            {"alphabet": default.alphabet},
+            {"smileys": default.smileys},
+            {"alphabet": default.alphabet, "smileys": default.smileys},
+        ):
+            candidate = settings.replace(**changes)
+            if candidate == settings:
+                continue
+            try:
+                controller.apply_settings(candidate)
+                return candidate
+            except Exception:  # noqa: BLE001
+                continue
+        raise first
 
 
 class TrayApp:
@@ -50,7 +83,7 @@ class TrayApp:
         self._dictionaries = dictionaries
         self._store = store
         # what settings.json says about the two switches the on/off shortcut flips at run time
-        self._saved_flags = {"enabled": controller.settings.enabled, "block_input": controller.settings.block_input}
+        self._saved_flags = {name: getattr(controller.settings, name) for name in SAVED_FIELDS}
         self._ui_queue: queue.Queue[Callable[[], None]] = queue.Queue()
 
         self._root = tk.Tk()
@@ -94,7 +127,7 @@ class TrayApp:
                 log.exception("Fehler in UI-Aufgabe")
         try:
             # one failing poll must not stop the others, and the loop must be scheduled again in any case
-            if self._quit_pending and not gate.blocked():
+            if self._quit_pending and not gate.busy():
                 self._quit_pending = False
                 self.quit()
             polls = (
@@ -262,13 +295,11 @@ class TrayApp:
     def _to_save(self, settings: Settings, runtime_only: bool) -> tuple[Settings, dict[str, bool]]:
         """The settings to write, and the saved switch values after that.
 
-        ``enabled`` and ``block_input`` are written only when the user changed them (form, tray menu).
+        ``enabled``, ``block_input`` (and the alphabet and smiley set, if the running ones are only a fallback)
+        are written only when the user changed them (form, tray menu).
         A pause by the on/off shortcut (``runtime_only``) and any other save made while paused keep the
         values that are on disk, so the next start blocks again.
         """
-        if gate.loading():
-            # an import brought settings.json: what the file now says about the switches is the saved value
-            return settings, {name: getattr(settings, name) for name in self._saved_flags}
         current = self._controller.settings
         saved = dict(self._saved_flags)
         if not runtime_only:
@@ -280,18 +311,30 @@ class TrayApp:
     def _apply(self, settings: Settings, runtime_only: bool = False) -> None:
         """Apply and save. Raises on errors, the caller shows them."""
         gate.check()  # ImportBusy while a backup import is writing the files
-        to_save, saved = self._to_save(settings, runtime_only)
-        self._controller.apply_settings(settings)
+        if gate.loading():
+            # the import loads the settings.json it wrote: that is what is saved, whatever the program runs
+            wanted = settings
+            if settings.enabled == self._saved_flags.get("enabled"):
+                # the file says what it said before: not a change of the switch, so a pause by the shortcut stays
+                wanted = settings.replace(enabled=self._controller.settings.enabled)
+            live = take_over_imported(self._controller, wanted)
+            to_save, saved = settings, {name: getattr(settings, name) for name in SAVED_FIELDS}
+        else:
+            to_save, saved = self._to_save(settings, runtime_only)
+            self._controller.apply_settings(settings)
+            live = settings
         self._store.save(to_save)
         self._saved_flags = saved
-        self._icon.icon = create_icon(settings.enabled)
+        self._icon.icon = create_icon(live.enabled)
         self._set_title(self._tooltip())
         self._icon.update_menu()
         self._window.sync()
 
     def _rebuild_menu(self) -> None:
-        """Rebuild the alphabet submenu after files were added or deleted."""
+        """Rebuild the alphabet submenu after files were added, deleted or imported; icon and tooltip follow."""
         self._icon.menu = self._build_menu()
+        self._icon.icon = create_icon(self._controller.settings.enabled)
+        self._set_title(self._tooltip())
         self._icon.update_menu()
 
     def _open_settings(self) -> None:
@@ -308,7 +351,7 @@ class TrayApp:
         self._root.mainloop()
 
     def quit(self) -> None:
-        if gate.blocked():  # half an import on disk would be the result: wait for it, then quit
+        if gate.busy():  # a backup job (checking, the open question, the import) is not done: wait for it, then quit
             self._quit_pending = True
             self._toast.show(tr("backup.quit_wait"), False)
             return

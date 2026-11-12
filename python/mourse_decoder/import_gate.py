@@ -29,6 +29,7 @@ class ImportGate:
         self._guard = threading.Lock()
         self._running = False
         self._allowed = 0
+        self._holders: set[int] = set()
 
     def begin(self) -> bool:
         """True if the caller may start an import (none is running); it must call ``end`` in every case."""
@@ -42,6 +43,20 @@ class ImportGate:
         with self._guard:
             self._running = False
             self._allowed = 0
+            self._holders.clear()
+
+    def hold(self, owner: object, on: bool) -> None:
+        """The page ``owner`` is in the middle of a backup job (checking, asking, writing): Quit has to wait.
+
+        This does not refuse saves (``blocked``): until the import really writes, nothing is half done.
+        """
+        with self._guard:
+            (self._holders.add if on else self._holders.discard)(id(owner))
+
+    def busy(self) -> bool:
+        """True from the moment a backup page starts a job until its last step is done (Quit waits for it)."""
+        with self._guard:
+            return self._running or bool(self._holders)
 
     @contextmanager
     def allow(self) -> Iterator[None]:

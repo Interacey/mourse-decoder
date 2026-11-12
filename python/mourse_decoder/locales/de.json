@@ -263,6 +263,8 @@
     "alpha.copy.id_suffix": "-kopie",
     "alpha.copy.name_suffix": " (Kopie)",
     "startup.alphabet_fallback": "Alphabet '{id}' nicht ladbar ({msg}) – 'latin' wird verwendet.",
+    "startup.bad_alphabet_id": "settings.json: \"{value}\" ist keine gültige Alphabet-ID (erlaubt: a-z, 0-9, \"-\" und \"_\"). Das Programm verwendet stattdessen \"{default}\"; wähle das Alphabet auf der Einstellungsseite neu.",
+    "startup.bad_smiley_id": "settings.json: \"{value}\" ist keine gültige Smiley-Set-ID (erlaubt: a-z, 0-9, \"-\" und \"_\"). Das Programm verwendet stattdessen kein Smiley-Set; wähle auf der Seite Smileys eines neu.",
     "app.already_running": "Mourse Decoder läuft bereits (Symbol im Infobereich der Taskleiste).",
     "alpha.title.deleted": "Alphabet gelöscht",
     "alpha.status.builtin": "Mitgeliefert und schreibgeschützt. Über „Als Kopie anlegen“ änderbar.",

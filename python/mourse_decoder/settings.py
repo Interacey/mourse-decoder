@@ -373,19 +373,25 @@ def default_config_dir() -> Path:
     return base / "mourse-decoder"
 
 
-def _without_bad_ids(settings: Settings) -> Settings:
+def _without_bad_ids(settings: Settings) -> tuple[Settings, list[tuple[str, dict[str, str]]]]:
     """An alphabet or smiley id that is not a valid id (a hand-edit, ``Latin``, ``//host/share/x``) went to the
     loaders as a file name and could never be loaded. The field goes back to its default and the rest of the
-    file is kept, instead of the whole file being thrown away."""
+    file is kept, instead of the whole file being thrown away.
+
+    Also returns what to tell the user: (language key, values) per reset field, see ``SettingsStore.warnings``.
+    """
     changes: dict[str, str] = {}
+    notes: list[tuple[str, dict[str, str]]] = []
     if isinstance(settings.alphabet, str) and settings.alphabet and not is_valid_id(settings.alphabet):
         changes["alphabet"] = Settings.alphabet
+        notes.append(("startup.bad_alphabet_id", {"value": settings.alphabet[:40], "default": Settings.alphabet}))
     if isinstance(settings.smileys, str) and settings.smileys and not is_valid_id(settings.smileys):
         changes["smileys"] = Settings.smileys
+        notes.append(("startup.bad_smiley_id", {"value": settings.smileys[:40]}))
     if changes:
         log.warning("Ungültige ID in den Einstellungen, Standardwert verwendet: %s", ", ".join(changes))
-        return settings.replace(**changes)
-    return settings
+        return settings.replace(**changes), notes
+    return settings, notes
 
 
 class SettingsStore:
@@ -394,6 +400,8 @@ class SettingsStore:
     def __init__(self, directory: Path | None = None) -> None:
         self.directory = Path(directory) if directory else default_config_dir()
         self.path = self.directory / self.FILE_NAME
+        # what the last ``load`` changed on its own and the user has to be told: (language key, values)
+        self.warnings: list[tuple[str, dict[str, str]]] = []
         if directory is None:
             self._migrate_legacy_directory()
 
@@ -412,13 +420,14 @@ class SettingsStore:
         A broken file is moved to settings.json.bak rather than deleted, so the
         user can still recover values by hand.
         """
+        self.warnings = []
         if not self.path.is_file():
             return Settings()
         try:
             data = jsontext.loads(self.path.read_text(encoding="utf-8-sig"), dict)
             if not isinstance(data, dict):
                 raise ValueError("Wurzelelement ist kein Objekt")
-            settings = _without_bad_ids(Settings.from_dict(data))
+            settings, self.warnings = _without_bad_ids(Settings.from_dict(data))
             errors = settings.validate()
             if errors:
                 # files saved before the key/shortcut clash check: keep the rest, drop the clashing shortcut

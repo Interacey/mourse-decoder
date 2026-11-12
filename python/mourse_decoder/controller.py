@@ -379,18 +379,28 @@ class MorseController:
             raise ValueError("; ".join(errors))
         with self._lock:
             old = self._settings
-            if new.alphabet != old.alphabet or new.smileys != old.smileys:
+            loaded = self._dictionaries.smiley_set_id
+            changed = new.alphabet != old.alphabet or new.smileys != old.smileys
+            # the set the settings name may not have been loadable at the start (file missing, then imported):
+            # try again, and stay quiet if it still is not there
+            stale = not changed and new.smileys != loaded
+            if changed or stale:
                 # build the new decoder first, if that fails nothing changes
                 try:
                     self._dictionaries.set_smileys(new.smileys)
                     decoder = self._decoder_factory(self._dictionaries, new.alphabet)
                 except Exception:
-                    self._dictionaries.set_smileys(old.smileys)
-                    raise
-                replaced = self._decoder
-                self._decoder = decoder
-                self._close_decoder(replaced)
-                self._engine.reset()  # a half-keyed sequence belongs to the old alphabet
+                    try:
+                        self._dictionaries.set_smileys(loaded)
+                    except Exception:  # noqa: BLE001 - what was loaded cannot be loaded again: keep the codes in memory
+                        log.exception("Smiley-Set konnte nicht wiederhergestellt werden")
+                    if not stale:
+                        raise
+                else:
+                    replaced = self._decoder
+                    self._decoder = decoder
+                    self._close_decoder(replaced)
+                    self._engine.reset()  # a half-keyed sequence belongs to the old alphabet
             timing_changed = (old.dot_threshold_ms, old.letter_gap_ms, old.word_gap_ms) != (
                 new.dot_threshold_ms,
                 new.letter_gap_ms,
@@ -401,20 +411,24 @@ class MorseController:
             # only on a real change: rebuilding the keys would forget a press in progress
             if (new.trigger, new.engine_dash_trigger) != (old.trigger, old.engine_dash_trigger):
                 self._apply_keys(new)
-            self._apply_blocking(new)
+            # a press of the on/off shortcut that the tray has not looked at yet stays pending (the poll applies it)
+            # unless this change sets the switch itself
+            pending = new.enabled == old.enabled and bool(self._engine.active) != old.enabled
+            self._apply_blocking(new, keep_active=pending)
             self._settings = new
 
     def _apply_keys(self, s: Settings) -> None:
         self._engine.trigger = s.trigger
         self._engine.dash_trigger = s.engine_dash_trigger
 
-    def _apply_blocking(self, s: Settings) -> None:
+    def _apply_blocking(self, s: Settings, keep_active: bool = False) -> None:
         self._engine.block_shortcut = s.block_shortcut
         self._engine.cycle_shortcut = s.cycle_shortcut
         self._engine.undo_shortcut = s.undo_shortcut
         self._engine.block_input = s.block_input
         # the engine only blocks while Morse input is on, so a paused app never eats the key
-        self._engine.active = s.enabled
+        if not keep_active:
+            self._engine.active = s.enabled
 
     def poll_active_toggle(self) -> Settings | None:
         """Settings after the shortcut toggled, else None.
@@ -614,7 +628,7 @@ class MorseController:
         """Reload the active alphabet after its file changed."""
         with self._lock:
             try:  # the active smiley set may be one of the files that changed
-                self._dictionaries.set_smileys(self._dictionaries.smiley_set_id)
+                self._dictionaries.set_smileys(self._settings.smileys)
             except Exception:  # noqa: BLE001 - a set that is gone: keep the codes in memory, the alphabet reload goes on
                 log.exception("Smiley-Set konnte nicht neu geladen werden")
             self._dictionaries.invalidate()
