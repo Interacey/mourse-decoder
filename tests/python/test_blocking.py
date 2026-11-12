@@ -54,19 +54,29 @@ def test_blocking_and_active_state_are_pushed_to_the_engine(fake_engine, injecto
     assert fake_engine.block_input is False
 
 
-def test_shortcut_toggle_flips_both_switches(fake_engine, injector):
+def test_shortcut_toggle_flips_only_morse_input(fake_engine, injector):
     controller = make(fake_engine, injector, block_input=True)
     controller.start()
     assert controller.poll_active_toggle() is None
     fake_engine.active = False  # the hook flipped it
     toggled = controller.poll_active_toggle()
-    assert toggled is not None and (toggled.enabled, toggled.block_input) == (False, False)
+    assert toggled is not None and (toggled.enabled, toggled.block_input) == (False, True)
     controller.apply_settings(toggled)
-    assert fake_engine.block_input is False
+    assert fake_engine.active is False and fake_engine.block_input is True  # the engine blocks only while active
     assert controller.poll_active_toggle() is None
     fake_engine.active = True
     back = controller.poll_active_toggle()
-    assert (back.enabled, back.block_input) == (True, True)  # both come back on together
+    assert (back.enabled, back.block_input) == (True, True)
+
+
+def test_shortcut_resume_does_not_turn_blocking_on_when_the_setting_is_off(fake_engine, injector):
+    controller = make(fake_engine, injector, block_input=False)
+    controller.start()
+    fake_engine.active = False
+    controller.apply_settings(controller.poll_active_toggle())
+    fake_engine.active = True
+    back = controller.poll_active_toggle()
+    assert (back.enabled, back.block_input) == (True, False)
 
 
 def test_morse_output_stops_while_the_shortcut_has_it_off(fake_engine, injector):

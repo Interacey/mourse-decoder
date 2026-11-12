@@ -344,7 +344,9 @@ class MorseController:
     def poll_active_toggle(self) -> Settings | None:
         """Settings after the shortcut toggled, else None.
 
-        The shortcut flips both switches together: Morse input and blocking of the normal input.
+        Only ``enabled`` changes, like with the tray menu and the settings switch. ``block_input`` stays the
+        saved setting: the engine blocks only while Morse input is on, so a pause never blocks and a resume
+        blocks exactly when the setting says so, whichever way it was switched.
         """
         with self._lock:
             s = self._settings
@@ -353,7 +355,7 @@ class MorseController:
             actual = bool(self._engine.active)
             if actual == s.enabled:
                 return None
-            return s.replace(enabled=actual, block_input=actual)
+            return s.replace(enabled=actual)
 
     def poll_cycle(self) -> int:
         """How often the cycle shortcut was pressed since the last call (0 while stopped)."""

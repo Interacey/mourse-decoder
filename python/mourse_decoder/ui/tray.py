@@ -46,6 +46,8 @@ class TrayApp:
         self._controller = controller
         self._dictionaries = dictionaries
         self._store = store
+        # what settings.json says about the two switches the on/off shortcut flips at run time
+        self._saved_flags = {"enabled": controller.settings.enabled, "block_input": controller.settings.block_input}
         self._ui_queue: queue.Queue[Callable[[], None]] = queue.Queue()
 
         self._root = tk.Tk()
@@ -116,7 +118,7 @@ class TrayApp:
         if toggled is None:
             return
         try:
-            self._apply(toggled)
+            self._apply(toggled, runtime_only=True)
         except Exception:  # noqa: BLE001
             log.exception("Morse-Eingabe konnte nicht umgeschaltet werden")
             return
@@ -232,10 +234,27 @@ class TrayApp:
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror(tr("app.name"), f"{tr('err.apply')}:\n{exc}")
 
-    def _apply(self, settings: Settings) -> None:
+    def _to_save(self, settings: Settings, runtime_only: bool) -> tuple[Settings, dict[str, bool]]:
+        """The settings to write, and the saved switch values after that.
+
+        ``enabled`` and ``block_input`` are written only when the user changed them (form, tray menu).
+        A pause by the on/off shortcut (``runtime_only``) and any other save made while paused keep the
+        values that are on disk, so the next start blocks again.
+        """
+        current = self._controller.settings
+        saved = dict(self._saved_flags)
+        if not runtime_only:
+            for name in saved:
+                if getattr(settings, name) != getattr(current, name):
+                    saved[name] = getattr(settings, name)
+        return settings.replace(**saved), saved
+
+    def _apply(self, settings: Settings, runtime_only: bool = False) -> None:
         """Apply and save. Raises on errors, the caller shows them."""
+        to_save, saved = self._to_save(settings, runtime_only)
         self._controller.apply_settings(settings)
-        self._store.save(settings)
+        self._store.save(to_save)
+        self._saved_flags = saved
         self._icon.icon = create_icon(settings.enabled)
         self._set_title(self._tooltip())
         self._icon.update_menu()

@@ -48,6 +48,8 @@ The default key is **Scroll Lock**. A short press is a dot, a long press (≥ 20
 
 The Morse key can also be a combination such as Caps Lock + Q: click the key button, hold Caps Lock (or Ctrl, Alt, Shift, Win) and press the key. Q on its own keeps typing normally. While "Block normal input" is on, Caps Lock no longer switches capitals when it is part of a Morse combination.
 
+**Windows that run as administrator.** Windows does not pass keys or clicks to a program that runs at a normal level while the window in front runs elevated (a program started with "Run as administrator", Task Manager, the UAC prompt). In such a window the Morse key is not seen, nothing is typed and blocking has no effect. Start Mourse Decoder as administrator too if you need it there.
+
 With "Separate dash key" switched on, the duration no longer matters: the Morse key always gives a dot and a second key always a dash. The pause after the last key still completes the letter. Both keys can be combinations.
 
 ### Switching alphabets with a shortcut
@@ -269,12 +271,12 @@ All keys are optional. A missing key gets its default, an unknown key is ignored
 | `dash_trigger` | The dash key | a key binding, different from `trigger` |
 | `alphabet` | Id of the active alphabet, or `chinese-telecode` | an id from `alphabets/` or the built-in ones |
 | `smileys` | Id of the smiley set; `""` = none | an id, or empty |
-| `enabled` | Morse input on or off | `true` or `false` |
+| `enabled` | Morse input on or off at start. Pausing with the on/off shortcut lasts until the program ends and is not written here; only the switch on the settings page or in the tray menu is | `true` or `false` |
 | `language` | Id of the interface language | `en`, `de`, `de-saar`, `es`, `fr`, `it`, `pt` or one of yours |
 | `theme` | Appearance | `"system"`, `"light"`, `"dark"` |
 | `sidebar_collapsed` | Sidebar shows icons only | `true` or `false` |
 | `notifications` | Small message when the on/off shortcut fires | `true` or `false` |
-| `block_input` | Hide the trigger's normal function (a space, a click) while Morse input is on | `true` or `false` |
+| `block_input` | Hide the trigger's normal function (a space, a click) while Morse input is on (the on/off shortcut does not change the saved value) | `true` or `false` 
 | `block_shortcut` | Shortcut that switches Morse input and blocking on or off; `""` = none | a key binding, see below |
 | `cycle_shortcut` | Shortcut that switches to the next alphabet of `cycle_alphabets`; `""` = none; must differ from `block_shortcut` | a key binding |
 | `cycle_alphabets` | Your own pick of alphabet ids, switched in this order | a list of up to 64 different ids |
