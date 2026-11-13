@@ -11,6 +11,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import tempfile
 import time
 import unicodedata
@@ -238,33 +239,76 @@ HIDING = {
 }
 
 
+def _written_out(char: str) -> str:
+    category = unicodedata.category(char)
+    if char in ("\n", "\r", "\t"):
+        return {"\n": "\\n", "\r": "\\r", "\t": "\\t"}[char]
+    if category in ("Cc", "Cs", "Zl", "Zp") or char in HIDING or category == "Cf":
+        return f"\\u{ord(char):04x}" if ord(char) < 0x10000 else f"\\U{ord(char):08x}"
+    return char
+
+
 def display_text(text: str, limit: int | None = None) -> str:
-    """``text`` with control, bidi and zero-width characters written out (``\\u202e``), cut at ``limit``."""
+    """``text`` with control, bidi and zero-width characters written out (``\\u202e``), cut at ``limit``.
+
+    ``limit`` counts the characters of the result and a written-out character is never cut in the middle.
+    """
     out: list[str] = []
+    used = 0
     for char in text:
-        category = unicodedata.category(char)
-        if char in ("\n", "\r", "\t"):
-            out.append({"\n": "\\n", "\r": "\\r", "\t": "\\t"}[char])
-        elif category in ("Cc", "Cs", "Zl", "Zp") or char in HIDING or category == "Cf":
-            out.append(f"\\u{ord(char):04x}" if ord(char) < 0x10000 else f"\\U{ord(char):08x}")
-        else:
-            out.append(char)
-    shown = "".join(out)
-    if limit is not None and len(shown) > limit:
-        shown = shown[:limit] + "…"
-    return shown
+        piece = _written_out(char)
+        if limit is not None and used + len(piece) > limit:
+            return "".join(out) + "…"
+        out.append(piece)
+        used += len(piece)
+    return "".join(out)
+
+
+_LONE_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def has_lone_surrogate(value: Any) -> bool:
+    """True if a string anywhere in a parsed JSON value (keys included) holds an unpaired surrogate.
+
+    ``\\ud83d\\ude00`` in JSON becomes one character; a lone ``\\ud800`` stays a surrogate, which no program can
+    type or put on the clipboard.
+    """
+    todo = [value]
+    while todo:
+        item = todo.pop()
+        if isinstance(item, str):
+            if _LONE_SURROGATE.search(item):
+                return True
+        elif isinstance(item, dict):
+            todo.extend(item.keys())
+            todo.extend(item.values())
+        elif isinstance(item, (list, tuple)):
+            todo.extend(item)
+    return False
 
 
 SCRATCH_PREFIX = "mourse-backup-"
+SCRATCH_MARKER = ".mourse-decoder-scratch"  # written into every scratch folder: only these are ours to remove
 ORPHAN_AGE_SECONDS = 24 * 3600
+_REPARSE_POINT = 0x400  # FILE_ATTRIBUTE_REPARSE_POINT: a junction or a symbolic link on Windows
+
+
+def _is_link(path: Path) -> bool:
+    """A symbolic link or, on Windows, a junction or any other reparse point (``Path.is_symlink`` misses those)."""
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return True
+    return stat.S_ISLNK(info.st_mode) or bool(getattr(info, "st_file_attributes", 0) & _REPARSE_POINT)
 
 
 def clean_orphaned_scratch(max_age_seconds: float = ORPHAN_AGE_SECONDS, parent: Path | None = None) -> list[Path]:
     """Remove scratch folders that an earlier run left behind (a process that was killed mid-check).
 
     They hold copies of settings.json, function_keys.json and alphabets. Only folders of the temp folder that
-    carry this program's prefix are touched, and only when they were last changed more than ``max_age_seconds``
-    ago, so the folder of a program that is running right now stays. Returns what was removed.
+    carry this program's prefix AND its marker file are touched (a folder the user named like that, an unpacked
+    export for example, has no marker), never a link or junction, and only when they were last changed more than
+    ``max_age_seconds`` ago, so the folder of a program that is running right now stays. Returns what was removed.
     """
     removed: list[Path] = []
     try:
@@ -275,7 +319,10 @@ def clean_orphaned_scratch(max_age_seconds: float = ORPHAN_AGE_SECONDS, parent: 
     cutoff = time.time() - max_age_seconds
     for path in candidates:
         try:
-            if path.is_symlink() or not path.is_dir() or path.stat().st_mtime > cutoff:
+            if _is_link(path) or not path.is_dir() or path.stat().st_mtime > cutoff:
+                continue
+            marker = path / SCRATCH_MARKER
+            if _is_link(marker) or not marker.is_file():
                 continue
             shutil.rmtree(path)
             removed.append(path)

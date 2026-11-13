@@ -387,7 +387,8 @@ class MorseController:
             raise ValueError("; ".join(errors))
         with self._lock:
             old = self._settings
-            loaded = self._dictionaries.smiley_set_id
+            smiley_state = self._dictionaries.smiley_state()  # what a failed change puts back, without reading a file
+            loaded = smiley_state[0]
             changed = new.alphabet != old.alphabet or new.smileys != old.smileys
             # the set the settings name may not have been loadable at the start (file missing, then imported):
             # try again, and stay quiet if it still is not there
@@ -406,10 +407,7 @@ class MorseController:
                         self._dictionaries.set_smileys("")
                     decoder = self._decoder_factory(self._dictionaries, new.alphabet)
                 except Exception:
-                    try:
-                        self._dictionaries.set_smileys(loaded)
-                    except Exception:  # noqa: BLE001 - what was loaded cannot be loaded again: keep the codes in memory
-                        log.exception("Smiley-Set konnte nicht wiederhergestellt werden")
+                    self._dictionaries.restore_smiley_state(smiley_state)
                     if not stale:
                         raise
                 else:

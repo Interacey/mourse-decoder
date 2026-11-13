@@ -20,8 +20,10 @@ from .smileys import BUILTIN_SMILEY_DIR, SmileyError, load_smiley_codes
 
 TELECODE_ALPHABET = DictionaryManager.TELECODE_ID
 _ID = re.compile(r"^[a-z0-9][a-z0-9_-]*\Z")
-# a value that has no brace, line break or tab cannot hold a command: skip the parser for it
-_MAY_HOLD_COMMANDS = re.compile(r"[{\n\r\t]")
+# a value that has no brace and no control character (a line break, tab, backspace, Escape, ...) cannot hold a
+# command: skip the parser for it. Cf (direction marks, zero-width joiners) is not listed: typing one changes how
+# text looks, it does not press a key, and emoji and several scripts need the joiners.
+_MAY_HOLD_COMMANDS = re.compile(r"[{\x00-\x1f\x7f-\x9f]")
 # the list that is kept for one file; the file is risky from the first entry on, and what is looked at is not cut off
 MAX_COMMANDS_LISTED = 5_000
 
@@ -32,6 +34,10 @@ class Note:
 
     code: str
     params: dict[str, str]
+
+    def __post_init__(self) -> None:
+        # the values may come from a file (a language id, an alphabet name): written out and cut, once, here
+        object.__setattr__(self, "params", {k: jsontext.display_text(str(v), 80) for k, v in self.params.items()})
 
 
 def _typed_texts(data: bytes) -> list[tuple[str, Any]]:
@@ -59,21 +65,30 @@ def commands_per_code(data: bytes) -> list[tuple[str, str, tuple[str, ...]]]:
 
     Same judgement as the single-file import (``macros.commands_in_file``), one source for both. Every code is
     looked at, however many there are (the size of the file is limited): a limit here would let a command stand
-    behind enough harmless codes.
+    behind enough harmless codes. At most ``MAX_COMMANDS_LISTED`` entries are returned, see ``typed_commands``.
     """
+    return typed_commands(data)[0]
+
+
+def typed_commands(data: bytes) -> tuple[list[tuple[str, str, tuple[str, ...]]], int]:
+    """``commands_per_code`` and the number of entries with commands there really are."""
     return commands_in_rows(_typed_texts(data))
 
 
-def commands_in_rows(rows: Iterable[tuple[str, Any]]) -> list[tuple[str, str, tuple[str, ...]]]:
-    """(label, text, commands) for the rows whose text does something when keyed (at most ``MAX_COMMANDS_LISTED``)."""
+def commands_in_rows(rows: Iterable[tuple[str, Any]]) -> tuple[list[tuple[str, str, tuple[str, ...]]], int]:
+    """(label, text, commands) for the rows whose text does something when keyed, and how many such rows there are.
+
+    The list keeps the first ``MAX_COMMANDS_LISTED``; the count goes on, so the dialog can say how many are left.
+    """
     found: list[tuple[str, str, tuple[str, ...]]] = []
+    total = 0
     for label, text in rows:
         if isinstance(text, str) and _MAY_HOLD_COMMANDS.search(text):
             if commands := macros.commands_in_texts([text], windows=True):
-                found.append((str(label), text, tuple(commands)))
-                if len(found) >= MAX_COMMANDS_LISTED:
-                    break
-    return found
+                total += 1
+                if len(found) < MAX_COMMANDS_LISTED:
+                    found.append((str(label), text, tuple(commands)))
+    return found, total
 
 
 def slot_commands(macro: str) -> tuple[str, ...]:

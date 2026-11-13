@@ -44,7 +44,7 @@ from .function_keys import SCHEMA_VERSION as FUNCTION_KEYS_SCHEMA_VERSION
 from .function_keys import FunctionKeys, FunctionKeysStore
 from .import_gate import gate
 from .jsontext import HIDING as _HIDING
-from .jsontext import SCRATCH_PREFIX, display_text
+from .jsontext import SCRATCH_MARKER, SCRATCH_PREFIX, display_text
 from .settings import Settings, SettingsStore, is_valid_id
 
 FORMAT_NAME = "mourse-decoder-backup"
@@ -74,6 +74,7 @@ MAX_MANIFEST_BYTES = 4 * MiB  # 2000 entries of about 250 bytes
 KEEP_RESTORE_POINTS = 5
 SQLITE_CHECK_SECONDS = 60
 MACRO_SUMMARY_LENGTH = 200
+PARAM_LIMIT = 300  # characters of one value in a message
 
 _SQLITE_HEADER = b"SQLite format 3\x00"
 _FILE_NAME = re.compile(r"[^\x00-\x1f\\/:*?\"<>|]+\.json\Z")
@@ -162,9 +163,10 @@ class BackupError(Exception):
     def __init__(self, code: str, *, restore_point: Path | None = None, path: str | None = None, **params: object):
         template = _MESSAGES.get(code)
         self.code = code if template is not None else "other"
-        self.params = {k: str(v) for k, v in params.items()}
+        # the values may come from the bundle (a reason, a name, a macro): control and direction characters written out
+        self.params = {k: display_text(str(v), PARAM_LIMIT) for k, v in params.items()}
         if restore_point is not None:
-            self.params["restore_point"] = str(restore_point)
+            self.params["restore_point"] = display_text(str(restore_point), PARAM_LIMIT)
         super().__init__(template.format(**self.params) if template is not None else code)
         self.restore_point = restore_point
         self.path = path
@@ -216,6 +218,7 @@ class Preview:
     risky_files: tuple[str, ...] = ()  # files with macros or commands: what "import without macros" leaves out
     safe: Preview | None = None  # the preview of the import without ``risky_files``, checked on its own
     safe_error: BackupError | None = None  # why that import is not possible
+    commands_total: int = 0  # entries with commands in all, ``commands`` keeps the first MAX_COMMANDS_LISTED per file
 
     def count(self, status: str) -> int:
         return sum(1 for e in self.entries if e.status == status)
@@ -307,6 +310,8 @@ def _parse_json(data: bytes) -> dict[str, Any]:
         raise ValueError(str(exc)) from exc
     if not isinstance(parsed, dict):
         raise ValueError("the top level is not an object")
+    if jsontext.has_lone_surrogate(parsed):  # \ud800 on its own: cannot be typed, copied or shown
+        raise ValueError("enthält ein einzelnes Surrogat-Zeichen (kein gültiger Unicode-Text)")
     return parsed
 
 
@@ -573,6 +578,7 @@ atexit.register(_clean_scratch)
 def _scratch():
     """A temporary folder outside the config folder; removed at the end, also after an error."""
     path = Path(tempfile.mkdtemp(prefix=SCRATCH_PREFIX))
+    (path / SCRATCH_MARKER).write_text("mourse-decoder backup check, safe to delete\n", encoding="utf-8")
     _live_scratch.add(path)
     try:
         yield path
@@ -642,8 +648,12 @@ def _load_function_keys(
         return keys, warnings
 
 
-def _check_sqlite(data: bytes) -> None:
+def _check_sqlite(data: bytes) -> tuple[list[tuple[str, str, tuple[str, ...]]], int]:
     """Open a copy read-only in a temp folder and check structure; the config folder is never touched.
+
+    Returns the entries whose text would do something as a macro and how many there are (the program types
+    telecode text as it is, so this is no danger at run time; a database with such entries is not one the build
+    tool wrote, and a backup says so). Every row is looked at, within the same time limit as the structure check.
 
     Only the table ``telecode`` (and the index SQLite makes for its key) may exist: a view, trigger or virtual
     table with that name could run an endless query under the lock of the program's lookup. A time limit stops
@@ -677,6 +687,8 @@ def _check_sqlite(data: bytes) -> None:
             columns = {row[1] for row in conn.execute("PRAGMA table_info(telecode)")}
             if not {"code", "char"} <= columns:
                 raise BackupError("sqlite_schema", name=TELECODE_FILE, path=TELECODE_FILE)
+            rows = ((str(code), char) for code, char in conn.execute("SELECT code, char FROM telecode"))
+            return backup_content.commands_in_rows(rows)
         except sqlite3.Error as exc:
             raise BackupError("sqlite_error", name=TELECODE_FILE, error=exc, path=TELECODE_FILE) from exc
         finally:
@@ -684,10 +696,10 @@ def _check_sqlite(data: bytes) -> None:
                 conn.close()
 
 
-def _validate_content(name: str, data: bytes) -> None:
+def _validate_content(name: str, data: bytes) -> tuple[list[tuple[str, str, tuple[str, ...]]], int] | None:
+    """Checks one file; the commands in a telecode database (see ``_check_sqlite``), None for any other file."""
     if name == TELECODE_FILE:
-        _check_sqlite(data)
-        return
+        return _check_sqlite(data)
     try:
         parsed_version = _schema_version(name, data) if name == FUNCTION_KEYS_FILE else None
         if parsed_version is None:
@@ -698,6 +710,7 @@ def _validate_content(name: str, data: bytes) -> None:
         raise BackupError(
             "newer_version", name=name, version=parsed_version, supported=FUNCTION_KEYS_SCHEMA_VERSION, path=name
         )
+    return None
 
 
 def _current(config_dir: Path, name: str) -> bytes | None:
@@ -729,40 +742,20 @@ def _summaries(keys: FunctionKeys) -> tuple[SlotSummary, ...]:
     return tuple(sorted(out, key=lambda s: not s.risks))  # stable: slot order inside both groups
 
 
-def _command_summaries(files: dict[str, bytes], changed: set[str]) -> tuple[CommandSummary, ...]:
+def _command_summaries(
+    files: dict[str, bytes], changed: set[str], telecode: tuple[list[tuple[str, str, tuple[str, ...]]], int]
+) -> tuple[tuple[CommandSummary, ...], int]:
+    """The entries with commands of the files that would change, and how many there are in all (the list is capped)."""
     out: list[CommandSummary] = []
+    total = 0
     for name, data in files.items():
         if name in changed and (name.split("/")[0] in ("alphabets", "smileys") or name == TELECODE_FILE):
-            found = _telecode_commands(data) if name == TELECODE_FILE else backup_content.commands_per_code(data)
+            found, count = telecode if name == TELECODE_FILE else backup_content.typed_commands(data)
+            total += count
             for code, text, commands in found:
                 shown = display_text(text, MACRO_SUMMARY_LENGTH)
                 out.append(CommandSummary(name, display_text(code, 40), shown, commands))
-    return tuple(out)
-
-
-def _telecode_commands(data: bytes) -> list[tuple[str, str, tuple[str, ...]]]:
-    """(code, text, commands) of the entries of a telecode database whose text would do something as a macro.
-
-    The program types telecode text as it is (``Emission.plain``), so this is no danger at run time; a database
-    with a ``{Win+R}`` as a character is not what the build tool writes, and a backup should say so. Every row is
-    looked at, within the same time limit as the structure check (a check that takes longer refuses the file).
-    """
-    with _scratch() as folder:
-        copy = folder / TELECODE_FILE
-        copy.write_bytes(data)
-        conn = None
-        try:
-            conn = sqlite3.connect(f"{copy.resolve().as_uri()}?mode=ro", uri=True)
-            conn.execute("PRAGMA trusted_schema = OFF")
-            deadline = time.monotonic() + SQLITE_CHECK_SECONDS
-            conn.set_progress_handler(lambda: 1 if time.monotonic() > deadline else 0, 10_000)
-            rows = ((str(code), char) for code, char in conn.execute("SELECT code, char FROM telecode"))
-            return backup_content.commands_in_rows(rows)
-        except sqlite3.Error as exc:
-            raise BackupError("sqlite_error", name=TELECODE_FILE, error=exc, path=TELECODE_FILE) from exc
-        finally:
-            if conn is not None:
-                conn.close()
+    return tuple(out), total
 
 
 @dataclass(frozen=True)
@@ -770,6 +763,7 @@ class _Checked:
     keys: FunctionKeys | None
     warnings: tuple[str, ...]
     notes: tuple[Note, ...]
+    telecode: tuple[list[tuple[str, str, tuple[str, ...]]], int] = ([], 0)  # commands in telecode.sqlite
 
 
 def _copy_user_files(config_dir: Path, work: Path, removed: set[str]) -> None:
@@ -846,8 +840,10 @@ def _validate_files(
     config_dir: Path, files: dict[str, bytes], check_shortcut: Callable[[str], None] | None, removed: set[str]
 ) -> _Checked:
     """Content checks of every file that will be written, with the loaders the program uses."""
+    telecode: tuple[list[tuple[str, str, tuple[str, ...]]], int] = ([], 0)
     for name, data in files.items():
-        _validate_content(name, data)
+        if (found := _validate_content(name, data)) is not None:
+            telecode = found
     warnings: list[str] = []
     settings = keys = None
     if SETTINGS_FILE in files:
@@ -883,7 +879,28 @@ def _validate_files(
         if effective is None and removed:
             effective = _load_settings_lenient(_current(config_dir, SETTINGS_FILE))
         notes = _check_user_files(config_dir, files, removed, effective)
-    return _Checked(keys, tuple(warnings), tuple(notes))
+    if settings is not None and (note := _keys_note(config_dir, settings)) is not None:
+        notes.append(note)
+    return _Checked(keys, tuple(warnings), tuple(notes), telecode)
+
+
+KEY_FIELDS = (
+    "trigger", "dash_trigger", "separate_dash_key", "block_input", "block_shortcut", "cycle_shortcut", "undo_shortcut",
+)
+
+
+def _keys_note(config_dir: Path, imported: Settings) -> Note | None:
+    """Say so when settings.json changes the Morse key, the blocking or a shortcut of the settings that are in use.
+
+    Nothing is said when it brings the same values (restoring one's own backup) or when there is no settings
+    file yet (a fresh install): the note must not become noise that is clicked away.
+    """
+    current_bytes = _current(config_dir, SETTINGS_FILE)
+    if current_bytes is None:
+        return None
+    current = _load_settings_lenient(current_bytes)
+    changed = [name for name in KEY_FIELDS if getattr(imported, name) != getattr(current, name)]
+    return Note("settings_keys", {"fields": ", ".join(changed)}) if changed else None
 
 
 def _load_settings_lenient(data: bytes | None) -> Settings:
@@ -945,6 +962,7 @@ class _Loaded:
     warnings: tuple[str, ...]
     notes: tuple[Note, ...]
     removed: tuple[str, ...]  # files a restore point takes back: the ones its import had created
+    telecode: tuple[list[tuple[str, str, tuple[str, ...]]], int] = ([], 0)
 
 
 def _load(
@@ -965,9 +983,9 @@ def _load(
         name
         for name in manifest.get("restore_created", [])
         if name not in skipped and name not in files and _regular(config_dir / name, config_dir)
-    ) if _is_own_restore_point(Path(zip_path), config_dir) else ()
+    ) if _is_own_restore_point(Path(zip_path), config_dir, manifest) else ()
     checked = _validate_files(config_dir, files, check_shortcut, set(removed))
-    return _Loaded(manifest, files, digest, checked.keys, checked.warnings, checked.notes, removed)
+    return _Loaded(manifest, files, digest, checked.keys, checked.warnings, checked.notes, removed, checked.telecode)
 
 
 def _preview(config_dir: Path, loaded: _Loaded) -> Preview:
@@ -979,10 +997,11 @@ def _preview(config_dir: Path, loaded: _Loaded) -> Preview:
         entries.append(PreviewEntry(name, "remove", (config_dir / name).stat().st_size, _actual_name(config_dir, name)))
     changed = {e.path for e in entries if e.status in ("add", "replace")}
     slots = _summaries(loaded.keys) if loaded.keys is not None and FUNCTION_KEYS_FILE in changed else ()
-    commands = _command_summaries(loaded.files, changed)
+    commands, commands_total = _command_summaries(loaded.files, changed, loaded.telecode)
     risky = ([FUNCTION_KEYS_FILE] if slots else []) + sorted({c.path for c in commands})
     return Preview(
-        loaded.manifest, tuple(entries), loaded.sha256, slots, commands, loaded.warnings, loaded.notes, tuple(risky)
+        loaded.manifest, tuple(entries), loaded.sha256, slots, commands, loaded.warnings, loaded.notes, tuple(risky),
+        commands_total=commands_total,
     )
 
 
@@ -1036,9 +1055,14 @@ def _write_file(path: Path, data: bytes) -> None:
     _atomic_write(path, data)
 
 
+def _restore_point_dir(config_dir: Path) -> Path:
+    """The folder restore points are written to and looked for: the one the config folder (or its link) is in."""
+    return config_dir.parent
+
+
 def _restore_point_path(config_dir: Path) -> Path:
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    base = config_dir.parent / f"{config_dir.name}-backup-{stamp}"
+    base = _restore_point_dir(config_dir) / f"{config_dir.name}-backup-{stamp}"
     candidate, counter = base.with_name(base.name + ".zip"), 1
     while candidate.exists():
         counter += 1
@@ -1067,19 +1091,20 @@ def _restore_point_name(config_dir: Path) -> re.Pattern[str]:
     return re.compile(re.escape(config_dir.name) + r"-backup-(\d{8}-\d{6})(?:-(\d+))?\.zip\Z")
 
 
-def _is_own_restore_point(zip_path: Path, config_dir: Path) -> bool:
+def _is_own_restore_point(zip_path: Path, config_dir: Path, manifest: dict[str, Any]) -> bool:
     """A restore point of this config folder: next to it, named like the ones this feature writes, marked as one.
 
     Only such a zip may delete files of the config folder (``restore_created``). A zip from anywhere else that
-    claims to be one is imported like any bundle: its list of files to remove is ignored.
+    claims to be one is imported like any bundle: its list of files to remove is ignored. ``manifest`` is the one
+    of the bytes that were checked (the zip is not opened a second time). The place is compared after resolving
+    both sides, so a config folder that is a junction or link works like a plain one.
     """
     try:
-        same_place = Path(zip_path).resolve().parent == config_dir.resolve().parent
+        same_place = Path(zip_path).resolve().parent == _restore_point_dir(config_dir).resolve()
     except OSError:
         return False
-    return same_place and bool(_restore_point_name(config_dir).fullmatch(Path(zip_path).name)) and _is_restore_point(
-        Path(zip_path)
-    )
+    marked = manifest.get("format") == FORMAT_NAME and manifest.get("restore_point") is True
+    return same_place and marked and bool(_restore_point_name(config_dir).fullmatch(Path(zip_path).name))
 
 
 def prune_restore_points(
@@ -1095,7 +1120,7 @@ def prune_restore_points(
     pattern = _restore_point_name(config_dir)
     found: list[tuple[int, str, Path]] = []
     try:
-        for path in config_dir.parent.iterdir():
+        for path in _restore_point_dir(config_dir).iterdir():
             if pattern.fullmatch(path.name):
                 found.append((path.stat().st_mtime_ns, path.name, path))
     except OSError:

@@ -46,20 +46,30 @@ def saved_fields(store: SettingsStore) -> dict[str, object]:
 
 
 BALLOON_UNITS = 255  # NOTIFYICONDATA.szInfo holds 256 UTF-16 units including the end mark
+BALLOON_TITLE_UNITS = 63  # szInfoTitle holds 64
 
 
-def fit_balloon(message: str) -> str:
-    """``message`` cut so that a tray balloon accepts it (pystray raises "string too long" above 255 units)."""
-    if len(message.encode("utf-16-le")) // 2 <= BALLOON_UNITS:
-        return message
-    out, used = [], 1  # one unit for the ellipsis
+def fit_balloon(message: str, limit: int = BALLOON_UNITS) -> str:
+    """``message`` cut to ``limit`` UTF-16 units so that a tray balloon accepts it (pystray raises "string too long").
+
+    Counted by code point (a character above U+FFFF is two units) and never encoded, so text from a file with an
+    unpaired surrogate cannot raise here: such a character is shown as U+FFFD.
+    """
+    out, used = [], 0
     for char in message:
         units = 2 if ord(char) > 0xFFFF else 1
-        if used + units > BALLOON_UNITS:
-            break
-        out.append(char)
+        out.append("\ufffd" if 0xD800 <= ord(char) <= 0xDFFF else char)
         used += units
-    return "".join(out) + "…"
+    if used <= limit:
+        return "".join(out)
+    kept, used = [], 1  # one unit for the ellipsis
+    for char in out:
+        units = 2 if ord(char) > 0xFFFF else 1
+        if used + units > limit:
+            break
+        kept.append(char)
+        used += units
+    return "".join(kept) + "…"
 
 
 def take_over_imported(controller: MorseController, settings: Settings) -> Settings:
@@ -178,7 +188,7 @@ class TrayApp:
             return
         self._hook_error_shown = True
         log.error("Tastatur-Hook ausgefallen: %s", error)
-        self._icon.notify(fit_balloon(error), tr("tray.error"))
+        self._icon.notify(fit_balloon(error), fit_balloon(tr("tray.error"), BALLOON_TITLE_UNITS))
         self._toast.show(error, False)
 
     def _poll_block(self) -> None:
@@ -262,7 +272,7 @@ class TrayApp:
 
     def on_error(self, message: str) -> None:
         shown = fit_balloon(message)
-        self.call_in_ui(lambda: self._icon.notify(shown, tr("tray.error")))
+        self.call_in_ui(lambda: self._icon.notify(shown, fit_balloon(tr("tray.error"), BALLOON_TITLE_UNITS)))
 
     def _tooltip(self) -> str:
         s = self._controller.settings

@@ -13,7 +13,6 @@ from ..controller import MorseController
 from ..dictionary import DictionaryManager
 from ..easter_egg import bind_sos
 from ..i18n import set_language, tr
-from ..settings import Settings
 from . import theme
 from .icon import create_icon
 
@@ -83,7 +82,7 @@ class MainWindow:
         root: tk.Tk,
         controller: MorseController,
         dictionaries: DictionaryManager,
-        apply_settings: Callable[[Settings], None],
+        apply_settings: Callable[..., None],  # Settings, optional chosen=(names of fields the user picked)
         on_alphabets_changed: Callable[[], None],
         on_hide: Callable[[], None],
         on_quit: Callable[[], None],

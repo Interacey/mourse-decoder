@@ -23,6 +23,7 @@ from __future__ import annotations
 import ntpath
 import os
 import re
+import unicodedata
 from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import NamedTuple
@@ -101,10 +102,11 @@ def resolve_path(raw: str) -> str:
 def commands_in_file(path: Path) -> list[str]:
     """Commands in the texts of an alphabet or smiley file that DO something when keyed.
 
-    Key combinations (``Win+R``), ``File``, ``Clipboard``, ``Scrape``, ``Scroll`` (reported by kind), and text with a
-    raw line break or tab: the injector types those as Return and Tab (reported as ``{Enter}`` and ``{Tab}``).
-    Waiting and loops are harmless, plain text too. An unreadable file gives [] because importing it
-    reports that anyway.
+    Key combinations (``Win+R``), ``File``, ``Clipboard``, ``Scrape``, ``Scroll`` (reported by kind), ``WaitWindow``,
+    and text with a control character: the injector types every one of them as a key event (a line break as Return,
+    a tab as Tab, backspace, Ctrl+X, Escape, Delete as what they are), reported as ``{Enter}``, ``{Tab}`` and
+    ``{control character U+0008}``. Waiting and loops are harmless, plain text too. An unreadable file gives []
+    because importing it reports that anyway.
     """
     try:
         data = jsontext.loads(Path(path).read_text(encoding="utf-8-sig"), dict)
@@ -113,7 +115,7 @@ def commands_in_file(path: Path) -> list[str]:
             values.append(data["word_separator"])
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return []
-    return commands_in_texts(values)
+    return commands_in_texts(values, windows=True)  # the same list as the check of a whole backup
 
 
 def commands_in_texts(texts: Iterable[str], windows: bool = False) -> list[str]:
@@ -129,7 +131,7 @@ def commands_in_texts(texts: Iterable[str], windows: bool = False) -> list[str]:
             continue  # a broken macro stops by itself before it does anything
         for kind, value in steps:
             if kind == "keys":
-                found[f"{{{value}}}"] = None
+                found[f"{{{jsontext.display_text(value, 80)}}}"] = None  # the text of a file: written out, cut
             elif kind in ("files", "clipboard", "scrape"):
                 found[{"files": "{File …}", "clipboard": "{Clipboard}", "scrape": "{Scrape …}"}[kind]] = None
             elif kind == "scroll":
@@ -139,10 +141,13 @@ def commands_in_texts(texts: Iterable[str], windows: bool = False) -> list[str]:
             elif kind == "window" and windows:
                 found["{WaitWindow …}"] = None
             elif kind == "text":
-                if "\n" in value or "\r" in value:
-                    found["{Enter}"] = None
-                if "\t" in value:
-                    found["{Tab}"] = None
+                for char in value:
+                    if char in "\n\r":
+                        found["{Enter}"] = None
+                    elif char == "\t":
+                        found["{Tab}"] = None
+                    elif unicodedata.category(char) == "Cc":
+                        found[f"{{control character U+{ord(char):04X}}}"] = None
     return list(found)
 
 
@@ -539,6 +544,9 @@ def _expand(tree: list[tuple]) -> list[Step]:
 def parse(text: str, check_shortcut: Callable[[str], None]) -> list[Step]:
     """Turn a macro into steps; MacroError if any part of it is broken.
 
-    ``check_shortcut`` raises ValueError for anything that is no key combination.
+    ``check_shortcut`` raises ValueError for anything that is no key combination. A text with an unpaired
+    surrogate is refused before anything is typed: it cannot be sent as keys, so the macro would stop half way.
     """
+    if jsontext.has_lone_surrogate(text):
+        raise _fail("Das Makro enthält ein ungültiges Zeichen (einzelnes Surrogat).")
     return _expand(_build(text, check_shortcut))

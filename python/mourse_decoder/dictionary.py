@@ -239,6 +239,17 @@ class DictionaryManager:
     def smiley_set_id(self) -> str:
         return self._smiley_id
 
+    def smiley_state(self) -> tuple[str, Mapping[str, str]]:
+        """What is loaded now (id and codes), to hand back to ``restore_smiley_state`` if a change fails."""
+        with self._lock:
+            return self._smiley_id, self._smileys
+
+    def restore_smiley_state(self, state: tuple[str, Mapping[str, str]]) -> None:
+        """Put a ``smiley_state`` back as it was. Reads no file, so it cannot fail."""
+        with self._lock:
+            self._smiley_id, self._smileys = state
+            self._active = None
+
     def _search_dirs(self) -> list[Path]:
         # built-in first, so user files can't shadow them
         return [self._directory, *([self._user_directory] if self._user_directory else [])]

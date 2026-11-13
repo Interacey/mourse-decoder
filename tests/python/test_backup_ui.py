@@ -555,9 +555,9 @@ class FakeTray:
 def gate_is_free():
     from mourse_decoder.import_gate import gate
 
-    gate.end()
+    gate.reset()
     yield
-    gate.end()
+    gate.reset()
 
 
 def test_the_tray_refuses_to_save_while_an_import_runs_and_saves_the_imported_state_after(make_panel, tmp_path):

@@ -221,7 +221,10 @@ def test_commands_that_do_something_are_listed(tmp_path):
             "-.-..--.": "{Ctrl+C}{ctrl+c}",
         },
     )
-    assert macros.commands_in_file(path) == ["{Win+R}", "{Enter}", "{Clipboard}", "{File …}", "{Ctrl+C}", "{ctrl+c}"]
+    # {WaitWindow} is listed too, like in the check of a whole backup: keys go to the window it waits for
+    assert macros.commands_in_file(path) == [
+        "{Win+R}", "{WaitWindow …}", "{Enter}", "{Clipboard}", "{File …}", "{Ctrl+C}", "{ctrl+c}",
+    ]
 
 
 def test_scrolling_is_listed(tmp_path):
@@ -234,7 +237,7 @@ def test_scrolling_is_listed(tmp_path):
     "codes",
     [
         {"--..--..": "Hallo Welt"},
-        {"--..--..": "{Wait 500}{Loop 3}x{EndLoop}{WaitWindow Editor}"},  # waiting and loops do nothing by themselves
+        {"--..--..": "{Wait 500}{Loop 3}x{EndLoop}"},  # waiting and loops do nothing by themselves
         {"--..--..": "{^_^} { } {}"},  # braces that are only text
         {"--..--..": "😀 text"},  # raw line breaks and tabs are reported, see test_review_b_macros
     ],

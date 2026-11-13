@@ -53,6 +53,19 @@ def build_controller(engine, injector, dictionaries, settings: Settings, listene
         return MorseController(engine, injector, dictionaries, fallback, listener=listener), [warning]
 
 
+def deliver_warnings(show, warnings) -> None:
+    """Show each startup warning with ``show``; a warning that cannot be shown never stops the start.
+
+    The text of a warning can come from a file (a trigger in function_keys.json, an alphabet name): whatever it
+    holds, the program starts, the others are shown and the failure goes to the log.
+    """
+    for warning in warnings:
+        try:
+            show(warning)
+        except Exception:  # noqa: BLE001
+            log.exception("Startwarnung konnte nicht angezeigt werden")
+
+
 def settings_warnings(store: SettingsStore) -> list[str]:
     """What ``store.load`` changed in the settings on its own (an invalid id), in the program's language.
 
@@ -254,8 +267,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.headless:
         controller, startup_warnings = build_controller(engine, injector, dictionaries, settings, _ConsoleListener())
         controller.start()
-        for warning in notices + startup_warnings + _start_function_keys(controller, store.directory, injector):
-            print(f"Warnung: {warning}", file=sys.stderr, flush=True)
+        deliver_warnings(
+            lambda warning: print(f"Warnung: {warning}", file=sys.stderr, flush=True),
+            notices + startup_warnings + _start_function_keys(controller, store.directory, injector),
+        )
         print(
             f"Morse-Decoder läuft (Taster: {display_text(settings.trigger)}, "
             f"Alphabet: {display_text(settings.alphabet)}). Strg+C beendet."
@@ -280,8 +295,9 @@ def main(argv: list[str] | None = None) -> int:
     tray = TrayApp(controller, dictionaries, store, start_hidden=args.minimized, hook_error=native.hook_error)
     controller.set_listener(tray)  # breaks the tray <-> controller cycle
     controller.start()
-    for warning in notices + startup_warnings + _start_function_keys(controller, store.directory, injector):
-        tray.on_error(warning)
+    deliver_warnings(
+        tray.on_error, notices + startup_warnings + _start_function_keys(controller, store.directory, injector)
+    )
     show_update_result(store.directory)
     try:
         tray.run()

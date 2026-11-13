@@ -11,7 +11,6 @@ from tkinter import filedialog, messagebox, ttk
 from ..controller import MorseController
 from ..dictionary import DictionaryManager
 from ..i18n import tr
-from ..settings import Settings
 from ..smileys import SmileyError, SmileySetInfo, delete_smiley_set, import_smiley_file, load_smiley_codes
 from . import theme
 from .theme import Button, RoundedBox, boxed, confirm_commands, list_box
@@ -23,7 +22,7 @@ class SmileyPanel(tk.Frame):
         master: tk.Misc,
         controller: MorseController,
         dictionaries: DictionaryManager,
-        apply_settings: Callable[[Settings], None],
+        apply_settings: Callable[..., None],  # Settings, optional chosen=(names of fields the user picked)
         on_changed: Callable[[], None],
     ) -> None:
         super().__init__(master, bg=theme.P.bg)
@@ -136,7 +135,9 @@ class SmileyPanel(tk.Frame):
     def _use(self) -> None:
         entry = self._entries[self._index]
         try:
-            self._apply_settings(self._controller.settings.replace(smileys="" if entry is None else entry.id))
+            self._apply_settings(
+                self._controller.settings.replace(smileys="" if entry is None else entry.id), chosen=("smileys",)
+            )
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror(tr("smiley.err.use"), str(exc), parent=self)
             return

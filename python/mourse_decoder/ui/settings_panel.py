@@ -134,7 +134,7 @@ class SettingsPanel(tk.Frame):
         master: tk.Misc,
         controller: MorseController,
         dictionaries: DictionaryManager,
-        apply_settings: Callable[[Settings], None],
+        apply_settings: Callable[..., None],  # Settings, optional chosen=(names of fields the user picked)
         capture_backend: CaptureBackend | None = None,
         backup_dialogs: BackupDialogs | None = None,
         config_dir: Path | None = None,
@@ -149,6 +149,7 @@ class SettingsPanel(tk.Frame):
         self._gate_lock = threading.Lock()  # the Tk thread and the worker both release it, once
         self._job_running = False  # the worker thread is still inside its job
         self._deferred_change = False  # a form change was made while a job ran
+        self._deferred_chosen: set[str] = set()  # the boxes that change picked (``_changed(chosen=...)``)
         self._pre_import: Settings | None = None  # the settings before the telecode alphabet was let go
         self._on_imported = on_imported  # refreshes the pages that are not this one
         self._worker_job: str | None = None
@@ -375,6 +376,7 @@ class SettingsPanel(tk.Frame):
             return
         if self._backup_running:  # an import writes settings.json itself: apply the change when the job is over
             self._deferred_change = True
+            self._deferred_chosen.update(chosen)
             return
         if self._job is not None:
             self.after_cancel(self._job)
@@ -489,7 +491,8 @@ class SettingsPanel(tk.Frame):
             self._set_backup_running(False)
             if self._deferred_change:  # a change made during the job: nothing was lost, apply it now
                 self._deferred_change = False
-                self._changed()
+                chosen, self._deferred_chosen = tuple(sorted(self._deferred_chosen)), set()
+                self._changed(chosen=chosen)
 
     def _release_gate(self) -> None:
         with self._gate_lock:  # the worker and ``_on_destroy`` can both get here: only the first lets go
@@ -506,7 +509,7 @@ class SettingsPanel(tk.Frame):
             if text == key:  # a code without translation, or free text: the English message of the error
                 text = str(error)
         else:
-            text = tr("backup.err.unexpected", error=f"{type(error).__name__}: {error}")
+            text = tr("backup.err.unexpected", error=backup.display_text(f"{type(error).__name__}: {error}", 300))
         point = getattr(error, "restore_point", None)
         if point is not None and str(point) not in text:
             text += "\n\n" + tr("backup.restore_point", path=point)
@@ -667,17 +670,16 @@ class SettingsPanel(tk.Frame):
             blocks.append(warning + "\n" + "\n".join(lines))
         if preview.commands:
             shown = preview.commands[:MAX_COMMAND_LINES]
+            total = max(preview.commands_total, len(preview.commands))  # the list kept per file is capped
             lines = [
                 _trusted(
                     "backup.import.command", path=c.path, code=c.code, text=c.text, risks=", ".join(c.risks)
                 )
                 for c in shown
             ]
-            if len(preview.commands) > len(shown):
-                lines.append(_trusted("backup.import.more_commands", count=len(preview.commands) - len(shown)))
-            blocks.append(
-                _trusted("backup.import.warn.commands", count=len(preview.commands)) + "\n" + "\n".join(lines)
-            )
+            if total > len(shown):
+                lines.append(_trusted("backup.import.more_commands", count=total - len(shown)))
+            blocks.append(_trusted("backup.import.warn.commands", count=total) + "\n" + "\n".join(lines))
         if preview.warnings:
             blocks.append(
                 _trusted("backup.import.notes", notes="\n".join(backup.display_text(w, 200) for w in preview.warnings[:5]))
@@ -710,6 +712,7 @@ class SettingsPanel(tk.Frame):
             self._restore_alphabet()
             self._finish()
             self._deferred_change = False
+            self._deferred_chosen = set()
             self._show_error("backup.err.import", error)
             return
         assert result is not None
@@ -717,6 +720,7 @@ class SettingsPanel(tk.Frame):
         self._pre_import = None
         if self._deferred_change:  # a form change during the import is not applied to the imported state
             self._deferred_change = False
+            self._deferred_chosen = set()
             self._error.configure(text=tr("backup.change_dropped"))
         self._finish()
         text = (
@@ -727,7 +731,7 @@ class SettingsPanel(tk.Frame):
         if restart:
             text += "\n\n" + tr("backup.import.restart", what=", ".join(tr(f"backup.restart.{key}") for key in restart))
         if problem:
-            text += "\n\n" + tr("backup.import.apply_failed", reason=problem)
+            text += "\n\n" + tr("backup.import.apply_failed", reason=backup.display_text(problem, 300))
         dialogs.info(tr("backup.import"), text)
 
     def _load_into_running_app(self, result: backup.ImportResult) -> tuple[str, list[str]]:

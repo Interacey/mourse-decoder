@@ -238,6 +238,7 @@ def test_old_scratch_folders_of_this_program_are_removed_and_nothing_else(tmp_pa
     for folder in (old_ours, new_ours, old_foreign):
         folder.mkdir()
         (folder / "settings.json").write_text("{}")
+        (folder / jsontext.SCRATCH_MARKER).write_text("x")  # what ``_scratch`` writes
     old_file.write_text("x")
     two_days = time.time() - 2 * 86400
     for path in (old_ours, old_foreign, old_file):

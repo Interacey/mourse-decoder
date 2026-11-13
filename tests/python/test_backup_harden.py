@@ -705,9 +705,9 @@ def test_the_programs_own_shipped_files_are_accepted_as_user_files(tmp_path):
 def free_gate():
     from mourse_decoder.import_gate import gate
 
-    gate.end()
+    gate.reset()
     yield gate
-    gate.end()
+    gate.reset()
 
 
 def test_alphabets_cannot_be_saved_renamed_or_deleted_while_an_import_runs(tmp_path, free_gate):

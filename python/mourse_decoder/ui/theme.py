@@ -514,12 +514,13 @@ def confirm_commands(parent: tk.Misc, path) -> bool:
 
     from .. import macros
     from ..i18n import tr
+    from ..jsontext import display_text
 
     commands = macros.commands_in_file(path)
     if not commands:
         return True
     return messagebox.askyesno(
-        tr("import.risky.title"), tr("import.risky", file=path.name, commands=", ".join(commands[:12])), parent=parent
+        tr("import.risky.title"), tr("import.risky", file=display_text(path.name, 80), commands=", ".join(commands[:12])), parent=parent
     )
 
 
