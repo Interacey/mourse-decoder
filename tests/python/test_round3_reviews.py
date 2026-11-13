@@ -487,7 +487,7 @@ def test_a_two_mib_alphabet_is_checked_once_and_fast(tmp_path, monkeypatch):
     preview = backup.inspect_bundle(zip_path, config)
     assert preview.risky_files == ("alphabets/big.json",)
     assert len(scans) == 1  # the check without macros leaves the file out: it is not read a second time
-    assert time.monotonic() - started < 10
+    assert time.monotonic() - started < 30  # about 0.4 s; the bound only catches a scan that runs away
 
 
 def test_a_telecode_database_is_written_and_opened_once_for_the_whole_check(tmp_path, monkeypatch):

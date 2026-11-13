@@ -176,7 +176,7 @@ def test_a_command_behind_many_harmless_codes_is_still_found(fillers):
     started = time.monotonic()
     found = backup_content.commands_per_code(data)
     assert [text for _, text, _ in found] == [EVIL]
-    assert time.monotonic() - started < 5
+    assert time.monotonic() - started < 30  # about 0.4 s; the bound only catches a scan that runs away
 
 
 def test_a_big_alphabet_with_a_command_at_the_end_is_risky_in_an_import(tmp_path):

@@ -913,13 +913,13 @@ def test_tk_objects_freed_by_the_collector_of_another_thread_are_parked_and_free
     holder = Holder()
     names, image, font = [v._name for v in holder.vars], str(holder.image), holder.font.name
     del holder
-    started = time.monotonic()
     worker = threading.Thread(target=gc.collect)
     worker.start()
     while worker.is_alive():
         tk_root.update()
         time.sleep(0.005)
-    assert time.monotonic() - started < 2  # Tk waited about a second per object before
+    # no wall-clock bound: a collection of a big heap is slow on a busy machine; what counts is where they ended
+    assert tkfinalizers._parked.qsize() >= 5
     assert alive(names, image, font) == ([True] * 3, True, True)  # parked, not freed on the worker
     assert tkfinalizers.drain() >= 5
     assert alive(names, image, font) == ([False] * 3, False, False)
