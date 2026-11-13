@@ -5,6 +5,8 @@
 # The tag must match the version in Cargo.toml, pyproject.toml and python/mourse_decoder/__init__.py,
 # and the tests must pass. It can also be started by hand from the Actions tab (the exe is then
 # only an artifact). Actions are pinned by commit SHA (the tag is in the comment).
+# The release is created as a DRAFT. The signing key is never in GitHub: the maintainer signs the exe
+# offline and uploads MourseDecoder.exe.sig before publishing (see packaging/RELEASING.md).
 name: Release
 
 on:
@@ -90,6 +92,12 @@ jobs:
           .venv\Scripts\python -m pip install -r requirements-build.txt
           .venv\Scripts\maturin develop --release
 
+      - name: A release needs a pinned update key
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          PYTHONPATH: python
+        run: .venv\Scripts\python -c "from mourse_decoder.signing import PINNED_PUBLIC_KEYS; assert PINNED_PUBLIC_KEYS, 'no pinned update key'"
+
       - name: Build the exe
         run: .venv\Scripts\python packaging\build.py
 
@@ -114,3 +122,5 @@ jobs:
             dist/MourseDecoder.exe
             dist/MourseDecoder.exe.sha256
           generate_release_notes: true
+          # stays a draft until the maintainer has signed offline, uploaded MourseDecoder.exe.sig and published
+          draft: true

@@ -42,7 +42,7 @@ def parse_errors(script_file: Path) -> tuple[int, int]:
     ).stdout.split()
     errors = int(out[0])
     names = set(out[1].split(",")) if len(out) > 1 else set()
-    known = {"Start-Sleep", "Remove-Item", "Start-Process", "New-Item", "Split-Path", "New-Object", "Get-Item", "Where-Object", "Test-Path", "Out-Null", "Report"}
+    known = {"Start-Sleep", "Remove-Item", "Start-Process", "New-Item", "Split-Path", "New-Object", "Get-Item", "Where-Object", "Test-Path", "Out-Null", "Report", "Get-FileHash"}
     return errors, len(names - known)
 
 
@@ -66,6 +66,7 @@ def test_scripts_with_typographic_quotes_parse_cleanly_and_call_nothing_extra(tm
     target = tmp_path / name / "MourseDecoder.exe"
     scripts = {
         "update": updater.update_script(new, target, status=tmp_path / name / "r.txt"),
+        "update with hash check": updater.update_script(new, target, status=tmp_path / name / "r.txt", sha256="ab" * 32),
         "uninstall": updater.uninstall_script(target, [tmp_path / name / "MourseDecoder"], status=tmp_path / name / "r.txt"),
     }
     for kind, script in scripts.items():
@@ -94,7 +95,7 @@ def test_failed_update_script_restarts_cleans_up_and_reports():
     script = updater.update_script(
         Path("C:/Temp/mourse-update-ab/MourseDecoder.exe"), Path("C:/App/MourseDecoder.exe"), status=Path("C:/Cfg/update-result.txt")
     )
-    failure = script.split("if (-not $done) {")[1].split("exit 1")[0]
+    failure = script.split("\nif (-not $done) {\n")[1].split("exit 1")[0]  # the block after the loop
     assert "Report 'busy'" in failure
     assert "Start-Process -FilePath $target" in failure
     assert "Remove-Item -LiteralPath 'C:\\Temp\\mourse-update-ab'" in failure.replace("/", "\\")
@@ -141,7 +142,7 @@ def test_read_update_result_returns_text_and_clears_the_file(tmp_path):
 
 
 def test_read_update_result_knows_every_code_and_survives_garbage(tmp_path):
-    for code in ("start", "uninstall", "reparse"):
+    for code in ("start", "uninstall", "reparse", "verify", "rollback"):
         (tmp_path / updater.RESULT_FILE).write_text(code + "\n", encoding="utf-8-sig")
         assert updater.read_update_result(tmp_path) == updater.tr(f"update.result.{code}")
     (tmp_path / updater.RESULT_FILE).write_bytes(b"\xff\xfe{x}")
@@ -154,11 +155,11 @@ def test_install_passes_the_status_file_to_the_script(tmp_path, monkeypatch):
     monkeypatch.setattr(updater, "can_self_update", lambda: True)
     monkeypatch.setattr(sys, "executable", str(tmp_path / "MourseDecoder.exe"))
     monkeypatch.setattr(updater, "result_path", lambda config_dir=None: tmp_path / "cfg" / updater.RESULT_FILE)
-    monkeypatch.setattr(updater, "download", lambda rel, folder, urlopen=None: folder / "MourseDecoder.exe")
+    monkeypatch.setattr(updater, "_download", lambda rel, folder, urlopen=None: (folder / "MourseDecoder.exe", "ab" * 32))
     scripts = []
     monkeypatch.setattr(updater, "run_after_exit", lambda script, popen=None: scripts.append(script))
     updater.install(updater.Release("v9", "", "https://github.com/e", None, "https://github.com/p"))
-    assert "update-result.txt" in scripts[0]
+    assert "update-result.txt" in scripts[0] and "-ne '" + "ab" * 32 + "'" in scripts[0]
 
 
 # --- 3: [ ] in paths ---

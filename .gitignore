@@ -27,3 +27,7 @@ __pycache__/
 Thumbs.db
 *.log
 *.tmp
+
+# signing keys and signatures (never commit)
+*.key
+*.sig

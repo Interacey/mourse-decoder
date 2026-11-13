@@ -33,11 +33,13 @@ EXE_NAME = "MourseDecoder.exe"
 TIMEOUT_S = 15
 MAX_JSON_BYTES = 1 << 20  # the release description is a few KB
 MAX_SHA_BYTES = 1024
+MAX_SIG_BYTES = 1024  # a base64 signature is 89 bytes
 MAX_EXE_BYTES = 200 << 20  # the exe is about 20 MB
 TEMP_PREFIX = "mourse-update-"
 # the only folder names uninstall deletes recursively, whatever APPDATA says
 _OWN_FOLDERS = {"MourseDecoder", "mourse-decoder", "PolyglotMorse"}
 RESULT_FILE = "update-result.txt"  # written by the helper script when it fails, shown and deleted at the next start
+BACKUP_SUFFIX = ".old"  # the replaced exe waits under this name next to the new one until the swap is done
 # PowerShell ends a single-quoted string at any of these, not only at the ASCII quote
 _PS_QUOTES = "'\u2018\u2019\u201a\u201b"
 _ALLOWED_HOSTS = {"github.com", "api.github.com", "objects.githubusercontent.com"}
@@ -62,7 +64,8 @@ class Release:
     notes: str
     exe_url: str
     sha_url: str | None
-    page: str
+    page: str  # html_url from the release JSON; never opened, the update page opens RELEASES_URL
+    sig_url: str | None = None  # MourseDecoder.exe.sig; an update is never installed without it
 
 
 def parse_version(text: str) -> tuple[int, ...]:
@@ -168,8 +171,8 @@ def fetch_latest(urlopen: Callable | None = None) -> Release:
     except (KeyError, TypeError, ValueError):
         raise UpdateError("Unerwartete Antwort von GitHub.") from None
     if EXE_NAME not in assets:
-        raise UpdateError(tr("update.err.no_exe", tag=tag, exe=EXE_NAME), open_page=True)
-    return Release(tag, notes, assets[EXE_NAME], assets.get(f"{EXE_NAME}.sha256"), page)
+        raise UpdateError(tr("update.err.no_exe", tag=tag, exe=EXE_NAME))  # nothing to install and nothing to offer
+    return Release(tag, notes, assets[EXE_NAME], assets.get(f"{EXE_NAME}.sha256"), page, assets.get(f"{EXE_NAME}.sig"))
 
 
 def _github_only(url: str) -> str:
@@ -178,17 +181,61 @@ def _github_only(url: str) -> str:
     return url
 
 
-def download(release: Release, directory: Path, urlopen: Callable | None = None) -> Path:
-    """Load the exe of ``release`` into ``directory`` and check it against the published SHA-256."""
+def _small_file(url: str, limit: int, urlopen: Callable | None) -> bytes:
+    """A small release file (checksum, signature) of at most ``limit`` bytes; a longer answer is an error."""
     import http.client
 
-    if release.sha_url is None:  # the check stays mandatory; the user can still download and judge by hand
-        raise UpdateError(tr("update.err.no_checksum", tag=release.tag), open_page=True)
-    with _open(_github_only(release.sha_url), urlopen) as response:
-        words = response.read(MAX_SHA_BYTES).decode("ascii", "replace").split()
+    try:
+        with _open(_github_only(url), urlopen) as response:
+            data = response.read(limit + 1)
+    except (OSError, http.client.HTTPException) as exc:  # the answer broke off while reading
+        raise _network_error(exc) from None
+    if len(data) > limit:
+        raise UpdateError(tr("update.err.file_too_large", name=url.rsplit("/", 1)[-1]))
+    return data
+
+
+def _require_newer(tag: str) -> None:
+    """Refuse a release that is not newer than this program, however it was signed (no downgrade, no reinstall)."""
+    try:
+        newer = is_newer(tag)
+    except ValueError:
+        newer = False
+    if not newer:
+        raise UpdateError(tr("update.err.not_newer", tag=tag, current=__version__))
+
+
+def download(release: Release, directory: Path, urlopen: Callable | None = None) -> Path:
+    """Load the exe of ``release`` into ``directory``; it must match the published SHA-256 and carry a valid signature.
+
+    The signature is checked against the hash computed here, not the published one, so a changed
+    release can only pass with a signature made by a pinned key. Any failure deletes the download.
+    """
+    return _download(release, directory, urlopen)[0]
+
+
+def _download(release: Release, directory: Path, urlopen: Callable | None) -> tuple[Path, str]:
+    """``download`` plus the SHA-256 (lower-case hex) that was checked and signed."""
+    import http.client
+
+    from . import signing
+
+    _require_newer(release.tag)
+    # No download page for a release that lacks a checksum or signature: whoever can edit a release can swap the exe
+    # and delete the .sig, and a manual download would then run the swapped exe with no check at all.
+    if release.sha_url is None:
+        raise UpdateError(tr("update.err.no_checksum", tag=release.tag))
+    if release.sig_url is None:
+        raise UpdateError(tr("update.err.no_signature", tag=release.tag))
+    if not signing.PINNED_PUBLIC_KEYS:  # verify_release says the same, but only after 20 MB were loaded
+        # open_page stays True here: this is a property of the installed build, not of the release, so nobody
+        # who edits a release can cause it, and a build without a key has no other way to get an update
+        raise signing.SignatureError("no_pinned_key")
+    words = _small_file(release.sha_url, MAX_SHA_BYTES, urlopen).decode("ascii", "replace").split()
     expected = words[0].lower() if words else ""
     if not re.fullmatch(r"[0-9a-f]{64}", expected):
         raise UpdateError("Die Prüfsumme des Releases ist ungültig.")
+    signature = _small_file(release.sig_url, MAX_SIG_BYTES, urlopen)
 
     target = Path(directory) / EXE_NAME
     digest = hashlib.sha256()
@@ -206,18 +253,23 @@ def download(release: Release, directory: Path, urlopen: Callable | None = None)
             raise UpdateError("Die geladene Datei passt nicht zur Prüfsumme – Update abgebrochen.")
         if head != b"MZ":
             raise UpdateError("Die geladene Datei ist kein Windows-Programm – Update abgebrochen.")
+        signing.verify_release(release.tag, EXE_NAME, digest.hexdigest(), signature)
     except (OSError, http.client.HTTPException) as exc:  # includes a download that breaks off half-way
         target.unlink(missing_ok=True)
         raise UpdateError(f"Download fehlgeschlagen ({exc}).", open_page=True) from None
     except UpdateError:
         target.unlink(missing_ok=True)
         raise
-    return target
+    return target, digest.hexdigest()
 
 
 def _quote(path: object) -> str:
     text = "".join(c * 2 if c in _PS_QUOTES else c for c in str(path))
     return "'" + text + "'"
+
+
+def _backup_path(exe: Path) -> Path:
+    return exe.with_name(exe.name + BACKUP_SUFFIX)
 
 
 def result_path(config_dir: Path | None = None) -> Path:
@@ -229,7 +281,7 @@ def result_path(config_dir: Path | None = None) -> Path:
 
 
 # the helper script cannot show anything, so it leaves a code here; tr() turns it into a sentence
-_RESULT_CODES = ("busy", "start", "uninstall", "reparse")
+_RESULT_CODES = ("busy", "start", "uninstall", "reparse", "verify", "rollback")
 
 
 def read_update_result(config_dir: Path | None = None) -> str | None:
@@ -259,36 +311,104 @@ def _status_function(status: Path | None) -> list[str]:
 
 
 def update_script(
-    new_exe: Path, target: Path, start: bool = True, delay_s: int = 1, tries: int = 120, status: Path | None = None
+    new_exe: Path,
+    target: Path,
+    start: bool = True,
+    delay_s: int = 1,
+    tries: int = 120,
+    status: Path | None = None,
+    sha256: str | None = None,
 ) -> str:
     """Wait until ``target`` is free, put ``new_exe`` in its place, start it.
 
-    Exit code 0 = done, 1 = ``target`` stayed busy and nothing changed, 2 = replaced but did not start.
-    On exit 1 the old program is started again (if ``start``), the download folder is removed and
-    ``status`` gets a one-line code for the next start to show.
+    Exit code 0 = done, 1 = ``target`` stayed busy and nothing changed, 2 = replaced but did not start,
+    3 = ``new_exe`` no longer has the hash ``sha256`` (64 hex digits) and nothing was replaced,
+    4 = a failed swap could not be undone (the new file could not be deleted from ``target``, or the backup could
+    not be renamed back): nothing is started, because ``target`` may hold a file that was not verified.
+    The old exe is never deleted before the new one is in place: it is renamed to ``<target>.old`` and renamed back
+    when anything fails after that, so a failed swap leaves the old exe, never a folder without one.
+    The hash is checked before the rename, again before the move and once more on the file that was moved in,
+    because the download sat in the temp folder since it was verified. Without ``sha256`` nothing is hashed.
+    On exit 1 and 3 the old program is started again (if ``start``), the download folder is removed and
+    ``status`` gets a one-line code for the next start to show. On exit 4 ``status`` gets a code too, but the
+    download folder stays and no round is retried, since another round would overwrite the backup.
     """
+    if sha256 is not None and not re.fullmatch(r"[0-9a-fA-F]{64}", sha256):
+        raise ValueError("sha256 must be 64 hex digits")
     download_folder = new_exe.parent
     # only the folder our own mkdtemp made; never one somebody else owns
     own_folder = download_folder.name.startswith(TEMP_PREFIX)
     remove = f"Remove-Item -LiteralPath {_quote(download_folder)} -Recurse -Force -ErrorAction Ignore"
     cleanup = [remove] if own_folder else []
+    restart = ["  try { Start-Process -FilePath $target -ErrorAction Stop } catch { }"] if start else []
+
+    def differs(var: str) -> str:
+        if sha256 is None:
+            return "$false"
+        return f"(Get-FileHash -LiteralPath {var} -Algorithm SHA256).Hash -ne '{sha256.lower()}'"
+
+    # the .NET calls take paths literally; Move-Item -Destination would read [ ] as a wildcard.
+    # A running exe can be renamed but not opened for writing, so the exclusive Open is what waits for the app to end.
+    # $renamed / $placed say what a failed round has to undo; the undo is retried, a virus scanner may hold a file
+    attempt = [
+        "  try {",
+        f"    if ({differs('$new')}) {{ $bad = $true }}",
+        "    else {",
+        "      if (Test-Path -LiteralPath $target) {",
+        "        [System.IO.File]::Open($target, 'Open', 'ReadWrite', 'None').Close()",
+        "        [System.IO.File]::Delete($old); [System.IO.File]::Move($target, $old); $renamed = $true",
+        "      }",
+        f"      if ({differs('$new')}) {{ $bad = $true }}",
+        "      else {",
+        "        $placed = $true; [System.IO.File]::Move($new, $target)",
+        f"        if ({differs('$target')}) {{ $bad = $true }} else {{ $done = $true }}",
+        "      }",
+        "    }",
+        "  } catch { }",
+        "  if (-not $done) {",
+        "    for ($r = 0; $r -lt 40 -and ($placed -or $renamed); $r++) {",
+        "      try {",
+        "        if ($placed) { [System.IO.File]::Delete($target); $placed = $false }",
+        "        if ($renamed) { [System.IO.File]::Move($old, $target); $renamed = $false }",
+        "      } catch { Start-Sleep -Milliseconds 500 }",
+        "    }",
+        "    if (-not $bad) { Start-Sleep -Milliseconds 500 }",
+        "  }",
+    ]
     return "\n".join(
         [
             f"Start-Sleep -Seconds {delay_s}",
             *_status_function(status),
-            f"$new = {_quote(new_exe)}; $target = {_quote(target)}; $done = $false",
-            f"for ($i = 0; $i -lt {tries} -and -not $done; $i++) {{",
-            # the .NET calls take paths literally; Move-Item -Destination would read [ ] as a wildcard.
-            # Delete fails while the exe runs; if Move fails after Delete, the next round only repeats Move
-            "  try { [System.IO.File]::Delete($target); [System.IO.File]::Move($new, $target); $done = $true }",
-            "  catch { Start-Sleep -Milliseconds 500 }",
+            f"$new = {_quote(new_exe)}; $target = {_quote(target)}; $old = {_quote(_backup_path(target))}",
+            "$done = $false; $bad = $false; $renamed = $false; $placed = $false",
+            # a round whose undo failed ends the loop: the next round would delete the backup of the old exe
+            f"for ($i = 0; $i -lt {tries} -and -not $done -and -not $bad -and -not ($placed -or $renamed); $i++) {{",
+            *attempt,
             "}",
+            # $target may hold the file that failed its check, so nothing may be started from here
+            "if (-not $done -and ($placed -or $renamed)) {",
+            "  Report 'rollback'",
+            "  exit 4",
+            "}",
+            *(
+                [
+                    "if ($bad) {",
+                    "  Report 'verify'",
+                    *[f"  {line}" for line in cleanup],
+                    *restart,
+                    "  exit 3",
+                    "}",
+                ]
+                if sha256 is not None
+                else []
+            ),
             "if (-not $done) {",
             "  Report 'busy'",
             *[f"  {line}" for line in cleanup],
-            *(["  try { Start-Process -FilePath $target -ErrorAction Stop } catch { }"] if start else []),
+            *restart,
             "  exit 1",
             "}",
+            "try { [System.IO.File]::Delete($old) } catch { }",
             *cleanup,
             *(["Remove-Item -LiteralPath $statusFile -Force -ErrorAction Ignore"] if status else []),
             *(["try { Start-Process -FilePath $target -ErrorAction Stop } catch { Report 'start'; exit 2 }"] * start),
@@ -300,7 +420,7 @@ def update_script(
 def uninstall_script(
     exe: Path | None, folders: list[Path], delay_s: int = 1, tries: int = 120, status: Path | None = None
 ) -> str:
-    """Wait until ``exe`` can be deleted, then delete it and the ``folders``.
+    """Wait until ``exe`` can be deleted, then delete it, a leftover backup of an update and the ``folders``.
 
     A folder that is a junction or symlink is skipped, not followed.
     Exit code 0 = everything is gone, 1 = something is still there (``status`` gets a code).
@@ -313,6 +433,7 @@ def uninstall_script(
             "  Remove-Item -LiteralPath $exe -Force -ErrorAction Ignore",
             "  if (Test-Path -LiteralPath $exe) { Start-Sleep -Milliseconds 500 }",
             "}",
+            f"Remove-Item -LiteralPath {_quote(_backup_path(exe))} -Force -ErrorAction Ignore",
         ]
     for folder in folders:
         lines += [
@@ -320,7 +441,7 @@ def uninstall_script(
             "if ($f -and ($f.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) { $code = 'reparse' }",
             "elseif ($f) { Remove-Item -LiteralPath $f.FullName -Recurse -Force -ErrorAction Ignore }",
         ]
-    paths = ", ".join(_quote(p) for p in [*([exe] if exe is not None else []), *folders])
+    paths = ", ".join(_quote(p) for p in [*([exe, _backup_path(exe)] if exe is not None else []), *folders])
     lines += [
         f"if (@({paths}) | Where-Object {{ Test-Path -LiteralPath $_ }}) {{",
         "  if (-not $code) { $code = 'uninstall' }",
@@ -375,7 +496,11 @@ def run_after_exit(script: str, popen: Callable | None = None) -> None:
 
 
 def install(release: Release, urlopen: Callable | None = None, popen: Callable | None = None) -> None:
-    """Download ``release`` and schedule the swap. The caller must quit the app right afterwards."""
+    """Download ``release`` and schedule the swap. The caller must quit the app right afterwards.
+
+    Only a release newer than this program is installed, so a correctly signed older one is no way back.
+    """
+    _require_newer(release.tag)
     if not can_self_update():
         raise UpdateError("Automatisch aktualisieren geht nur mit der heruntergeladenen MourseDecoder.exe.")
     target = Path(sys.executable)
@@ -383,8 +508,8 @@ def install(release: Release, urlopen: Callable | None = None, popen: Callable |
         raise UpdateError(tr("update.err.no_write", folder=target.parent), open_page=True)
     folder = Path(tempfile.mkdtemp(prefix=TEMP_PREFIX))
     try:
-        new_exe = download(release, folder, urlopen)
-        run_after_exit(update_script(new_exe, target, status=result_path()), popen)
+        new_exe, digest = _download(release, folder, urlopen)
+        run_after_exit(update_script(new_exe, target, status=result_path(), sha256=digest), popen)
     except BaseException:
         shutil.rmtree(folder, ignore_errors=True)  # nothing downloaded is worth keeping
         raise

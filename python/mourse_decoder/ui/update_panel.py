@@ -115,8 +115,8 @@ class UpdatePanel(tk.Frame):
 
     def _failed(self, message: str, open_page: bool = False) -> None:
         self._status.set(tr("update.error", msg=message))
-        if open_page:  # the update cannot run by itself: offer the page that has the exe to load by hand
-            self._page = self._release.page if self._release else updater.RELEASES_URL
+        if open_page:  # the update cannot run by itself: offer the releases page to load the exe by hand
+            self._page = updater.RELEASES_URL  # a fixed address, not the html_url that came with the release
             self._page_btn.pack(side="left", padx=(8, 0))
         else:
             self._page_btn.pack_forget()
@@ -149,7 +149,7 @@ class UpdatePanel(tk.Frame):
             return
         if not updater.can_self_update():
             self._status.set(tr("update.only_exe"))
-            webbrowser.open(release.page)
+            webbrowser.open(updater.RELEASES_URL)
             return
 
         def job() -> Callable[[], None]:

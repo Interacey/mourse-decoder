@@ -102,13 +102,22 @@ def test_page_button_opens_the_releases_page(panel, monkeypatch):
     assert opened == [updater.RELEASES_URL]
 
 
-def test_page_button_opens_the_page_of_the_known_release(panel, monkeypatch):
+def test_page_button_never_opens_the_address_that_came_with_the_release(panel, monkeypatch):
     opened = []
     monkeypatch.setattr(update_panel.webbrowser, "open", opened.append)
-    panel._release = updater.Release("v9.9.9", "", "https://github.com/e", None, "https://github.com/p")
+    panel._release = updater.Release("v9.9.9", "", "https://github.com/e", None, "https://github.com/evil/page")
     panel._failed("kaputt", True)
     panel._open_page()
-    assert opened == ["https://github.com/p"]
+    assert opened == [updater.RELEASES_URL]
+
+
+def test_install_outside_the_exe_opens_the_fixed_releases_page(panel, monkeypatch):
+    opened = []
+    monkeypatch.setattr(update_panel.webbrowser, "open", opened.append)
+    monkeypatch.setattr(update_panel.updater, "can_self_update", lambda: False)
+    panel._release = updater.Release("v9.9.9", "", "https://github.com/e", None, "https://github.com/evil/page")
+    panel._install()
+    assert opened == [updater.RELEASES_URL]
 
 
 def test_busy_is_true_from_start_of_work_until_the_result_is_shown(panel, root):
