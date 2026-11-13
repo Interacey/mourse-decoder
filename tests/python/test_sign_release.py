@@ -123,28 +123,42 @@ def test_keygen_restricts_the_file_before_the_seed_is_written(tmp_path, monkeypa
 windows_only = pytest.mark.skipif(os.name != "nt", reason="icacls is a Windows tool")
 
 
-def _fake_run(calls, whoami_output='"PC\\user","S-1-5-21-1-2-3-1001"\n', whoami_fails=False):
+ONE_ENTRY = "C:\\k\\update.key PC\\user:(F)\n\nSuccessfully processed 1 files; Failed processing 0 files\n"
+
+
+def _fake_run(
+    calls, whoami_output='"PC\\user","S-1-5-21-1-2-3-1001"\n', whoami_fails=False, fails=(), listing=ONE_ENTRY
+):
+    """Stands in for subprocess.run; `fails` names the icacls steps that exit non-zero: reset, grant or show."""
+
     def fake(cmd, **kwargs):
         calls.append(cmd)
         if Path(cmd[0]).name.lower() == "whoami.exe":
             if whoami_fails:
                 raise subprocess.CalledProcessError(1, cmd)
             return subprocess.CompletedProcess(cmd, 0, stdout=whoami_output, stderr="")
-        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        step = "reset" if "/reset" in cmd else "grant" if "/grant:r" in cmd else "show"
+        if step in fails:
+            raise subprocess.CalledProcessError(5, cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout=listing if step == "show" else "", stderr="")
 
     return fake
 
 
 @windows_only
-def test_restrict_calls_icacls_and_whoami_by_full_path_and_grants_by_sid(tmp_path, monkeypatch):
+def test_restrict_calls_icacls_and_whoami_by_full_path_and_grants_by_sid(tmp_path, monkeypatch, capsys):
     calls = []
     monkeypatch.setattr(sign_release.subprocess, "run", _fake_run(calls))
     target = tmp_path / "update.key"
     sign_release.restrict_to_owner(target)
-    whoami, icacls = calls
+    whoami, reset, grant, show = calls
     assert Path(whoami[0]).is_absolute() and Path(whoami[0]).name.lower() == "whoami.exe"
-    assert Path(icacls[0]).is_absolute() and Path(icacls[0]).name.lower() == "icacls.exe"
-    assert icacls[1:] == [str(target), "/inheritance:r", "/grant:r", "*S-1-5-21-1-2-3-1001:F"]
+    for icacls in (reset, grant, show):
+        assert Path(icacls[0]).is_absolute() and Path(icacls[0]).name.lower() == "icacls.exe"
+    assert reset[1:] == [str(target), "/reset"]  # its own call: in one call with the others it has no effect
+    assert grant[1:] == [str(target), "/inheritance:r", "/grant:r", "*S-1-5-21-1-2-3-1001:F"]
+    assert show[1:] == [str(target)]
+    assert capsys.readouterr().err == ""
 
 
 @windows_only
@@ -157,21 +171,87 @@ def test_restrict_warns_on_an_unusable_whoami_answer(tmp_path, monkeypatch, caps
 
 @windows_only
 def test_restrict_warns_when_whoami_fails_and_keygen_still_writes_the_key(tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr(sign_release.subprocess, "run", _fake_run([], whoami_fails=True))
+    calls = []
+    monkeypatch.setattr(sign_release.subprocess, "run", _fake_run(calls, whoami_fails=True))
     path = tmp_path / "update.key"
     assert sign_release.main(["keygen", "--out", str(path)]) == 0
     assert "could not restrict access" in capsys.readouterr().err
+    assert len(calls) == 1  # no SID, so no icacls call
     assert len(bytes.fromhex(path.read_text(encoding="ascii").strip())) == 32
 
 
 @windows_only
-def test_restrict_leaves_exactly_one_access_entry(tmp_path):
-    path = tmp_path / "update.key"
+def test_restrict_still_grants_and_warns_when_the_reset_fails(tmp_path, monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(sign_release.subprocess, "run", _fake_run(calls, fails=("reset",)))
+    sign_release.restrict_to_owner(tmp_path / "update.key")
+    assert "could not restrict access" in capsys.readouterr().err
+    assert [c for c in calls if "/grant:r" in c]  # the grant is still tried
+
+
+@windows_only
+def test_restrict_warns_and_does_not_raise_when_the_grant_fails(tmp_path, monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(sign_release.subprocess, "run", _fake_run(calls, fails=("grant",)))
+    sign_release.restrict_to_owner(tmp_path / "update.key")
+    assert "could not restrict access" in capsys.readouterr().err
+    assert len(calls) == 3  # whoami, reset, grant; the result is not checked after a failed grant
+
+
+@windows_only
+@pytest.mark.parametrize(
+    "listing",
+    [
+        "C:\\k\\update.key NT AUTHORITY\\SYSTEM:(F)\n               PC\\user:(F)\n",
+        "C:\\k\\update.key PC\\user:(I)(F)\n               BUILTIN\\Administrators:(F)\n               OWNER RIGHTS:(F)\n",
+        "",
+    ],
+)
+def test_restrict_warns_when_other_access_entries_remain(tmp_path, monkeypatch, capsys, listing):
+    monkeypatch.setattr(sign_release.subprocess, "run", _fake_run([], listing=listing))
+    sign_release.restrict_to_owner(tmp_path / "update.key")
+    assert "access entries remain" in capsys.readouterr().err
+
+
+@windows_only
+def test_restrict_warns_when_the_result_cannot_be_read_back(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(sign_release.subprocess, "run", _fake_run([], fails=("show",)))
+    sign_release.restrict_to_owner(tmp_path / "update.key")
+    assert "could not restrict access" in capsys.readouterr().err
+
+
+def _icacls(*args):
+    return subprocess.run([sign_release._system32("icacls.exe"), *map(str, args)], capture_output=True, text=True)
+
+
+def _folder(tmp_path, inheritable):
+    """A normal folder, or one like the runner's pytest tmp dir: no inheritable entries, so a new file keeps the
+    explicit SYSTEM, Administrators and OWNER RIGHTS entries from its creator's default DACL."""
+    folder = tmp_path / ("inheriting" if inheritable else "plain")
+    folder.mkdir()
+    if not inheritable:
+        sid = sign_release._current_user_sid()
+        _icacls(folder, "/inheritance:r", "/grant:r", f"*{sid}:F")  # no (OI)(CI): the entry is not inherited
+    return folder
+
+
+@windows_only
+@pytest.mark.parametrize("inheritable", [True, False], ids=["folder-with-inheritable-entries", "folder-without"])
+def test_restrict_leaves_exactly_one_access_entry(tmp_path, inheritable):
+    path = _folder(tmp_path, inheritable) / "update.key"
     path.write_text("x", encoding="ascii")
     sign_release.restrict_to_owner(path)
-    shown = subprocess.run([sign_release._system32("icacls.exe"), str(path)], capture_output=True, text=True).stdout
+    shown = _icacls(path).stdout
     assert shown.count(":(") == 1, shown
     assert "(F)" in shown
+
+
+@windows_only
+def test_restrict_reports_nothing_on_a_folder_without_inheritable_entries(tmp_path, capsys):
+    path = _folder(tmp_path, inheritable=False) / "update.key"
+    path.write_text("x", encoding="ascii")
+    sign_release.restrict_to_owner(path)
+    assert capsys.readouterr().err == ""
 
 
 def test_pubkey_matches_keygen_output(tmp_path, capsys):

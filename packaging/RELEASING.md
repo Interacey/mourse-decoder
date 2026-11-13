@@ -26,12 +26,16 @@ All commands below are for PowerShell 5.1, run from the repository root, one per
    fails on its gate step ("no pinned update key"), and installed apps accept no update.
 
 What the key file protection does: the file is created with mode 0600 on POSIX. On Windows the script
-creates the empty file, runs `%SystemRoot%\System32\icacls.exe <file> /inheritance:r /grant:r *<your SID>:F`
-(the SID comes from `%SystemRoot%\System32\whoami.exe /user`), and only then writes the seed. Inherited
-permissions are removed, so other accounts lose access, and the seed is never in a file with inherited
-permissions. This is best effort: administrators, backup tools, malware running as you, and a copy to
-another disk are not covered. The key is not encrypted. If the `icacls` call fails, the script prints a
-warning on stderr, still writes the key, and you have to fix the permissions by hand.
+creates the empty file, runs `%SystemRoot%\System32\icacls.exe <file> /reset`, then
+`icacls.exe <file> /inheritance:r /grant:r *<your SID>:F` (the SID comes from
+`%SystemRoot%\System32\whoami.exe /user`), and only then writes the seed. `/reset` removes the explicit
+entries (SYSTEM, Administrators, OWNER RIGHTS) that a new file gets from its creator when the folder has no
+inheritable entries; it has to be a separate call. Inherited permissions are removed too, so other accounts
+lose access, and the seed is never in a file with inherited permissions. The script then lists the file's
+entries with `icacls.exe <file>` and warns if there is more than one. This is best effort: administrators,
+backup tools, malware running as you, and a copy to another disk are not covered. The key is not encrypted.
+If an `icacls` call fails or other entries remain, the script prints a warning on stderr, still writes the
+key, and you have to fix the permissions by hand.
 
 ## b) Every release
 

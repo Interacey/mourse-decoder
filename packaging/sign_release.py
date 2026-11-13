@@ -82,17 +82,41 @@ def _current_user_sid() -> str:
     return sid
 
 
+def _warn_unrestricted(path: Path, reason: str = "") -> None:
+    print(f"Warning: could not restrict access to {path}{reason}; set the permissions by hand.", file=sys.stderr)
+
+
 def restrict_to_owner(path: Path) -> None:
-    """Best effort: POSIX mode 0600 is set at creation; on Windows the ACL is reduced with icacls."""
+    """Best effort: POSIX mode 0600 is set at creation; on Windows the ACL is reduced to the current user.
+
+    `/reset` runs as its own call first: it drops the explicit entries (SYSTEM, Administrators, OWNER RIGHTS) that
+    a new file gets from the creator's default DACL when the folder has no inheritable entries. `/inheritance:r`
+    removes only inherited entries and `/grant:r` replaces only the same SID's entry, so without it they stay.
+    The result is checked: any other number of entries than one is reported.
+    """
     if os.name != "nt":
         return
+    icacls = _system32("icacls.exe")
     try:
-        subprocess.run(
-            [_system32("icacls.exe"), str(path), "/inheritance:r", "/grant:r", f"*{_current_user_sid()}:F"],
-            check=True, capture_output=True,
-        )
+        sid = _current_user_sid()
     except (OSError, ValueError, IndexError, StopIteration, subprocess.CalledProcessError):
-        print(f"Warning: could not restrict access to {path}; set the permissions by hand.", file=sys.stderr)
+        _warn_unrestricted(path)
+        return
+    try:
+        subprocess.run([icacls, str(path), "/reset"], check=True, capture_output=True)
+    except (OSError, subprocess.CalledProcessError):
+        _warn_unrestricted(path, " (icacls /reset failed)")
+    try:
+        subprocess.run([icacls, str(path), "/inheritance:r", "/grant:r", f"*{sid}:F"], check=True, capture_output=True)
+        shown = subprocess.run(
+            [icacls, str(path)], check=True, capture_output=True, text=True, errors="replace"
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        _warn_unrestricted(path)
+        return
+    entries = shown.count(":(")  # one "principal:(rights)" per entry, in every Windows language
+    if entries != 1:
+        _warn_unrestricted(path, f" ({entries} access entries remain, expected 1)")
 
 
 def git_tag_commit(tag: str) -> str:

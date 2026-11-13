@@ -282,7 +282,7 @@ def test_script_runs_hidden_and_detached_with_a_clean_environment(monkeypatch):
 
 def test_quotes_in_paths_cannot_break_out_of_the_script():
     script = updater.update_script(Path("C:/it's/new.exe"), Path("C:/a'; Remove-Item x; '/app.exe"))
-    assert "'C:\\it''s\\new.exe'" in script.replace("/", "\\") or "'C:/it''s/new.exe'" in script
+    assert str(Path("C:/it's/new.exe")).replace("'", "''") in script  # the path as the platform prints it
     assert "a''; Remove-Item x; ''" in script  # stays inside the string
 
 
@@ -840,7 +840,7 @@ def test_update_script_hashes_the_file_before_it_touches_the_program():
 
 def test_update_script_never_deletes_the_program_before_the_new_one_is_in_place():
     script = updater.update_script(Path("C:/T/n.exe"), Path("C:/A/a.exe"), sha256=DIGEST)
-    assert "$old = 'C:\\A\\a.exe.old'" in script
+    assert f"$old = '{Path('C:/A/a.exe')}.old'" in script  # the path as the platform prints it
     deletes = [m.start() for m in re.finditer(r"File\]::Delete\(\$target\)", script)]
     placed = script.index("$placed = $true; [System.IO.File]::Move($new, $target)")
     assert deletes and all(d > placed for d in deletes)  # only the undo of a placed file deletes the target
