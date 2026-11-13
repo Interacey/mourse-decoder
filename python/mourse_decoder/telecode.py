@@ -51,14 +51,20 @@ class TelecodeStore:
         except sqlite3.Error as exc:
             raise TelecodeError(f"Ungültige Telecode-Datenbank {db_path}: {exc}") from exc
         self._lock = threading.Lock()
+        self._error = sqlite3.OperationalError  # not ProgrammingError: a closed store is a bug, not a bad row
         self.path = db_path
 
     def lookup(self, code: str) -> str | None:
+        """The character of ``code``; None if there is none, or if the row is not text (a damaged database)."""
         if not _CODE_PATTERN.match(code):
             return None
-        with self._lock:
-            row = self._conn.execute("SELECT char FROM telecode WHERE code = ?", (code,)).fetchone()
-        return row[0] if row else None
+        try:
+            with self._lock:
+                row = self._conn.execute("SELECT char FROM telecode WHERE code = ?", (code,)).fetchone()
+        except self._error:  # e.g. a text that is not valid UTF-8: the key is dropped like an unknown code
+            return None
+        char = row[0] if row else None
+        return char if isinstance(char, str) else None
 
     def __len__(self) -> int:
         with self._lock:

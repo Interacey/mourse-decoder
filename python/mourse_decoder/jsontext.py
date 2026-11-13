@@ -46,18 +46,46 @@ def escape_stray_quotes(text: str) -> str:
     return "".join(out)
 
 
+# No file of the program nests deeper than 4 levels (function_keys.json: object, slots, slot, value). The limit
+# is fixed instead of the interpreter's: that one differs between threads (main thread, worker, Tk callback), so
+# a file could pass a check in one and break the next load in another.
+MAX_JSON_DEPTH = 100
+_SCAN = re.compile(r'"|\\.|[\[\]{}]', re.DOTALL)
+
+
+def check_depth(text: str, limit: int = MAX_JSON_DEPTH) -> None:
+    """ValueError (JSONDecodeError) if brackets nest deeper than ``limit``; strings are skipped. Linear."""
+    depth = 0
+    in_string = False
+    for match in _SCAN.finditer(text):
+        token = match.group()
+        if token == '"':
+            in_string = not in_string
+        elif not in_string and token in "[{":
+            depth += 1
+            if depth > limit:
+                raise json.JSONDecodeError(f"zu tief verschachtelt (mehr als {limit} Ebenen)", text, match.start())
+        elif not in_string and token in "]}":
+            depth -= 1
+
+
 def loads(text: str, object_pairs_hook: Callable[[list[tuple[str, Any]]], Any]) -> Any:
     """json.loads that accepts raw line breaks and stray quotes inside strings.
 
-    Raises the error of the original text if the repair doesn't help either.
+    Raises the error of the original text if the repair doesn't help either. Nesting deeper than
+    ``MAX_JSON_DEPTH`` is refused (JSONDecodeError), and so is a RecursionError that gets through anyway.
     """
+    check_depth(text)
     try:
-        return json.loads(text, object_pairs_hook=object_pairs_hook, strict=False)
-    except json.JSONDecodeError as exc:
         try:
-            return json.loads(escape_stray_quotes(text), object_pairs_hook=object_pairs_hook, strict=False)
-        except json.JSONDecodeError:
-            raise exc from None
+            return json.loads(text, object_pairs_hook=object_pairs_hook, strict=False)
+        except json.JSONDecodeError as exc:
+            try:
+                return json.loads(escape_stray_quotes(text), object_pairs_hook=object_pairs_hook, strict=False)
+            except json.JSONDecodeError:
+                raise exc from None
+    except RecursionError as exc:
+        raise json.JSONDecodeError("zu tief verschachtelt", text, 0) from exc
 
 
 _NUMBER = re.compile(r"-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\Z")
@@ -199,11 +227,20 @@ def repair(text: str) -> tuple[str, list[str]]:
 def write_atomic(path: Path, data: str | bytes) -> None:
     """Write to ``<name>.tmp`` and rename, so a crash cannot leave a half-written file."""
     tmp = path.with_name(path.name + ".tmp")
-    if isinstance(data, str):
-        tmp.write_text(data, encoding="utf-8")
-    else:
-        tmp.write_bytes(data)
-    os.replace(tmp, path)
+    try:
+        if isinstance(data, str):
+            tmp.write_text(data, encoding="utf-8")
+        else:
+            tmp.write_bytes(data)
+        os.replace(tmp, path)
+    except UnicodeEncodeError as exc:  # an unpaired surrogate: nothing can be written, and nothing stays behind
+        tmp.unlink(missing_ok=True)
+        raise ValueError(
+            "Der Text enthält ein ungültiges Zeichen (einzelnes Surrogat) und kann nicht gespeichert werden."
+        ) from exc
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 MAX_BACKUPS = 5

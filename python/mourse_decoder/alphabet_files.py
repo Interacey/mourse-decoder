@@ -61,6 +61,8 @@ def parse_alphabet_text(text: str) -> dict:
         raise AlphabetError(f"Kein gültiges JSON: {exc}.{hint}") from exc
     if not isinstance(data, dict):
         raise AlphabetError("Das Wurzelelement muss ein JSON-Objekt { … } sein.")
+    if jsontext.has_lone_surrogate(data):
+        raise AlphabetError("Enthält ein einzelnes Surrogat-Zeichen (kein gültiger Unicode-Text).")
     return data
 
 

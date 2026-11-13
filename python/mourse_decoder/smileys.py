@@ -58,6 +58,8 @@ def parse_smiley_text(text: str) -> dict[str, Any]:
         raise SmileyError(f"Kein gültiges JSON: {exc}") from exc
     if not isinstance(data, dict):
         raise SmileyError("Das Wurzelelement muss ein JSON-Objekt { … } sein.")
+    if jsontext.has_lone_surrogate(data):
+        raise SmileyError("Enthält ein einzelnes Surrogat-Zeichen (kein gültiger Unicode-Text).")
     return data
 
 

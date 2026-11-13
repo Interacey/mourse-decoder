@@ -513,14 +513,17 @@ def confirm_commands(parent: tk.Misc, path) -> bool:
     from tkinter import messagebox
 
     from .. import macros
-    from ..i18n import tr
+    from ..i18n import tr_trusted
     from ..jsontext import display_text
 
     commands = macros.commands_in_file(path)
     if not commands:
         return True
+    # built-in texts only: a language file of the user's folder must not turn this question around
     return messagebox.askyesno(
-        tr("import.risky.title"), tr("import.risky", file=display_text(path.name, 80), commands=", ".join(commands[:12])), parent=parent
+        tr_trusted("import.risky.title"),
+        tr_trusted("import.risky", file=display_text(path.name, 80), commands=", ".join(commands[:12])),
+        parent=parent,
     )
 
 

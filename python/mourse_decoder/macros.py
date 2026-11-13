@@ -26,7 +26,7 @@ import re
 import unicodedata
 from collections.abc import Callable, Iterable
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 from . import jsontext
 from .settings import TYPING_DELAY_RANGE
@@ -110,18 +110,33 @@ def commands_in_file(path: Path) -> list[str]:
     """
     try:
         data = jsontext.loads(Path(path).read_text(encoding="utf-8-sig"), dict)
-        values = [v for v in data["codes"].values() if isinstance(v, str)]
-        if isinstance(data.get("word_separator"), str):  # typed at every word pause, like a code
-            values.append(data["word_separator"])
-    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+    except (OSError, ValueError):
         return []
-    return commands_in_texts(values, windows=True)  # the same list as the check of a whole backup
+    # the same texts and the same judgement as the check of a whole backup (backup_content.commands_per_code)
+    return commands_in_texts([text for _, text in typed_texts(data) if isinstance(text, str)])
 
 
-def commands_in_texts(texts: Iterable[str], windows: bool = False) -> list[str]:
+def typed_texts(parsed: Any) -> list[tuple[str, Any]]:
+    """(label, text) of everything in an alphabet or smiley file (parsed JSON) that the decoder can type.
+
+    That is every value of ``codes`` and the ``word_separator`` (typed at every word pause, label
+    ``word_separator``), each on its own: a file that extends another may have no ``codes`` at all and still
+    carry a separator. ``combining`` is typed only as the one character it forms with the letter before it
+    (``AlphabetDecoder._combine``), so it cannot hold a command; ``name`` and ``description`` are only shown.
+    """
+    if not isinstance(parsed, dict):
+        return []
+    codes = parsed.get("codes")
+    texts: list[tuple[str, Any]] = [(str(c), t) for c, t in codes.items()] if isinstance(codes, dict) else []
+    if "word_separator" in parsed:
+        texts.append(("word_separator", parsed["word_separator"]))
+    return texts
+
+
+def commands_in_texts(texts: Iterable[str]) -> list[str]:
     """The commands in ``texts`` that DO something when keyed, see ``commands_in_file``.
 
-    With ``windows`` a ``{WaitWindow …}`` is listed too (it waits for a window and then keys go to it).
+    ``{WaitWindow …}`` is listed too: it waits for a window and then the keys go to it.
     """
     found: dict[str, None] = {}  # a dict keeps the order of first use
     for text in texts:
@@ -138,7 +153,7 @@ def commands_in_texts(texts: Iterable[str], windows: bool = False) -> list[str]:
                 found[f"{{Scroll {value.capitalize()}}}"] = None
             elif kind == "rollback":
                 found["{Rollback}"] = None
-            elif kind == "window" and windows:
+            elif kind == "window":
                 found["{WaitWindow …}"] = None
             elif kind == "text":
                 for char in value:

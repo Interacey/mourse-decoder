@@ -5,8 +5,6 @@ An invalid input, e.g. a half-typed number, isn't applied but reported below the
 
 from __future__ import annotations
 
-import functools
-import json
 import logging
 import queue
 import threading
@@ -17,7 +15,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Any
 
-from .. import backup, i18n
+from .. import backup, backup_content, i18n
 from ..controller import MorseController
 from ..dictionary import DictionaryManager
 from ..function_keys import FunctionKeys, FunctionKeysStore
@@ -36,25 +34,35 @@ WORKER_POLL_MS = 50  # how often the Tk thread looks for the result of a backup 
 log = logging.getLogger(__name__)
 
 
-@functools.lru_cache(maxsize=16)
-def _builtin_strings(code: str) -> dict[str, str]:
-    try:
-        return json.loads((i18n.BUILTIN_LOCALE_DIR / f"{code}.json").read_text(encoding="utf-8"))["strings"]
-    except (OSError, ValueError, KeyError, TypeError):
-        return {}
+_builtin_strings = i18n.builtin_strings
 
 
 def _trusted(key: str, **values: object) -> str:
     """Like ``tr``, but only from the built-in language files. The text of an import confirmation must not
     come from a language file in the user's folder: one that arrived with an earlier import could drop the
-    warning from it."""
-    text = _builtin_strings(i18n.current_language()).get(key) or _builtin_strings(i18n.DEFAULT_LANGUAGE).get(key) or key
-    if not values:
-        return text
-    try:
-        return i18n._formatter.vformat(text, (), values)
-    except (KeyError, IndexError, ValueError):
-        return text
+    warning from it, or swap what Yes and No say (see ``i18n.tr_trusted``)."""
+    return i18n.tr_trusted(key, **values)
+
+
+def _note_text(note: backup_content.Note) -> str:
+    """One note of the confirmation, from the built-in texts; field names are shown as the settings page names them."""
+    params = dict(note.params)
+    if note.code == "settings_keys":
+        names = [n for n in params.get("fields", "").split(", ") if n]
+        params["fields"] = ", ".join(_trusted(_KEY_FIELD_LABELS.get(n, n)) for n in names)
+    return _trusted(f"backup.warn.{note.code}", **params)
+
+
+# the settings page's own labels for the fields a settings.json can change (see backup.KEY_FIELDS)
+_KEY_FIELD_LABELS = {
+    "trigger": "settings.key",
+    "dash_trigger": "settings.dash_key",
+    "separate_dash_key": "settings.dash",
+    "block_input": "settings.block",
+    "block_shortcut": "settings.shortcut",
+    "cycle_shortcut": "settings.cycle_shortcut",
+    "undo_shortcut": "settings.undo_shortcut",
+}
 
 _TIMING_FIELDS = (
     ("dot_threshold_ms", "timing.dot"),
@@ -113,7 +121,8 @@ class BackupDialogs:
         buttons = tk.Frame(top)
         buttons.pack(pady=(0, 8))
         for label_key, value in (("backup.btn.yes", True), ("backup.btn.no", False), ("backup.btn.cancel", None)):
-            tk.Button(buttons, text=tr(label_key), width=14, command=lambda v=value: close(v)).pack(side="left", padx=4)
+            # built-in texts only: a language file must not swap what Yes and No say
+            tk.Button(buttons, text=_trusted(label_key), width=14, command=lambda v=value: close(v)).pack(side="left", padx=4)
         top.protocol("WM_DELETE_WINDOW", lambda: close(None))
         top.bind("<Escape>", lambda _e: close(None))
         top.wait_visibility()  # a grab on a window that is not on screen yet fails on some systems
@@ -501,18 +510,23 @@ class SettingsPanel(tk.Frame):
             self._holds_gate = False
         gate.end()
 
-    def _error_text(self, error: BaseException) -> str:
-        """The message of a failed job in the current language; a restore point is always named."""
+    def _error_text(self, error: BaseException, trusted: bool = False) -> str:
+        """The message of a failed job in the current language; a restore point is always named.
+
+        ``trusted``: from the built-in languages only, for the text of a question the user answers.
+        """
+        say = _trusted if trusted else tr
         if isinstance(error, backup.BackupError):
             key = f"backup.err.{error.code}"
-            text = tr(key, **error.params)
+            text = say(key, **error.params)
             if text == key:  # a code without translation, or free text: the English message of the error
                 text = str(error)
         else:
-            text = tr("backup.err.unexpected", error=backup.display_text(f"{type(error).__name__}: {error}", 300))
+            text = say("backup.err.unexpected", error=backup.display_text(f"{type(error).__name__}: {error}", 300))
         point = getattr(error, "restore_point", None)
-        if point is not None and str(point) not in text:
-            text += "\n\n" + tr("backup.restore_point", path=point)
+        shown = backup.display_text(str(point), backup.PARAM_LIMIT) if point is not None else ""
+        if point is not None and shown not in text:  # the text holds the written-out, cut form of the path
+            text += "\n\n" + say("backup.restore_point", path=shown)
         return text
 
     def _show_error(self, title_key: str, error: BaseException) -> None:
@@ -578,7 +592,10 @@ class SettingsPanel(tk.Frame):
             # a file that can be left out: offer the rest of the backup without it
             culprit = getattr(error, "path", None)
             if culprit and culprit not in exclude and dialogs.ask(
-                tr("backup.err.import"), self._error_text(error) + "\n\n" + tr("backup.import.skipfile.ask", name=culprit)
+                _trusted("backup.err.import"),
+                self._error_text(error, trusted=True)
+                + "\n\n"
+                + _trusted("backup.import.skipfile.ask", name=backup.display_text(culprit)),
             ):
                 self._inspect(source, (*exclude, culprit))
                 return
@@ -594,7 +611,7 @@ class SettingsPanel(tk.Frame):
         text = self._confirm_text(preview)
         chosen = exclude
         if preview.risky_files:
-            choice = dialogs.choose(tr("backup.import"), text + "\n\n" + _trusted("backup.import.choice"))
+            choice = dialogs.choose(_trusted("backup.import"), text + "\n\n" + _trusted("backup.import.choice"))
             if choice is None:
                 self._finish()
                 return
@@ -604,7 +621,7 @@ class SettingsPanel(tk.Frame):
                     self._show_error("backup.err.import", preview.safe_error)
                     return
                 chosen = (*exclude, *preview.risky_files)
-        elif not dialogs.ask(tr("backup.import"), text):
+        elif not dialogs.ask(_trusted("backup.import"), text):
             self._finish()
             return
         config, check, digest = self._config_dir, self._controller.check_shortcut, preview.sha256
@@ -673,7 +690,7 @@ class SettingsPanel(tk.Frame):
             total = max(preview.commands_total, len(preview.commands))  # the list kept per file is capped
             lines = [
                 _trusted(
-                    "backup.import.command", path=c.path, code=c.code, text=c.text, risks=", ".join(c.risks)
+                    "backup.import.command", path=c.label, code=c.code, text=c.text, risks=", ".join(c.risks)
                 )
                 for c in shown
             ]
@@ -686,7 +703,7 @@ class SettingsPanel(tk.Frame):
             )
         if preview.notes:
             blocks.append(
-                _trusted("backup.import.notes", notes="\n".join(_trusted(f"backup.warn.{n.code}", **n.params) for n in preview.notes))
+                _trusted("backup.import.notes", notes="\n".join(_note_text(n) for n in preview.notes))
             )
         if preview.risky_files:
             if preview.safe is not None:
@@ -697,7 +714,9 @@ class SettingsPanel(tk.Frame):
                     )
                 )
             elif preview.safe_error is not None:
-                blocks.append(_trusted("backup.import.safe_error", error=self._error_text(preview.safe_error)))
+                blocks.append(
+                    _trusted("backup.import.safe_error", error=self._error_text(preview.safe_error, trusted=True))
+                )
         return _trusted(
             "backup.import.confirm",
             add=preview.count("add"), replace=preview.count("replace"), unchanged=preview.count("unchanged"),

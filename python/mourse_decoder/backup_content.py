@@ -36,28 +36,20 @@ class Note:
     params: dict[str, str]
 
     def __post_init__(self) -> None:
-        # the values may come from a file (a language id, an alphabet name): written out and cut, once, here
-        object.__setattr__(self, "params", {k: jsontext.display_text(str(v), 80) for k, v in self.params.items()})
+        # the values may come from a file (a language id, an alphabet name): written out and cut, once, here.
+        # Lists of field names are short and complete; a reason from a loader may be longer than a name
+        limits = {"fields": None, "names": 300, "reason": 300}
+        object.__setattr__(
+            self, "params", {k: jsontext.display_text(str(v), limits.get(k, 80)) for k, v in self.params.items()}
+        )
 
 
 def _typed_texts(data: bytes) -> list[tuple[str, Any]]:
-    """(label, text) of everything in an alphabet or smiley file that the decoder can type.
-
-    That is every value of ``codes`` and the ``word_separator`` (typed at every word pause, label
-    ``word_separator``). ``combining`` is typed only as the one character it forms with the letter before it
-    (``AlphabetDecoder._combine``), so it cannot hold a command; ``name`` and ``description`` are only shown.
-    """
+    """``macros.typed_texts`` of the bytes of a file; an unreadable file has none (importing it says so)."""
     try:
-        parsed = jsontext.loads(data.decode("utf-8-sig"), dict)
+        return macros.typed_texts(jsontext.loads(data.decode("utf-8-sig"), dict))
     except (UnicodeDecodeError, ValueError, RecursionError):
         return []
-    if not isinstance(parsed, dict):
-        return []
-    codes = parsed.get("codes")
-    texts: list[tuple[str, Any]] = [(str(c), t) for c, t in codes.items()] if isinstance(codes, dict) else []
-    if "word_separator" in parsed:
-        texts.append(("word_separator", parsed["word_separator"]))
-    return texts
 
 
 def commands_per_code(data: bytes) -> list[tuple[str, str, tuple[str, ...]]]:
@@ -84,7 +76,7 @@ def commands_in_rows(rows: Iterable[tuple[str, Any]]) -> tuple[list[tuple[str, s
     total = 0
     for label, text in rows:
         if isinstance(text, str) and _MAY_HOLD_COMMANDS.search(text):
-            if commands := macros.commands_in_texts([text], windows=True):
+            if commands := macros.commands_in_texts([text]):
                 total += 1
                 if len(found) < MAX_COMMANDS_LISTED:
                     found.append((str(label), text, tuple(commands)))
@@ -92,7 +84,7 @@ def commands_in_rows(rows: Iterable[tuple[str, Any]]) -> tuple[list[tuple[str, s
 
 
 def slot_commands(macro: str) -> tuple[str, ...]:
-    return tuple(macros.commands_in_texts([macro], windows=True))
+    return tuple(macros.commands_in_texts([macro]))
 
 
 def trigger_risk(trigger: str) -> str:
@@ -130,6 +122,11 @@ def language_problem(path: Path) -> str | None:
 def has_loadable_id(stem: str) -> bool:
     """Files whose name is no id are skipped by the program, so nothing is checked for them."""
     return bool(_ID.match(stem))
+
+
+def builtin_language_ids() -> set[str]:
+    """The ids of the languages that ship with the program."""
+    return _language_ids(i18n.BUILTIN_LOCALE_DIR)
 
 
 def _builtin_ids(folder: Path) -> set[str]:

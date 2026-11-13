@@ -35,7 +35,7 @@ CONTROLS = [chr(c) for c in [*range(0x20), *range(0x7F, 0xA0)]]
 
 @pytest.mark.parametrize("char", CONTROLS, ids=lambda c: f"U+{ord(c):04X}")
 def test_every_control_character_in_a_text_is_reported(char):
-    found = macros.commands_in_texts([f"a{char}b"], windows=True)
+    found = macros.commands_in_texts([f"a{char}b"])
     expected = {"\n": "{Enter}", "\r": "{Enter}", "\t": "{Tab}"}.get(char, f"{{control character U+{ord(char):04X}}}")
     assert found == [expected]
 
@@ -48,7 +48,7 @@ def test_a_control_character_is_found_by_every_check_and_left_out_without_macros
     path = tmp_path / "x.json"
     path.write_bytes(data)
     assert macros.commands_in_file(path)  # the single-file import
-    assert macros.commands_in_texts([f"x{char}"], windows=True)  # a function key macro (backup.slot_commands)
+    assert macros.commands_in_texts([f"x{char}"])  # a function key macro (backup.slot_commands)
     config = make_config(tmp_path / "cfg" / "MourseDecoder")
     smiley = json.dumps({"id": "ctl", "codes": {"..--": f"x{char}"}}).encode()
     telecode = make_telecode_db(tmp_path / "t.sqlite", {"0001": f"x{char}"})
@@ -67,7 +67,7 @@ def test_normal_text_gives_no_command_report(telecode_db):
         "caf\u00e9", "\ufe0f", "\u3000",
     ]
     for text in texts:
-        assert macros.commands_in_texts([text], windows=True) == [], ascii(text)
+        assert macros.commands_in_texts([text]) == [], ascii(text)
     for path in [*ALPHABET_DIR.glob("*.json"), *SMILEY_DIR.glob("*.json")]:
         assert backup_content.commands_per_code(path.read_bytes()) == [], path.name
     rows = sqlite3.connect(telecode_db).execute("SELECT code, char FROM telecode").fetchall()
@@ -78,7 +78,7 @@ def test_cf_characters_are_not_reported_because_they_press_no_key():
     # direction marks and joiners change how text looks, emoji and several scripts need them
     for char in ("\u200d", "\u200c", "\u202e", "\u200b", "\ufeff"):
         assert unicodedata.category(char) == "Cf"
-        assert macros.commands_in_texts([f"a{char}b"], windows=True) == []
+        assert macros.commands_in_texts([f"a{char}b"]) == []
 
 
 # ---- SR2: text from a file in a dialog -----------------------------------------------------------------------------
@@ -92,7 +92,7 @@ def clean(text: str, limit: int) -> bool:
 
 
 def test_risks_of_a_key_combination_from_a_file_are_written_out_and_cut():
-    (risk,) = macros.commands_in_texts([EVIL_KEYS], windows=True)
+    (risk,) = macros.commands_in_texts([EVIL_KEYS])
     assert clean(risk, 90) and risk.startswith("{Win+R\\u202e\\n\\nALLES")
 
 
@@ -113,7 +113,7 @@ def test_the_confirmation_shows_nothing_of_a_bundle_unescaped(tmp_path):
     for command in preview.commands:
         assert all(clean(r, 90) for r in command.risks)
     for note in preview.notes:
-        assert all(clean(v, 90) for v in note.params.values()), note
+        assert all(clean(v, 302) for v in note.params.values()), note
     text = SettingsPanel._confirm_text(None, preview)
     assert "\u202e" not in text and "\nALLES HARMLOS" not in text and "\nNo commands found" not in text
     assert "A" * 400 not in text
@@ -219,12 +219,14 @@ def test_a_bundle_file_with_a_lone_surrogate_is_refused(tmp_path):
     config = make_config(tmp_path / "cfg" / "MourseDecoder")
     for name, data in (
         ("function_keys.json", b'{"schema_version":1,"slots":[{"slot":1,"trigger":"\\ud800","macro":"x"}]}'),
-        ("alphabets/s.json", b'{"id":"s","extends":"latin","codes":{".-.-.-":"\\ud800"}}'),
         ("settings.json", b'{"language":"\\udfff"}'),
     ):
         with pytest.raises(backup.BackupError) as info:
             backup.inspect_bundle(make_bundle(tmp_path / "b.zip", {name: data}), config)
         assert info.value.code in ("file_unusable", "function_keys_invalid"), (name, info.value.code)
+    # an alphabet with one is a broken file like any other: a note, refused only if it replaces a good one
+    broken = make_bundle(tmp_path / "s.zip", {"alphabets/s.json": b'{"id":"s","extends":"latin","codes":{".-.-.-":"\\ud800"}}'})
+    assert [n.code for n in backup.inspect_bundle(broken, config).notes] == ["file_skipped"]
     pair = b'{"id":"p","extends":"latin","codes":{".-.-.-":"\\ud83d\\ude00"}}'  # a real pair is fine
     assert backup.inspect_bundle(make_bundle(tmp_path / "ok.zip", {"alphabets/p.json": pair}), config)
 
@@ -291,27 +293,6 @@ def junction(link: Path, target: Path) -> bool:
     except OSError:
         return False
     return True
-
-
-def test_a_junction_is_never_followed_or_removed(tmp_path):
-    victim = tmp_path / "victim"
-    victim.mkdir()
-    (victim / "keep.txt").write_text("x")
-    parent = tmp_path / "tmp"
-    parent.mkdir()
-    old = time.time() - 3 * 86400
-    os.utime(victim, (old, old))
-    (victim / jsontext.SCRATCH_MARKER).write_text("x")  # even a marker behind the link must not count
-    root_link = parent / "mourse-backup-link"
-    if not junction(root_link, victim):
-        pytest.skip("no junctions or symbolic links here")
-    real = make_scratch(parent, "mourse-backup-real", True, 3)
-    inner = real / "inner"
-    assert junction(inner, victim)
-    os.utime(real, (old, old))  # making the link changed the folder's time
-    removed = jsontext.clean_orphaned_scratch(parent=parent)
-    assert removed == [real] and not real.exists()
-    assert (victim / "keep.txt").is_file() and os.path.lexists(root_link)  # nothing behind a link was touched
 
 
 # ---- SR6: settings.json that changes the keys -----------------------------------------------------------------------

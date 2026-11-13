@@ -84,10 +84,12 @@ def _read_json(path: Path) -> dict[str, Any]:
         data = jsontext.loads(path.read_text(encoding="utf-8-sig"), _reject_duplicate_keys)
     except AlphabetError as exc:
         raise AlphabetError(f"{path.name}: {exc}") from None
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
         raise AlphabetError(f"{path.name}: nicht lesbar ({exc})") from exc
     if not isinstance(data, dict):
         raise AlphabetError(f"{path.name}: Wurzelelement muss ein Objekt sein")
+    if jsontext.has_lone_surrogate(data):
+        raise AlphabetError(f"{path.name}: enthält ein einzelnes Surrogat-Zeichen (kein gültiger Unicode-Text)")
     return data
 
 

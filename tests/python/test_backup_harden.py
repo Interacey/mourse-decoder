@@ -962,8 +962,9 @@ def test_alphabets_are_loaded_with_what_they_extend_from_the_bundle_and_the_fold
 def test_settings_that_name_what_will_not_exist_are_noted_before_the_import(tmp_path):
     settings = json.dumps({"alphabet": "doesnotexist", "smileys": "nosuchset", "language": "zz"}).encode()
     preview = inspect_bundle(build_zip(tmp_path / "z.zip", {"settings.json": settings}), tmp_path / "t")
-    assert [(n.code, n.params["name"]) for n in preview.notes] == [
+    assert [(n.code, n.params.get("name") or n.params.get("names")) for n in preview.notes] == [
         ("alphabet_missing", "doesnotexist"), ("smileys_missing", "nosuchset"), ("language_missing", "zz"),
+        ("languages_custom", "zz"),  # a language that does not ship with the program is named as such too
     ]
     telecode = build_zip(tmp_path / "t.zip", {"settings.json": b'{"alphabet": "chinese-telecode"}'})
     assert [n.code for n in inspect_bundle(telecode, tmp_path / "t").notes] == ["telecode_missing"]
@@ -974,7 +975,8 @@ def test_settings_that_name_what_will_not_exist_are_noted_before_the_import(tmp_
         "settings.json": fine, "alphabets/mine.json": alpha("mine"), "smileys/set.json": smileys_file("set"),
         "languages/xx.json": b'{"id": "xx", "name": "X", "strings": {}}',
     }
-    assert inspect_bundle(build_zip(tmp_path / "f.zip", files), tmp_path / "t").notes == ()
+    notes = inspect_bundle(build_zip(tmp_path / "f.zip", files), tmp_path / "t").notes
+    assert [n.code for n in notes] == ["languages_custom"]  # a language file that comes with a backup is named
 
 
 # restore points take back what an import created

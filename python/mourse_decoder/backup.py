@@ -75,6 +75,7 @@ KEEP_RESTORE_POINTS = 5
 SQLITE_CHECK_SECONDS = 60
 MACRO_SUMMARY_LENGTH = 200
 PARAM_LIMIT = 300  # characters of one value in a message
+_UNCUT = ("files",)  # lists the user needs in full (the files a failed write left behind): written out, not cut
 
 _SQLITE_HEADER = b"SQLite format 3\x00"
 _FILE_NAME = re.compile(r"[^\x00-\x1f\\/:*?\"<>|]+\.json\Z")
@@ -83,6 +84,10 @@ _RESERVED = {
     *(f"com{n}" for n in range(1, 10)), *(f"lpt{n}" for n in range(1, 10)),
 }
 _SHORT_NAME = re.compile(r"~[0-9]")  # 8.3 names such as ALPHAB~1.json
+# letters and symbols that show as blanks (Hangul filler, braille blank); Cf characters other than ZWJ and ZWNJ are
+# refused by category (soft hyphen, invisible operators, tag characters): none of them belongs in a file name
+_BLANKS = {"\u3164", "\u2800", "\u115f", "\u1160", "\uffa0"}
+_JOINERS = {"\u200c", "\u200d"}
 _TEMP_SUFFIX = ".mourse-tmp"
 
 
@@ -127,6 +132,7 @@ _MESSAGES = {
     "not_sqlite": "{name} is not an SQLite database.",
     "sqlite_damaged": "{name} is damaged: {reason}",
     "sqlite_schema": "{name} has no telecode table with the columns code and char.",
+    "sqlite_values": "{name} has {count} entries whose code or character is not text.",
     "sqlite_error": "{name} is not a usable database: {error}",
     "clash": "The function keys and the settings would clash: {details}",
     "not_a_plain_file": "{name} in the config folder is not a plain file, nothing was changed.",
@@ -164,7 +170,7 @@ class BackupError(Exception):
         template = _MESSAGES.get(code)
         self.code = code if template is not None else "other"
         # the values may come from the bundle (a reason, a name, a macro): control and direction characters written out
-        self.params = {k: display_text(str(v), PARAM_LIMIT) for k, v in params.items()}
+        self.params = {k: display_text(str(v), None if k in _UNCUT else PARAM_LIMIT) for k, v in params.items()}
         if restore_point is not None:
             self.params["restore_point"] = display_text(str(restore_point), PARAM_LIMIT)
         super().__init__(template.format(**self.params) if template is not None else code)
@@ -200,10 +206,15 @@ class SlotSummary:
 class CommandSummary:
     """A code of an alphabet or smiley file whose text runs commands when it is keyed."""
 
-    path: str
+    path: str  # the name in the bundle, as the import needs it
     code: str
     text: str  # shortened and escaped for display
     risks: tuple[str, ...]
+
+    @property
+    def label(self) -> str:
+        """The path as it may be shown: no control, bidi or zero-width characters."""
+        return display_text(self.path)
 
 
 @dataclass(frozen=True)
@@ -258,7 +269,8 @@ def _safe_json_name(name: str) -> bool:
         and stem == stem.rstrip(" .")
         and not _reserved(stem)
         and not _SHORT_NAME.search(folded)
-        and not any(c in _HIDING or unicodedata.category(c) in ("Cc", "Zl", "Zp") for c in name)
+        and not any(c in _HIDING or c in _BLANKS or unicodedata.category(c) in ("Cc", "Zl", "Zp") for c in name)
+        and not any(unicodedata.category(c) == "Cf" and c not in _JOINERS for c in name)
     )
 
 
@@ -303,14 +315,14 @@ def _schema_version(name: str, data: bytes) -> int | None:
     return version
 
 
-def _parse_json(data: bytes) -> dict[str, Any]:
+def _parse_json(data: bytes, allow_surrogates: bool = False) -> dict[str, Any]:
     try:
         parsed = jsontext.loads(data.decode("utf-8-sig"), dict)
     except (UnicodeDecodeError, ValueError, RecursionError) as exc:
         raise ValueError(str(exc)) from exc
     if not isinstance(parsed, dict):
         raise ValueError("the top level is not an object")
-    if jsontext.has_lone_surrogate(parsed):  # \ud800 on its own: cannot be typed, copied or shown
+    if not allow_surrogates and jsontext.has_lone_surrogate(parsed):  # \ud800 on its own: cannot be typed or shown
         raise ValueError("enthält ein einzelnes Surrogat-Zeichen (kein gültiger Unicode-Text)")
     return parsed
 
@@ -578,7 +590,11 @@ atexit.register(_clean_scratch)
 def _scratch():
     """A temporary folder outside the config folder; removed at the end, also after an error."""
     path = Path(tempfile.mkdtemp(prefix=SCRATCH_PREFIX))
-    (path / SCRATCH_MARKER).write_text("mourse-decoder backup check, safe to delete\n", encoding="utf-8")
+    try:
+        (path / SCRATCH_MARKER).write_text("mourse-decoder backup check, safe to delete\n", encoding="utf-8")
+    except BaseException:  # a folder without the marker would never be cleaned up
+        shutil.rmtree(path, ignore_errors=True)
+        raise
     _live_scratch.add(path)
     try:
         yield path
@@ -687,6 +703,11 @@ def _check_sqlite(data: bytes) -> tuple[list[tuple[str, str, tuple[str, ...]]], 
             columns = {row[1] for row in conn.execute("PRAGMA table_info(telecode)")}
             if not {"code", "char"} <= columns:
                 raise BackupError("sqlite_schema", name=TELECODE_FILE, path=TELECODE_FILE)
+            odd = conn.execute(
+                "SELECT COUNT(*) FROM telecode WHERE typeof(char) != 'text' OR typeof(code) != 'text'"
+            ).fetchone()[0]
+            if odd:  # a BLOB or a number as the character: nothing the build tool writes, and nothing to type
+                raise BackupError("sqlite_values", name=TELECODE_FILE, count=odd, path=TELECODE_FILE)
             rows = ((str(code), char) for code, char in conn.execute("SELECT code, char FROM telecode"))
             return backup_content.commands_in_rows(rows)
         except sqlite3.Error as exc:
@@ -703,7 +724,8 @@ def _validate_content(name: str, data: bytes) -> tuple[list[tuple[str, str, tupl
     try:
         parsed_version = _schema_version(name, data) if name == FUNCTION_KEYS_FILE else None
         if parsed_version is None:
-            _parse_json(data)
+            # alphabets, smiley sets and languages are judged by their loaders (they refuse a lone surrogate)
+            _parse_json(data, allow_surrogates=name.split("/")[0] in FOLDERS)
     except ValueError as exc:
         raise BackupError("file_unusable", name=name, reason=exc, path=name) from exc
     if parsed_version is not None and parsed_version > FUNCTION_KEYS_SCHEMA_VERSION:
@@ -764,6 +786,7 @@ class _Checked:
     warnings: tuple[str, ...]
     notes: tuple[Note, ...]
     telecode: tuple[list[tuple[str, str, tuple[str, ...]]], int] = ([], 0)  # commands in telecode.sqlite
+    language: str | None = None  # ``language`` of the settings.json of the bundle
 
 
 def _copy_user_files(config_dir: Path, work: Path, removed: set[str]) -> None:
@@ -881,7 +904,7 @@ def _validate_files(
         notes = _check_user_files(config_dir, files, removed, effective)
     if settings is not None and (note := _keys_note(config_dir, settings)) is not None:
         notes.append(note)
-    return _Checked(keys, tuple(warnings), tuple(notes), telecode)
+    return _Checked(keys, tuple(warnings), tuple(notes), telecode, settings.language if settings else None)
 
 
 KEY_FIELDS = (
@@ -963,6 +986,7 @@ class _Loaded:
     notes: tuple[Note, ...]
     removed: tuple[str, ...]  # files a restore point takes back: the ones its import had created
     telecode: tuple[list[tuple[str, str, tuple[str, ...]]], int] = ([], 0)
+    language: str | None = None  # ``language`` of the settings.json of the bundle
 
 
 def _load(
@@ -985,7 +1009,10 @@ def _load(
         if name not in skipped and name not in files and _regular(config_dir / name, config_dir)
     ) if _is_own_restore_point(Path(zip_path), config_dir, manifest) else ()
     checked = _validate_files(config_dir, files, check_shortcut, set(removed))
-    return _Loaded(manifest, files, digest, checked.keys, checked.warnings, checked.notes, removed, checked.telecode)
+    return _Loaded(
+        manifest, files, digest, checked.keys, checked.warnings, checked.notes, removed, checked.telecode,
+        checked.language,
+    )
 
 
 def _preview(config_dir: Path, loaded: _Loaded) -> Preview:
@@ -999,10 +1026,29 @@ def _preview(config_dir: Path, loaded: _Loaded) -> Preview:
     slots = _summaries(loaded.keys) if loaded.keys is not None and FUNCTION_KEYS_FILE in changed else ()
     commands, commands_total = _command_summaries(loaded.files, changed, loaded.telecode)
     risky = ([FUNCTION_KEYS_FILE] if slots else []) + sorted({c.path for c in commands})
+    notes = loaded.notes
+    if (note := _language_note(config_dir, loaded, entries)) is not None:
+        notes = (*notes, note)
     return Preview(
-        loaded.manifest, tuple(entries), loaded.sha256, slots, commands, loaded.warnings, loaded.notes, tuple(risky),
+        loaded.manifest, tuple(entries), loaded.sha256, slots, commands, loaded.warnings, notes, tuple(risky),
         commands_total=commands_total,
     )
+
+
+def _language_note(config_dir: Path, loaded: _Loaded, entries: list[PreviewEntry]) -> Note | None:
+    """Say so when the import brings a language file or selects a language that does not ship with the program.
+
+    The texts of a language file are shown wherever the program talks, so a file that came with a backup could
+    relabel buttons (the warnings of the import dialog themselves only use the built-in languages). Nothing is
+    said when the files are unchanged (restoring one's own backup) or the language is already the one in use.
+    """
+    names = [Path(e.path).stem for e in entries if e.path.startswith("languages/") and e.status in ("add", "replace")]
+    language = loaded.language
+    if language and language not in backup_content.builtin_language_ids():
+        current = _load_settings_lenient(_current(config_dir, SETTINGS_FILE)).language
+        if language != current and language not in names:
+            names.append(language)
+    return Note("languages_custom", {"names": ", ".join(names)}) if names else None
 
 
 def inspect_bundle(

@@ -14,7 +14,7 @@ from .controller import MorseController, NativeInjector
 from .dictionary import AlphabetError, DictionaryManager
 from .function_keys import FunctionKeysStore
 from .i18n import set_language, tr
-from .jsontext import clean_orphaned_scratch, display_text
+from .jsontext import backup_file, clean_orphaned_scratch, display_text
 from .settings import Settings, SettingsStore
 from .telecode import TelecodeError
 
@@ -51,6 +51,28 @@ def build_controller(engine, injector, dictionaries, settings: Settings, listene
         fallback = settings.replace(alphabet=FALLBACK_ALPHABET)
         warning = tr("startup.alphabet_fallback", id=settings.alphabet, msg=exc)
         return MorseController(engine, injector, dictionaries, fallback, listener=listener), [warning]
+
+
+def make_engine(native, settings: Settings, store: SettingsStore | None = None):
+    """The Rust engine for ``settings``; if it refuses the keys, the default keys are used and the user is told.
+
+    Returns (engine, settings, warnings). ``Settings.validate`` asks the same parser before a file is accepted,
+    so this is the last net: whatever a settings file holds, the program starts. The file is copied to
+    settings.json.bak first (the user can read what was there), nothing else is changed on disk.
+    """
+    try:
+        return native.MorseEngine(trigger=settings.trigger), settings, []
+    except ValueError as exc:
+        log.warning("Taster '%s' vom Tastaturmodul abgelehnt: %s", display_text(settings.trigger), exc)
+        if store is not None:
+            backup_file(store.path, move=False)
+        default = Settings()
+        fallback = settings.replace(
+            trigger=default.trigger, dash_trigger=default.dash_trigger, separate_dash_key=False,
+            block_shortcut="", cycle_shortcut="", undo_shortcut="",
+        )
+        warning = tr("startup.keys_fallback", reason=display_text(str(exc), 40))
+        return native.MorseEngine(trigger=fallback.trigger), fallback, [warning]
 
 
 def deliver_warnings(show, warnings) -> None:
@@ -261,7 +283,8 @@ def main(argv: list[str] | None = None) -> int:
         user_directory=store.directory / "alphabets",
         user_smiley_directory=store.directory / "smileys",
     )
-    engine = native.MorseEngine(trigger=settings.trigger)
+    engine, settings, key_warnings = make_engine(native, settings, store)
+    notices += key_warnings
     injector = _PrintInjector() if args.dry_run else NativeInjector(native)
 
     if args.headless:

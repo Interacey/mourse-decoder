@@ -992,7 +992,8 @@ def test_a_settings_file_that_is_thrown_away_gives_no_notice_about_its_ids(tmp_p
     (tmp_path / "settings.json").write_text(json.dumps({"alphabet": "Latin", "dot_threshold_ms": -5}), encoding="utf-8")
     store = SettingsStore(tmp_path)
     settings = store.load()
-    assert settings == Settings() and store.warnings == []
+    assert settings == Settings()
+    assert [key for key, _ in store.warnings] == ["startup.settings_discarded"]  # no notice about its ids, one about it
     assert (tmp_path / "settings.json.bak").is_file()  # the file is kept for the user, like before
 
 

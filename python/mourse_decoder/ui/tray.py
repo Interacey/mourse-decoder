@@ -47,6 +47,7 @@ def saved_fields(store: SettingsStore) -> dict[str, object]:
 
 BALLOON_UNITS = 255  # NOTIFYICONDATA.szInfo holds 256 UTF-16 units including the end mark
 BALLOON_TITLE_UNITS = 63  # szInfoTitle holds 64
+TOOLTIP_UNITS = 127  # szTip holds 128
 
 
 def fit_balloon(message: str, limit: int = BALLOON_UNITS) -> str:
@@ -133,7 +134,7 @@ class TrayApp:
         self._icon = pystray.Icon(
             "mourse-decoder",
             icon=create_icon(controller.settings.enabled),
-            title=self._tooltip(),
+            title=fit_balloon(self._tooltip(), TOOLTIP_UNITS),
             menu=self._build_menu(),
         )
 
@@ -280,8 +281,8 @@ class TrayApp:
         return tr("tray.tooltip", state=state, alphabet=s.alphabet, key=binding_label(s.trigger))
 
     def _set_title(self, title: str) -> None:
-        # Windows caps tray tooltips at 127 characters
-        self._icon.title = title[:127]
+        # Windows caps tray tooltips at 127 UTF-16 units (a character above U+FFFF is two)
+        self._icon.title = fit_balloon(title, TOOLTIP_UNITS)
 
     def _build_menu(self) -> pystray.Menu:
         def alphabet_item(info_id: str, label: str) -> pystray.MenuItem:
