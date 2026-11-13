@@ -17,6 +17,10 @@ from tkinter import ttk
 
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageTk
 
+from . import tkfinalizers
+
+tkfinalizers.install()  # Tk variables, images and fonts are freed on the Tk thread only
+
 
 @dataclass(frozen=True)
 class Palette:
@@ -509,13 +513,17 @@ def confirm_commands(parent: tk.Misc, path) -> bool:
     from tkinter import messagebox
 
     from .. import macros
-    from ..i18n import tr
+    from ..i18n import tr_trusted
+    from ..jsontext import display_text
 
     commands = macros.commands_in_file(path)
     if not commands:
         return True
+    # built-in texts only: a language file of the user's folder must not turn this question around
     return messagebox.askyesno(
-        tr("import.risky.title"), tr("import.risky", file=path.name, commands=", ".join(commands[:12])), parent=parent
+        tr_trusted("import.risky.title"),
+        tr_trusted("import.risky", file=display_text(path.name, 80), commands=", ".join(commands[:12])),
+        parent=parent,
     )
 
 
@@ -584,6 +592,10 @@ def draw_glyph(canvas: tk.Canvas, name: str, cx: float, cy: float, color: str, t
         canvas.create_oval(x + 1, y + 1, x + 17, y + 17, fill="", outline=color, width=2, tags=tag)
         canvas.create_line(x + 9, y + 8, x + 9, y + 13, **line)
         canvas.create_oval(x + 8, y + 4, x + 10, y + 6, fill=color, outline=color, tags=tag)
+    elif name == "calibration":  # ruler with ticks
+        canvas.create_line(x, y + 14, x + 18, y + 14, **line)
+        for i, height in enumerate((9, 5, 9, 5, 9)):
+            canvas.create_line(x + 1 + i * 4, y + 14, x + 1 + i * 4, y + 14 - height, **line)
     elif name == "sidebar":  # window with a sidebar
         canvas.create_rectangle(x + 1, y + 2, x + 17, y + 16, fill="", outline=color, width=2, tags=tag)
         canvas.create_line(x + 7, y + 2, x + 7, y + 16, **line)

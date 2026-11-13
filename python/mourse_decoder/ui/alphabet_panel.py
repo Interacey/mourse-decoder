@@ -27,7 +27,6 @@ from ..alphabet_files import (
 from ..controller import MorseController
 from ..dictionary import AlphabetError, AlphabetInfo, DictionaryManager
 from ..i18n import tr
-from ..settings import Settings
 from . import theme
 from .theme import Button, boxed, confirm_commands, list_box, text_box
 
@@ -44,7 +43,7 @@ class AlphabetPanel(tk.Frame):
         master: tk.Misc,
         controller: MorseController,
         dictionaries: DictionaryManager,
-        apply_settings: Callable[[Settings], None],
+        apply_settings: Callable[..., None],  # Settings, optional chosen=(names of fields the user picked)
         on_changed: Callable[[], None],
     ) -> None:
         super().__init__(master, bg=theme.P.bg)
@@ -240,7 +239,9 @@ class AlphabetPanel(tk.Frame):
                 cycle_alphabets=tuple(info.id if a == replacing else a for a in active.cycle_alphabets),
             )
             if replacing and replacing != info.id and moved != active:
-                self._apply_settings(moved)
+                # the renamed alphabet is the one the user works with: a deliberate choice, saved even if the
+                # program runs a fallback for the file's name
+                self._apply_settings(moved, chosen=("alphabet",) if moved.alphabet != active.alphabet else ())
             else:
                 self._controller.reload_alphabet()
         except Exception as exc:  # noqa: BLE001 - AlphabetError, ValueError, OSError
@@ -265,7 +266,7 @@ class AlphabetPanel(tk.Frame):
         if self._selected is None:
             return
         try:
-            self._apply_settings(self._controller.settings.replace(alphabet=self._selected.id))
+            self._apply_settings(self._controller.settings.replace(alphabet=self._selected.id), chosen=("alphabet",))
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror(tr("alpha.err.use"), str(exc), parent=self)
             return

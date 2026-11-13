@@ -11,6 +11,10 @@ import json
 import os
 import re
 import shutil
+import stat
+import tempfile
+import time
+import unicodedata
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -42,18 +46,46 @@ def escape_stray_quotes(text: str) -> str:
     return "".join(out)
 
 
+# No file of the program nests deeper than 4 levels (function_keys.json: object, slots, slot, value). The limit
+# is fixed instead of the interpreter's: that one differs between threads (main thread, worker, Tk callback), so
+# a file could pass a check in one and break the next load in another.
+MAX_JSON_DEPTH = 100
+_SCAN = re.compile(r'"|\\.|[\[\]{}]', re.DOTALL)
+
+
+def check_depth(text: str, limit: int = MAX_JSON_DEPTH) -> None:
+    """ValueError (JSONDecodeError) if brackets nest deeper than ``limit``; strings are skipped. Linear."""
+    depth = 0
+    in_string = False
+    for match in _SCAN.finditer(text):
+        token = match.group()
+        if token == '"':
+            in_string = not in_string
+        elif not in_string and token in "[{":
+            depth += 1
+            if depth > limit:
+                raise json.JSONDecodeError(f"zu tief verschachtelt (mehr als {limit} Ebenen)", text, match.start())
+        elif not in_string and token in "]}":
+            depth -= 1
+
+
 def loads(text: str, object_pairs_hook: Callable[[list[tuple[str, Any]]], Any]) -> Any:
     """json.loads that accepts raw line breaks and stray quotes inside strings.
 
-    Raises the error of the original text if the repair doesn't help either.
+    Raises the error of the original text if the repair doesn't help either. Nesting deeper than
+    ``MAX_JSON_DEPTH`` is refused (JSONDecodeError), and so is a RecursionError that gets through anyway.
     """
+    check_depth(text)
     try:
-        return json.loads(text, object_pairs_hook=object_pairs_hook, strict=False)
-    except json.JSONDecodeError as exc:
         try:
-            return json.loads(escape_stray_quotes(text), object_pairs_hook=object_pairs_hook, strict=False)
-        except json.JSONDecodeError:
-            raise exc from None
+            return json.loads(text, object_pairs_hook=object_pairs_hook, strict=False)
+        except json.JSONDecodeError as exc:
+            try:
+                return json.loads(escape_stray_quotes(text), object_pairs_hook=object_pairs_hook, strict=False)
+            except json.JSONDecodeError:
+                raise exc from None
+    except RecursionError as exc:
+        raise json.JSONDecodeError("zu tief verschachtelt", text, 0) from exc
 
 
 _NUMBER = re.compile(r"-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\Z")
@@ -195,11 +227,20 @@ def repair(text: str) -> tuple[str, list[str]]:
 def write_atomic(path: Path, data: str | bytes) -> None:
     """Write to ``<name>.tmp`` and rename, so a crash cannot leave a half-written file."""
     tmp = path.with_name(path.name + ".tmp")
-    if isinstance(data, str):
-        tmp.write_text(data, encoding="utf-8")
-    else:
-        tmp.write_bytes(data)
-    os.replace(tmp, path)
+    try:
+        if isinstance(data, str):
+            tmp.write_text(data, encoding="utf-8")
+        else:
+            tmp.write_bytes(data)
+        os.replace(tmp, path)
+    except UnicodeEncodeError as exc:  # an unpaired surrogate: nothing can be written, and nothing stays behind
+        tmp.unlink(missing_ok=True)
+        raise ValueError(
+            "Der Text enthält ein ungültiges Zeichen (einzelnes Surrogat) und kann nicht gespeichert werden."
+        ) from exc
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 MAX_BACKUPS = 5
@@ -227,3 +268,101 @@ def backup_file(path: Path, move: bool) -> None:
             shutil.copy2(path, target)
     except OSError:
         pass
+
+
+# bidi controls and zero-width characters that hide what a text says; ZWJ and ZWNJ stay (real scripts need them)
+HIDING = {
+    chr(c) for c in (0x061C, 0x200B, 0x200E, 0x200F, 0x2060, 0xFEFF, *range(0x202A, 0x202F), *range(0x2066, 0x206A))
+}
+
+
+def _written_out(char: str) -> str:
+    category = unicodedata.category(char)
+    if char in ("\n", "\r", "\t"):
+        return {"\n": "\\n", "\r": "\\r", "\t": "\\t"}[char]
+    if category in ("Cc", "Cs", "Zl", "Zp") or char in HIDING or category == "Cf":
+        return f"\\u{ord(char):04x}" if ord(char) < 0x10000 else f"\\U{ord(char):08x}"
+    return char
+
+
+def display_text(text: str, limit: int | None = None) -> str:
+    """``text`` with control, bidi and zero-width characters written out (``\\u202e``), cut at ``limit``.
+
+    ``limit`` counts the characters of the result and a written-out character is never cut in the middle.
+    """
+    out: list[str] = []
+    used = 0
+    for char in text:
+        piece = _written_out(char)
+        if limit is not None and used + len(piece) > limit:
+            return "".join(out) + "…"
+        out.append(piece)
+        used += len(piece)
+    return "".join(out)
+
+
+_LONE_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def has_lone_surrogate(value: Any) -> bool:
+    """True if a string anywhere in a parsed JSON value (keys included) holds an unpaired surrogate.
+
+    ``\\ud83d\\ude00`` in JSON becomes one character; a lone ``\\ud800`` stays a surrogate, which no program can
+    type or put on the clipboard.
+    """
+    todo = [value]
+    while todo:
+        item = todo.pop()
+        if isinstance(item, str):
+            if _LONE_SURROGATE.search(item):
+                return True
+        elif isinstance(item, dict):
+            todo.extend(item.keys())
+            todo.extend(item.values())
+        elif isinstance(item, (list, tuple)):
+            todo.extend(item)
+    return False
+
+
+SCRATCH_PREFIX = "mourse-backup-"
+SCRATCH_MARKER = ".mourse-decoder-scratch"  # written into every scratch folder: only these are ours to remove
+ORPHAN_AGE_SECONDS = 24 * 3600
+_REPARSE_POINT = 0x400  # FILE_ATTRIBUTE_REPARSE_POINT: a junction or a symbolic link on Windows
+
+
+def _is_link(path: Path) -> bool:
+    """A symbolic link or, on Windows, a junction or any other reparse point (``Path.is_symlink`` misses those)."""
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return True
+    return stat.S_ISLNK(info.st_mode) or bool(getattr(info, "st_file_attributes", 0) & _REPARSE_POINT)
+
+
+def clean_orphaned_scratch(max_age_seconds: float = ORPHAN_AGE_SECONDS, parent: Path | None = None) -> list[Path]:
+    """Remove scratch folders that an earlier run left behind (a process that was killed mid-check).
+
+    They hold copies of settings.json, function_keys.json and alphabets. Only folders of the temp folder that
+    carry this program's prefix AND its marker file are touched (a folder the user named like that, an unpacked
+    export for example, has no marker), never a link or junction, and only when they were last changed more than
+    ``max_age_seconds`` ago, so the folder of a program that is running right now stays. Returns what was removed.
+    """
+    removed: list[Path] = []
+    try:
+        folder = Path(parent) if parent is not None else Path(tempfile.gettempdir())
+        candidates = [p for p in folder.iterdir() if p.name.startswith(SCRATCH_PREFIX)]
+    except OSError:
+        return removed
+    cutoff = time.time() - max_age_seconds
+    for path in candidates:
+        try:
+            if _is_link(path) or not path.is_dir() or path.stat().st_mtime > cutoff:
+                continue
+            marker = path / SCRATCH_MARKER
+            if _is_link(marker) or not marker.is_file():
+                continue
+            shutil.rmtree(path)
+            removed.append(path)
+        except OSError:
+            continue  # in use or not ours to delete: leave it
+    return removed

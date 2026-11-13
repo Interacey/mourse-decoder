@@ -9,9 +9,12 @@ a language, drop in another JSON file.
 
 from __future__ import annotations
 
+import functools
 import json
 import string
 from pathlib import Path
+
+from . import jsontext
 
 BUILTIN_LOCALE_DIR = Path(__file__).with_name("locales")
 DEFAULT_LANGUAGE = "en"
@@ -24,12 +27,16 @@ _user_dir: Path | None = None
 
 def _read(path: Path) -> tuple[str, str, dict[str, str]] | None:
     try:
-        data = json.loads(path.read_text(encoding="utf-8-sig"))
+        text = path.read_text(encoding="utf-8-sig")
+        jsontext.check_depth(text)  # the same fixed limit everywhere: one file cannot pass here and fail elsewhere
+        data = json.loads(text)
+        if jsontext.has_lone_surrogate(data):
+            return None
         strings = data["strings"]
         if not isinstance(strings, dict):
             return None
         return str(data["id"]), str(data.get("name") or data["id"]), {str(k): str(v) for k, v in strings.items()}
-    except (OSError, ValueError, KeyError, TypeError):
+    except (OSError, ValueError, KeyError, TypeError, RecursionError):
         return None
 
 
@@ -61,6 +68,30 @@ def set_language(code: str, user_dir: Path | None = None) -> str:
     _current = code if code in loaded else DEFAULT_LANGUAGE
     _strings = loaded.get(_current, _fallback)
     return _current
+
+
+@functools.lru_cache(maxsize=16)
+def builtin_strings(code: str) -> dict[str, str]:
+    """The strings of a language that ships with the program (never a file of the user's folder)."""
+    try:
+        return json.loads((BUILTIN_LOCALE_DIR / f"{code}.json").read_text(encoding="utf-8"))["strings"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return {}
+
+
+def tr_trusted(key: str, **values: object) -> str:
+    """Like ``tr``, but only from the built-in language files (English where the language is not built in).
+
+    For texts that a decision rests on (the labels of buttons, the warnings of an import): a language file that
+    came with a backup could swap the meaning of "Yes" and "No" or drop a warning.
+    """
+    text = builtin_strings(current_language()).get(key) or builtin_strings(DEFAULT_LANGUAGE).get(key) or key
+    if not values:
+        return text
+    try:
+        return _formatter.vformat(text, (), values)
+    except (KeyError, IndexError, ValueError):
+        return text
 
 
 def current_language() -> str:

@@ -4,7 +4,15 @@
 //!
 //! * `MorseEngine`: starts/stops the worker and the global hook and calls a Python
 //!   callback `callback(kind: str, payload: str)` for every event, where `kind` is
-//!   one of "symbol", "letter", "word_gap".
+//!   one of "symbol", "letter", "word_gap". While `set_measuring(True)` is in force (the
+//!   calibration page; off by default, off again after `stop()`) there are two more:
+//!   "press_ms" (payload: whole milliseconds the key was held, sent right before the
+//!   "symbol" of that release) and "gap_ms" (payload: whole milliseconds of silence since
+//!   the last release, sent when a new press arrives; none for the first press, after a
+//!   `reset()`, or for the repeats of a held key). Without measuring the stream has only
+//!   the first three kinds, exactly as before. Every `set_measuring()` call on a running
+//!   engine is answered by one "measuring" event (payload "1" or "0") at the exact place of
+//!   the switch in the stream: letters before it were keyed under the old setting.
 //! * `inject_text(text, char_delay_ms=None)`, `inject_backspaces(n)`: native text injection.
 //! * `begin_capture()`, `poll_capture()`, `cancel_capture()`: read the next key or
 //!   mouse button for the key binding.
@@ -34,6 +42,8 @@ struct EngineState {
     keys: MorseKeys,
     handle: Option<EngineHandle>,
     hooked: bool,
+    /// Press and gap events on or off; given to the worker at start and on every change.
+    measuring: bool,
 }
 
 impl EngineState {
@@ -66,6 +76,10 @@ fn to_python_event(output: TimerOutput) -> (&'static str, String) {
         TimerOutput::Symbol(s) => ("symbol", s.as_char().to_string()),
         TimerOutput::Letter(seq) => ("letter", seq),
         TimerOutput::WordGap => ("word_gap", String::new()),
+        // whole milliseconds, as text like the other payloads
+        TimerOutput::Press(d) => ("press_ms", d.as_millis().to_string()),
+        TimerOutput::Gap(d) => ("gap_ms", d.as_millis().to_string()),
+        TimerOutput::Measuring(on) => ("measuring", u8::from(on).to_string()),
     }
 }
 
@@ -88,6 +102,7 @@ impl PyMorseEngine {
                 },
                 handle: None,
                 hooked: false,
+                measuring: false,
             }),
         })
     }
@@ -117,9 +132,10 @@ impl PyMorseEngine {
             });
         };
 
-        let handle = EngineHandle::spawn(state.config, sink).map_err(|e| {
-            PyRuntimeError::new_err(format!("Worker-Thread konnte nicht starten: {e}"))
-        })?;
+        let handle =
+            EngineHandle::spawn_with(state.config, state.measuring, sink).map_err(|e| {
+                PyRuntimeError::new_err(format!("Worker-Thread konnte nicht starten: {e}"))
+            })?;
 
         #[cfg(feature = "native-io")]
         if use_hook {
@@ -148,6 +164,7 @@ impl PyMorseEngine {
                 crate::hooks::clear_route();
             }
             state.hooked = false;
+            state.measuring = false; // a new start never measures unless asked again
             state.handle.take()
         };
         // critical: join the worker WITHOUT holding the GIL. The worker may be waiting in
@@ -171,6 +188,21 @@ impl PyMorseEngine {
             handle.send(WorkerMessage::Configure(config));
         }
         Ok(())
+    }
+
+    /// Press and gap events ("press_ms", "gap_ms") on or off; off by default and after `stop()`.
+    /// Takes effect between the key events sent before and after the call, also while running.
+    fn set_measuring(&self, on: bool) {
+        let mut state = lock_or_recover(&self.state);
+        state.measuring = on;
+        if let Some(handle) = &state.handle {
+            handle.send(WorkerMessage::SetMeasuring(on, Instant::now()));
+        }
+    }
+
+    #[getter]
+    fn measuring(&self) -> bool {
+        lock_or_recover(&self.state).measuring
     }
 
     /// Discards a half-keyed sequence (e.g. on an alphabet change).

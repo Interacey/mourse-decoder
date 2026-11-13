@@ -7,6 +7,7 @@ them. A change always creates a new object that is swapped in atomically.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import json
 import logging
 import os
@@ -18,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import jsontext
+from . import _native, jsontext
 
 log = logging.getLogger(__name__)
 
@@ -34,12 +35,28 @@ THEME_MODES: tuple[str, ...] = ("system", "light", "dark")
 
 # Any key (Windows virtual-key code) and extra mouse buttons from Mouse4 on.
 # Keep in sync with TriggerKey::from_str in src/trigger.rs.
-# [0-9] and \Z instead of \d and $: Unicode digits and a trailing newline must not pass (Rust rejects them)
-_VK_PATTERN = re.compile(r"^VK([0-9]{1,3})\Z", re.IGNORECASE)
-_MOUSE_PATTERN = re.compile(r"^Mouse([0-9]{1,2})\Z", re.IGNORECASE)
+# [0-9] and \Z instead of \d and $: Unicode digits and a trailing newline must not pass (Rust rejects them).
+# re.ASCII: without it IGNORECASE also matches the Kelvin sign (U+212A) for "k" and the long s (U+017F) for "s",
+# which Rust (eq_ignore_ascii_case) does not.
+_FLAGS = re.IGNORECASE | re.ASCII
+_VK_PATTERN = re.compile(r"^VK([0-9]{1,3})\Z", _FLAGS)
+_MOUSE_PATTERN = re.compile(r"^Mouse([0-9]{1,2})\Z", _FLAGS)
 # F13..F24 are keys of their own (virtual-key codes 124..135); VK124 is the same key as F13
-_EXTRA_F_PATTERN = re.compile(r"^F(1[3-9]|2[0-4])\Z", re.IGNORECASE)
+_EXTRA_F_PATTERN = re.compile(r"^F(1[3-9]|2[0-4])\Z", _FLAGS)
 _F13_VK = 124
+# What Python strips and lowercases in a binding is ASCII only. str.strip() also removes U+001C..U+001F and
+# str.lower() maps U+212A to "k", Rust's trim() and eq_ignore_ascii_case do neither: a spec that only Python
+# accepts would pass the settings check and then stop the program at every start (ValueError of the engine).
+_ASCII_BLANKS = " \t\n\r\x0b\x0c"
+_ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+
+
+def _lower(text: str) -> str:
+    return text.translate(_ASCII_LOWER)
+
+
+def _strip(text: str) -> str:
+    return text.strip(_ASCII_BLANKS)
 
 
 def is_valid_trigger(name: object) -> bool:
@@ -66,10 +83,27 @@ _MODIFIERS = {
 
 def is_valid_binding(spec: object) -> bool:
     """A trigger, optionally after modifiers joined with "+", e.g. "F8" or "CapsLock+VK81"."""
-    if not isinstance(spec, str) or not spec.strip():
+    if not isinstance(spec, str) or not _strip(spec):
         return False
-    *modifiers, key = (part.strip() for part in spec.split("+"))
-    return is_valid_trigger(key) and all(m.lower() in _MODIFIERS for m in modifiers)
+    *modifiers, key = (_strip(part) for part in spec.split("+"))
+    return is_valid_trigger(key) and all(_lower(m) in _MODIFIERS for m in modifiers)
+
+
+@functools.lru_cache(maxsize=512)
+def native_binding_error(spec: str) -> str | None:
+    """Why the Rust engine refuses ``spec`` as a key or shortcut, None if it takes it (or there is no Rust module).
+
+    The engine's constructor only parses (no hook, no thread, nothing global), and it parses with the same
+    ``KeyBinding`` the shortcut setters use. Asking it makes the settings check as strict as the code that has
+    to live with the value: a difference between the two parsers cannot become a crash at the next start.
+    """
+    if not _native.NATIVE_AVAILABLE:
+        return None
+    try:
+        _native.load_native().MorseEngine(trigger=spec)
+    except ValueError as exc:
+        return str(exc)
+    return None
 
 
 def is_valid_shortcut(spec: object) -> bool:
@@ -89,7 +123,7 @@ _TRIGGER_BY_LOWER = {name.lower(): name for name in TRIGGER_NAMES}
 
 def _canonical_key(key: str) -> str:
     """Canonical spelling of a trigger name: ``f8`` -> ``F8``, ``vk124`` -> ``F13``, ``mouse5`` -> ``Mouse5``."""
-    lower = key.lower()
+    lower = _lower(key)
     if lower in _TRIGGER_BY_LOWER:
         return _TRIGGER_BY_LOWER[lower]
     if match := _VK_PATTERN.match(key):
@@ -108,13 +142,13 @@ def normalize_binding(spec: str) -> str:
     Modifiers in the order Ctrl, Alt, Shift, Win, CapsLock; an invalid spec comes back stripped
     but otherwise unchanged.
     """
-    spec = spec.strip()
+    spec = _strip(spec)
     if not is_valid_binding(spec):
         return spec
-    *modifiers, key = (part.strip().lower() for part in spec.split("+"))
+    *modifiers, key = (_lower(_strip(part)) for part in spec.split("+"))
     wanted = {_MODIFIER_ALIASES.get(m, m) for m in modifiers}
     names = [_MODIFIER_NAMES[m] for m in _MODIFIER_ORDER if m in wanted]
-    return "+".join([*names, _canonical_key(key.strip())])
+    return "+".join([*names, _canonical_key(key)])
 
 
 def same_binding(first: str, second: str) -> bool:
@@ -147,7 +181,7 @@ def _is_esc(spec: str) -> bool:
 
 
 def _loose(spec: str) -> tuple[frozenset[str], str]:
-    *modifiers, key = (part.strip().lower() for part in spec.split("+"))
+    *modifiers, key = (_lower(_strip(part)) for part in spec.split("+"))
     return frozenset(modifiers), key
 
 
@@ -181,6 +215,11 @@ def typing_delay_error(value: object) -> str | None:
     if not low <= value <= high:
         return f"Die Tastenanschlag-Verzögerung muss zwischen {low} und {high} ms liegen."
     return None
+
+
+def is_valid_id(value: object) -> bool:
+    """True for an alphabet or smiley set id: the file name pattern, so an id can never be a path (``//host/x``)."""
+    return isinstance(value, str) and bool(_ID_PATTERN.match(value))
 
 
 @dataclass(frozen=True)
@@ -229,8 +268,12 @@ class Settings:
         errors.extend(self._key_errors())
         if not isinstance(self.alphabet, str) or not self.alphabet:
             errors.append("Es muss ein Alphabet gewählt sein.")
+        elif not is_valid_id(self.alphabet):
+            errors.append(f"Ungültige Alphabet-ID '{self.alphabet}' (nur a-z, 0-9, '-' und '_').")
         if not isinstance(self.smileys, str):
             errors.append("'smileys' muss ein Text sein (ID des Smiley-Sets oder leer).")
+        elif self.smileys and not is_valid_id(self.smileys):
+            errors.append(f"Ungültige Smiley-Set-ID '{self.smileys}' (nur a-z, 0-9, '-' und '_').")
         if not isinstance(self.enabled, bool):
             errors.append("'enabled' muss true oder false sein.")
         if not isinstance(self.language, str) or not self.language:
@@ -246,6 +289,8 @@ class Settings:
         for spec in (self.block_shortcut, self.cycle_shortcut, self.undo_shortcut):
             if not is_valid_shortcut(spec):
                 errors.append(f"Ungültiges Tastenkürzel '{spec}'.")
+            elif spec and native_binding_error(spec):  # type: ignore[arg-type]
+                errors.append(f"Tastenkürzel '{spec}' wird von der Tastatur-Bibliothek abgelehnt.")
         if self.block_shortcut and self.cycle_shortcut and same_binding(self.block_shortcut, self.cycle_shortcut):
             errors.append("Die beiden Kürzel (Ein/Aus und Umschalten) müssen verschieden sein.")
         if self.undo_shortcut and any(
@@ -267,10 +312,14 @@ class Settings:
     def _key_errors(self) -> list[str]:
         if not is_valid_binding(self.trigger):
             return [f"Unbekannter Taster '{self.trigger}'."]
+        if native_binding_error(self.trigger):
+            return [f"Taster '{self.trigger}' wird von der Tastatur-Bibliothek abgelehnt."]
         if not isinstance(self.separate_dash_key, bool):
             return ["'separate_dash_key' muss true oder false sein."]
         if not is_valid_binding(self.dash_trigger):
             return [f"Unbekannte Strich-Taste '{self.dash_trigger}'."]
+        if self.separate_dash_key and native_binding_error(self.dash_trigger):  # only this one goes to the engine
+            return [f"Strich-Taste '{self.dash_trigger}' wird von der Tastatur-Bibliothek abgelehnt."]
         if _is_esc(self.trigger) or (self.separate_dash_key and _is_esc(self.dash_trigger)):
             return ["Esc bricht die Eingabe ab und kann keine Morse-Taste sein."]
         if self.separate_dash_key and same_binding(self.trigger, self.dash_trigger):
@@ -364,12 +413,58 @@ def default_config_dir() -> Path:
     return base / "mourse-decoder"
 
 
+SHOWN_ID_LENGTH = 16  # the notice must stay under the 256 UTF-16 units of a tray balloon, in every language
+
+
+def _shown(value: str) -> str:
+    """An id from a file for a notice: control and direction-changing characters written out, cut short."""
+    return jsontext.display_text(value, SHOWN_ID_LENGTH)
+
+
+def _canonical_keys(settings: Settings) -> Settings:
+    """Trigger and shortcuts in the spelling the Rust hook prints (``strg+shift+vk124`` -> ``Ctrl+Shift+F13``).
+
+    Only values that are valid are touched; an invalid one stays as it is and fails the check with its own text.
+    """
+    changes = {}
+    for name in ("trigger", "dash_trigger", "block_shortcut", "cycle_shortcut", "undo_shortcut"):
+        value = getattr(settings, name)
+        if isinstance(value, str) and value and is_valid_binding(value):
+            canonical = normalize_binding(value)
+            if canonical != value:
+                changes[name] = canonical
+    return settings.replace(**changes) if changes else settings
+
+
+def _without_bad_ids(settings: Settings) -> tuple[Settings, list[tuple[str, dict[str, str]]]]:
+    """An alphabet or smiley id that is not a valid id (a hand-edit, ``Latin``, ``//host/share/x``) went to the
+    loaders as a file name and could never be loaded. The field goes back to its default and the rest of the
+    file is kept, instead of the whole file being thrown away.
+
+    Also returns what to tell the user: (language key, values) per reset field, see ``SettingsStore.warnings``.
+    """
+    changes: dict[str, str] = {}
+    notes: list[tuple[str, dict[str, str]]] = []
+    if isinstance(settings.alphabet, str) and settings.alphabet and not is_valid_id(settings.alphabet):
+        changes["alphabet"] = Settings.alphabet
+        notes.append(("startup.bad_alphabet_id", {"value": _shown(settings.alphabet), "default": Settings.alphabet}))
+    if isinstance(settings.smileys, str) and settings.smileys and not is_valid_id(settings.smileys):
+        changes["smileys"] = Settings.smileys
+        notes.append(("startup.bad_smiley_id", {"value": _shown(settings.smileys)}))
+    if changes:
+        log.warning("Ungültige ID in den Einstellungen, Standardwert verwendet: %s", ", ".join(changes))
+        return settings.replace(**changes), notes
+    return settings, notes
+
+
 class SettingsStore:
     FILE_NAME = "settings.json"
 
     def __init__(self, directory: Path | None = None) -> None:
         self.directory = Path(directory) if directory else default_config_dir()
         self.path = self.directory / self.FILE_NAME
+        # what the last ``load`` changed on its own and the user has to be told: (language key, values)
+        self.warnings: list[tuple[str, dict[str, str]]] = []
         if directory is None:
             self._migrate_legacy_directory()
 
@@ -388,13 +483,15 @@ class SettingsStore:
         A broken file is moved to settings.json.bak rather than deleted, so the
         user can still recover values by hand.
         """
+        self.warnings = []
         if not self.path.is_file():
             return Settings()
         try:
             data = jsontext.loads(self.path.read_text(encoding="utf-8-sig"), dict)
             if not isinstance(data, dict):
                 raise ValueError("Wurzelelement ist kein Objekt")
-            settings = Settings.from_dict(data)
+            settings, self.warnings = _without_bad_ids(Settings.from_dict(data))
+            settings = _canonical_keys(settings)
             errors = settings.validate()
             if errors:
                 # files saved before the key/shortcut clash check: keep the rest, drop the clashing shortcut
@@ -405,6 +502,8 @@ class SettingsStore:
                 settings = relaxed
             return settings
         except (OSError, ValueError, TypeError) as exc:
+            # the file is thrown away: what it said about its ids no longer matters, but the user is told
+            self.warnings = [("startup.settings_discarded", {"reason": jsontext.display_text(str(exc), 40)})]
             log.warning("Einstellungen ungültig (%s) – verwende Standardwerte", exc)
             self._backup_broken_file()
             return Settings()

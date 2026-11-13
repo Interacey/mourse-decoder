@@ -84,10 +84,12 @@ def _read_json(path: Path) -> dict[str, Any]:
         data = jsontext.loads(path.read_text(encoding="utf-8-sig"), _reject_duplicate_keys)
     except AlphabetError as exc:
         raise AlphabetError(f"{path.name}: {exc}") from None
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
         raise AlphabetError(f"{path.name}: nicht lesbar ({exc})") from exc
     if not isinstance(data, dict):
         raise AlphabetError(f"{path.name}: Wurzelelement muss ein Objekt sein")
+    if jsontext.has_lone_surrogate(data):
+        raise AlphabetError(f"{path.name}: enthält ein einzelnes Surrogat-Zeichen (kein gültiger Unicode-Text)")
     return data
 
 
@@ -238,6 +240,17 @@ class DictionaryManager:
     @property
     def smiley_set_id(self) -> str:
         return self._smiley_id
+
+    def smiley_state(self) -> tuple[str, Mapping[str, str]]:
+        """What is loaded now (id and codes), to hand back to ``restore_smiley_state`` if a change fails."""
+        with self._lock:
+            return self._smiley_id, self._smileys
+
+    def restore_smiley_state(self, state: tuple[str, Mapping[str, str]]) -> None:
+        """Put a ``smiley_state`` back as it was. Reads no file, so it cannot fail."""
+        with self._lock:
+            self._smiley_id, self._smileys = state
+            self._active = None
 
     def _search_dirs(self) -> list[Path]:
         # built-in first, so user files can't shadow them

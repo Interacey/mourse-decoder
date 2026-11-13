@@ -99,14 +99,14 @@ def restore(saved: list[tuple[int, bytes]]) -> None:
 def set_text(text: str) -> None:
     with _Open():
         _user32.EmptyClipboard()
-        _put(CF_UNICODETEXT, (text + "\0").encode("utf-16-le"))
+        _put(CF_UNICODETEXT, (text + "\0").encode("utf-16-le", "surrogatepass"))  # a lone surrogate must not raise
 
 
 def set_files(paths: list[str]) -> None:
     """Put files and folders on the clipboard as if copied in Explorer (Ctrl+V pastes them)."""
     # DROPFILES: offset of the list, point x/y, non-client flag, wide-characters flag
     header = struct.pack("<Iiiii", 20, 0, 0, 0, 1)
-    listing = ("\0".join(paths) + "\0\0").encode("utf-16-le")
+    listing = ("\0".join(paths) + "\0\0").encode("utf-16-le", "surrogatepass")  # a Windows name may hold one
     with _Open():
         _user32.EmptyClipboard()
         _put(CF_HDROP, header + listing)

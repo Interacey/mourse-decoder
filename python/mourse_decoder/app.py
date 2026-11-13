@@ -14,6 +14,7 @@ from .controller import MorseController, NativeInjector
 from .dictionary import AlphabetError, DictionaryManager
 from .function_keys import FunctionKeysStore
 from .i18n import set_language, tr
+from .jsontext import backup_file, clean_orphaned_scratch, display_text
 from .settings import Settings, SettingsStore
 from .telecode import TelecodeError
 
@@ -50,6 +51,49 @@ def build_controller(engine, injector, dictionaries, settings: Settings, listene
         fallback = settings.replace(alphabet=FALLBACK_ALPHABET)
         warning = tr("startup.alphabet_fallback", id=settings.alphabet, msg=exc)
         return MorseController(engine, injector, dictionaries, fallback, listener=listener), [warning]
+
+
+def make_engine(native, settings: Settings, store: SettingsStore | None = None):
+    """The Rust engine for ``settings``; if it refuses the keys, the default keys are used and the user is told.
+
+    Returns (engine, settings, warnings). ``Settings.validate`` asks the same parser before a file is accepted,
+    so this is the last net: whatever a settings file holds, the program starts. The file is copied to
+    settings.json.bak first (the user can read what was there), nothing else is changed on disk.
+    """
+    try:
+        return native.MorseEngine(trigger=settings.trigger), settings, []
+    except ValueError as exc:
+        log.warning("Taster '%s' vom Tastaturmodul abgelehnt: %s", display_text(settings.trigger), exc)
+        if store is not None:
+            backup_file(store.path, move=False)
+        default = Settings()
+        fallback = settings.replace(
+            trigger=default.trigger, dash_trigger=default.dash_trigger, separate_dash_key=False,
+            block_shortcut="", cycle_shortcut="", undo_shortcut="",
+        )
+        warning = tr("startup.keys_fallback", reason=display_text(str(exc), 40))
+        return native.MorseEngine(trigger=fallback.trigger), fallback, [warning]
+
+
+def deliver_warnings(show, warnings) -> None:
+    """Show each startup warning with ``show``; a warning that cannot be shown never stops the start.
+
+    The text of a warning can come from a file (a trigger in function_keys.json, an alphabet name): whatever it
+    holds, the program starts, the others are shown and the failure goes to the log.
+    """
+    for warning in warnings:
+        try:
+            show(warning)
+        except Exception:  # noqa: BLE001
+            log.exception("Startwarnung konnte nicht angezeigt werden")
+
+
+def settings_warnings(store: SettingsStore) -> list[str]:
+    """What ``store.load`` changed in the settings on its own (an invalid id), in the program's language.
+
+    The file is not touched here; the next save writes the replaced value, so this message comes first.
+    """
+    return [tr(key, **values) for key, values in store.warnings]
 
 
 def acquire_single_instance(name: str = MUTEX_NAME) -> bool:
@@ -119,6 +163,8 @@ def _start_function_keys(controller: MorseController, directory, injector) -> li
 
 class _PrintInjector:
     """For --dry-run: show instead of typing."""
+
+    dry_run = True  # the controller does not read the clipboard for {Scrape} and types a placeholder
 
     def inject_text(self, text: str) -> None:
         print(f"[tippe {text!r}]", flush=True)
@@ -226,21 +272,32 @@ def main(argv: list[str] | None = None) -> int:
 
     store = SettingsStore()
     settings = store.load()
+    try:  # check folders of a backup check that a killed process left behind (copies of the settings and macros)
+        clean_orphaned_scratch()
+    except Exception:  # noqa: BLE001 - housekeeping must never stop the program
+        log.exception("Temporäre Backup-Ordner nicht aufgeräumt")
     set_language(settings.language, store.directory / "languages")  # startup warnings use it
+    notices = settings_warnings(store)
     dictionaries = DictionaryManager(
         telecode_db=store.directory / "telecode.sqlite",
         user_directory=store.directory / "alphabets",
         user_smiley_directory=store.directory / "smileys",
     )
-    engine = native.MorseEngine(trigger=settings.trigger)
+    engine, settings, key_warnings = make_engine(native, settings, store)
+    notices += key_warnings
     injector = _PrintInjector() if args.dry_run else NativeInjector(native)
 
     if args.headless:
         controller, startup_warnings = build_controller(engine, injector, dictionaries, settings, _ConsoleListener())
         controller.start()
-        for warning in startup_warnings + _start_function_keys(controller, store.directory, injector):
-            print(f"Warnung: {warning}", file=sys.stderr, flush=True)
-        print(f"Morse-Decoder läuft (Taster: {settings.trigger}, Alphabet: {settings.alphabet}). Strg+C beendet.")
+        deliver_warnings(
+            lambda warning: print(f"Warnung: {warning}", file=sys.stderr, flush=True),
+            notices + startup_warnings + _start_function_keys(controller, store.directory, injector),
+        )
+        print(
+            f"Morse-Decoder läuft (Taster: {display_text(settings.trigger)}, "
+            f"Alphabet: {display_text(settings.alphabet)}). Strg+C beendet."
+        )
         try:
             while True:
                 time.sleep(0.1)
@@ -261,8 +318,9 @@ def main(argv: list[str] | None = None) -> int:
     tray = TrayApp(controller, dictionaries, store, start_hidden=args.minimized, hook_error=native.hook_error)
     controller.set_listener(tray)  # breaks the tray <-> controller cycle
     controller.start()
-    for warning in startup_warnings + _start_function_keys(controller, store.directory, injector):
-        tray.on_error(warning)
+    deliver_warnings(
+        tray.on_error, notices + startup_warnings + _start_function_keys(controller, store.directory, injector)
+    )
     show_update_result(store.directory)
     try:
         tray.run()

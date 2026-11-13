@@ -14,6 +14,7 @@ import os
 import re
 import threading
 import time
+import unicodedata
 from collections import deque
 from collections.abc import Callable
 from typing import NamedTuple, Protocol
@@ -70,6 +71,8 @@ class EngineLike(Protocol):
     def stop(self) -> None: ...
     def configure(self, dot_threshold_ms: int, letter_gap_ms: int, word_gap_ms: int = 0) -> None: ...
     def reset(self) -> None: ...
+    def set_measuring(self, on: bool) -> None:
+        """Engine events "press_ms" / "gap_ms" on or off (off by default)."""
     def set_function_keys(self, entries: list[tuple[int, str, bool]]) -> None:
         """Install (slot, trigger, swallow) entries; ValueError if one is invalid or clashes."""
     def clear_function_keys(self) -> None: ...
@@ -108,6 +111,14 @@ class ControllerListener(Protocol):
     def on_symbol(self, symbol: str) -> None: ...
     def on_letter(self, sequence: str, text: str | None) -> None: ...
     def on_error(self, message: str) -> None: ...
+
+    # optional, only called while ``calibrating``: ``kind`` is "press_ms" (how long the key was held) or
+    # "gap_ms" (silence before a press), ``ms`` the whole milliseconds the engine measured
+    def on_timing(self, kind: str, ms: int) -> None: ...
+
+    # optional: the controller ended the measuring by itself (``reason`` "stopped" or "timeout"),
+    # the page has to drop its "measuring" state
+    def on_calibration_ended(self, reason: str) -> None: ...
 
 
 class NativeInjector:
@@ -204,6 +215,8 @@ class MorseController:
     TYPE_CHUNK = 100  # characters typed between two looks at the on/off switch (about 2 s)
     ERASE_CHUNK = 2000  # Backspaces sent between two looks at the on/off switch and Esc
     MODIFIER_TIMEOUT_S = 3.0  # a function key waits this long for Ctrl/Alt/Shift/Win to be let go
+    # measuring ends by itself after this long, so letters can never stay muted because a page forgot to stop
+    CALIBRATION_MAX_S = 600.0
 
     def __init__(
         self,
@@ -215,7 +228,9 @@ class MorseController:
         decoder_factory: Callable[[DictionaryManager, str], Decoder] = create_decoder,
         use_hook: bool = True,
         scroller_factory: Callable[..., Scroller] = Scroller,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
+        self._clock = clock
         self._engine = engine
         self._injector = injector
         self._dictionaries = dictionaries
@@ -224,6 +239,13 @@ class MorseController:
         self._use_hook = use_hook
         self._lock = threading.RLock()
         self._running = False
+        self._calibrating = False
+        self._smiley_warned: set[str] = set()
+        # letters and word gaps are muted from the engine's "measuring" marker 1 to the marker 0, not from
+        # the moment the flag changes: the marker sits in the event stream where the engine switched, so
+        # a letter keyed under one setting is judged under that setting
+        self._muted = False
+        self._calibration_started = 0.0
         self._stopping = False  # set by stop() so a running macro ends before the engine is joined
         self._cycle_seen = 0
         self._undo_seen = 0
@@ -250,7 +272,7 @@ class MorseController:
         try:
             dictionaries.set_smileys(settings.smileys)
         except ValueError as exc:  # set deleted or broken: start without smileys instead of crashing
-            log.warning("Smiley-Set '%s' nicht ladbar (%s) – Smileys aus", settings.smileys, exc)
+            self._warn_smileys(settings.smileys, exc)
         # build the decoder now so a bad alphabet fails at startup, not on the first letter
         self._decoder: Decoder = decoder_factory(dictionaries, settings.alphabet)
         # one entry per character so ``erase`` can pop entries 1:1; maxlen caps memory
@@ -267,11 +289,63 @@ class MorseController:
     def set_listener(self, listener: ControllerListener | None) -> None:
         self._listener = listener
 
+    @property
+    def calibrating(self) -> bool:
+        """True while the calibration page measures: letters and word gaps are not typed then."""
+        return self._calibrating
+
+    def set_calibrating(self, on: bool) -> bool:
+        """Switch measuring on or off without touching ``Settings.enabled``; returns the state afterwards.
+
+        Measuring needs a running controller (False otherwise). It also ends by itself: ``stop()``, a
+        listener that was told ``on_calibration_ended``, or ``CALIBRATION_MAX_S`` after the start.
+        The engine worker resets itself in the same step as the switch (one message, so no queued key
+        event can slip in between), and the decoder is reset when the marker arrives:
+
+        * on: a letter whose pause ran out before the switch is typed, a half-keyed one is dropped;
+        * off: every letter of the measuring phase is dropped, also one that is still on its way to
+          ``_handle_letter`` when the flag changes, and a letter started while measuring is dropped, otherwise
+          the practice presses would be typed as one.
+
+        The muting follows the engine's "measuring" marker, see ``_muted``; without a running engine
+        (no marker will come) it ends at once.
+        """
+        with self._lock:
+            if on == self._calibrating:
+                return on
+            if on and not self._running:
+                return False
+            self._calibrating = on
+            self._calibration_started = self._clock()
+            self._engine.set_measuring(on)
+            if not self._running and not on:
+                self._muted = False
+            return on
+
+    def check_calibration_timeout(self) -> bool:
+        """End a measuring that lasts longer than ``CALIBRATION_MAX_S``; True if it did."""
+        with self._lock:
+            if not self._calibrating or self._clock() - self._calibration_started < self.CALIBRATION_MAX_S:
+                return False
+        self._end_calibrating("timeout")
+        return True
+
+    def _end_calibrating(self, reason: str) -> None:
+        """Measuring off, then tell the page. Not under the lock: the listener may call back."""
+        with self._lock:
+            if not self._calibrating:
+                return
+            self._calibrating = False
+            self._engine.set_measuring(False)  # ``_muted`` ends with the marker, or in ``stop`` after the join
+        if getattr(self._listener, "on_calibration_ended", None) is not None:
+            self._notify("on_calibration_ended", reason)
+
     def start(self) -> None:
         with self._lock:
             if self._running:
                 return
             self._stopping = False
+            self._muted = False
             s = self._settings
             self._engine.configure(s.dot_threshold_ms, s.letter_gap_ms, s.word_gap_ms)
             self._apply_keys(s)
@@ -293,29 +367,54 @@ class MorseController:
                 return
             self._running = False
             self._stopping = True
+        self._end_calibrating("stopped")  # the page must not stay on "measuring" for a stopped engine
         self._scroller.stop()
         self._engine.block_input = False  # never leave the key blocked behind
         self._engine.clear_function_keys()
         self._engine.stop()
+        with self._lock:
+            self._muted = False  # only now: a letter of the measuring phase may still have been on its way
 
-    def apply_settings(self, new: Settings) -> None:
+    def apply_settings(self, new: Settings, lenient_smileys: bool = False) -> None:
+        """Apply ``new``; nothing changes if that fails.
+
+        ``lenient_smileys`` (an import loading settings.json, like the start of the program): a smiley set that
+        is not there is no reason to refuse the rest, the name stays in the settings and the set is loaded by
+        the next apply that finds it.
+        """
         errors = new.validate() or self._function_keys.clashes(new)
         if errors:
             raise ValueError("; ".join(errors))
         with self._lock:
             old = self._settings
-            if new.alphabet != old.alphabet or new.smileys != old.smileys:
+            smiley_state = self._dictionaries.smiley_state()  # what a failed change puts back, without reading a file
+            loaded = smiley_state[0]
+            changed = new.alphabet != old.alphabet or new.smileys != old.smileys
+            # the set the settings name may not have been loadable at the start (file missing, then imported):
+            # try again, and stay quiet if it still is not there
+            stale = not changed and new.smileys != loaded
+            if changed or stale:
                 # build the new decoder first, if that fails nothing changes
                 try:
-                    self._dictionaries.set_smileys(new.smileys)
+                    try:
+                        self._dictionaries.set_smileys(new.smileys)
+                    except ValueError as exc:  # SmileyError: file missing or broken
+                        # refused only if this change asks for the set; a name that is already in the settings must
+                        # not block an alphabet change (it did not at the start either: the smileys stay off)
+                        if stale or (new.smileys != old.smileys and not lenient_smileys):
+                            raise
+                        self._warn_smileys(new.smileys, exc)
+                        self._dictionaries.set_smileys("")
                     decoder = self._decoder_factory(self._dictionaries, new.alphabet)
                 except Exception:
-                    self._dictionaries.set_smileys(old.smileys)
-                    raise
-                replaced = self._decoder
-                self._decoder = decoder
-                self._close_decoder(replaced)
-                self._engine.reset()  # a half-keyed sequence belongs to the old alphabet
+                    self._dictionaries.restore_smiley_state(smiley_state)
+                    if not stale:
+                        raise
+                else:
+                    replaced = self._decoder
+                    self._decoder = decoder
+                    self._close_decoder(replaced)
+                    self._engine.reset()  # a half-keyed sequence belongs to the old alphabet
             timing_changed = (old.dot_threshold_ms, old.letter_gap_ms, old.word_gap_ms) != (
                 new.dot_threshold_ms,
                 new.letter_gap_ms,
@@ -326,25 +425,31 @@ class MorseController:
             # only on a real change: rebuilding the keys would forget a press in progress
             if (new.trigger, new.engine_dash_trigger) != (old.trigger, old.engine_dash_trigger):
                 self._apply_keys(new)
-            self._apply_blocking(new)
+            # a press of the on/off shortcut that the tray has not looked at yet stays pending (the poll applies it)
+            # unless this change sets the switch itself
+            pending = new.enabled == old.enabled and bool(self._engine.active) != old.enabled
+            self._apply_blocking(new, keep_active=pending)
             self._settings = new
 
     def _apply_keys(self, s: Settings) -> None:
         self._engine.trigger = s.trigger
         self._engine.dash_trigger = s.engine_dash_trigger
 
-    def _apply_blocking(self, s: Settings) -> None:
+    def _apply_blocking(self, s: Settings, keep_active: bool = False) -> None:
         self._engine.block_shortcut = s.block_shortcut
         self._engine.cycle_shortcut = s.cycle_shortcut
         self._engine.undo_shortcut = s.undo_shortcut
         self._engine.block_input = s.block_input
         # the engine only blocks while Morse input is on, so a paused app never eats the key
-        self._engine.active = s.enabled
+        if not keep_active:
+            self._engine.active = s.enabled
 
     def poll_active_toggle(self) -> Settings | None:
         """Settings after the shortcut toggled, else None.
 
-        The shortcut flips both switches together: Morse input and blocking of the normal input.
+        Only ``enabled`` changes, like with the tray menu and the settings switch. ``block_input`` stays the
+        saved setting: the engine blocks only while Morse input is on, so a pause never blocks and a resume
+        blocks exactly when the setting says so, whichever way it was switched.
         """
         with self._lock:
             s = self._settings
@@ -353,7 +458,7 @@ class MorseController:
             actual = bool(self._engine.active)
             if actual == s.enabled:
                 return None
-            return s.replace(enabled=actual, block_input=actual)
+            return s.replace(enabled=actual)
 
     def poll_cycle(self) -> int:
         """How often the cycle shortcut was pressed since the last call (0 while stopped)."""
@@ -536,12 +641,24 @@ class MorseController:
     def reload_alphabet(self) -> None:
         """Reload the active alphabet after its file changed."""
         with self._lock:
+            try:  # the active smiley set may be one of the files that changed
+                self._dictionaries.set_smileys(self._settings.smileys)
+            except ValueError as exc:  # SmileyError: a set that is not there (yet); the alphabet reload goes on
+                self._warn_smileys(self._settings.smileys, exc)
+            except Exception:  # noqa: BLE001 - keep the codes in memory, the alphabet reload goes on
+                log.exception("Smiley-Set konnte nicht neu geladen werden")
             self._dictionaries.invalidate()
             decoder = self._decoder_factory(self._dictionaries, self._settings.alphabet)  # raises: old decoder stays
             replaced = self._decoder
             self._decoder = decoder
             self._close_decoder(replaced)
             self._engine.reset()
+
+    def _warn_smileys(self, name: str, exc: Exception) -> None:
+        """A named smiley set that cannot be loaded: say so once per name, not at every reload."""
+        if name not in self._smiley_warned:
+            self._smiley_warned.add(name)
+            log.warning("Smiley-Set '%s' nicht ladbar (%s) – Smileys aus", name, exc)
 
     @staticmethod
     def _close_decoder(old) -> None:
@@ -557,12 +674,18 @@ class MorseController:
     def _on_engine_event(self, kind: str, payload: str) -> None:
         # an exception here wouldn't kill the worker, but the letter would vanish silently
         try:
+            self.check_calibration_timeout()
             if kind == "symbol":
                 self._notify("on_symbol", payload)
             elif kind == "letter":
                 self._handle_letter(payload)
             elif kind == "word_gap":
                 self._handle_word_gap()
+            elif kind == "measuring":
+                self._muted = payload == "1"
+                self._reset_decoder()  # a half-keyed combination (dakuten, digits) does not cross the switch
+            elif kind in ("press_ms", "gap_ms"):
+                self._handle_timing(kind, payload)
             else:
                 log.debug("Unbekanntes Engine-Ereignis %r", kind)
         except macros.MacroStopped:
@@ -571,9 +694,19 @@ class MorseController:
             log.exception("Fehler bei Engine-Ereignis %s", kind)
             self._notify("on_error", str(exc))
 
+    def _handle_timing(self, kind: str, payload: str) -> None:
+        if not self._calibrating or getattr(self._listener, "on_timing", None) is None:
+            return
+        try:
+            ms = int(payload)
+        except ValueError:
+            log.debug("Ungültige Zeitangabe %r", payload)
+            return
+        self._notify("on_timing", kind, ms)
+
     def _handle_letter(self, sequence: str) -> None:
         with self._lock:
-            if not self._settings.enabled:
+            if not self._settings.enabled or self._muted:
                 return  # engine keeps running, output is paused
             emission = self._decoder.decode(sequence)
         if emission is None:
@@ -584,7 +717,7 @@ class MorseController:
 
     def _handle_word_gap(self) -> None:
         with self._lock:
-            if not self._settings.enabled:
+            if not self._settings.enabled or self._muted:
                 return
             emission = self._decoder.word_gap()
         if emission is not None:
@@ -623,12 +756,20 @@ class MorseController:
         length of the previous output alone. Text that Esc cut short is not counted.
         """
         # typing takes a few ms, so do it outside the lock to not block apply_settings
-        steps = macros.parse(emission.text, self._injector.check_shortcut)  # first, so a broken macro changes nothing
+        if emission.plain:
+            # typed as it is: no braces, no commands; control characters would be typed as Enter or Tab
+            text = "".join(c for c in emission.text if unicodedata.category(c) != "Cc")
+            steps: list[macros.Step] = [("text", text)] if text else []
+        else:
+            # parsed first, so a broken macro changes nothing
+            steps = macros.parse(emission.text, self._injector.check_shortcut)
         self._check_paths(steps)
+        steps = self._resolve_scrapes(steps)  # a missing marker before any key press stops the macro before it types
         self._set_typing_delay(effective_typing_delay(self._settings.typing_delay_ms, typing_delay_ms))
         self._run_typed, self._run_touched = 0, False
         try:
             if emission.erase:
+                self._stop_if_switched_off()  # before the first key is sent, not after the backspaces
                 self._run_touched = True
                 self._injector.inject_backspaces(emission.erase)
                 for _ in range(min(emission.erase, len(self.history))):
@@ -656,6 +797,15 @@ class MorseController:
                     if not secret:
                         raise macros.MacroError("Die Zwischenablage enthält keinen Text – nichts getippt.")
                     self._type(secret, self._injector.type_text, always=True)
+                elif kind == "scraped":
+                    # typed like {Clipboard} and kept out of the history for the same reason
+                    if value:
+                        self._type(value, self._injector.type_text, always=True)
+                elif kind == "scrape":
+                    # after a key or file step: the clipboard may have changed, so read it only now
+                    cut = self._cut(value)
+                    if cut:
+                        self._type(cut, self._injector.type_text, always=True)
                 elif kind == "scroll":
                     # returns at once: the scroller thread does the rest, outside the macro lock
                     if value == "down":
@@ -722,6 +872,34 @@ class MorseController:
             self._stop_if_switched_off()
             self._type_piece(text[start:end], inject)
             start = end
+
+    def _resolve_scrapes(self, steps: list[macros.Step]) -> list[macros.Step]:
+        """Cut the {Scrape}s that can be cut before typing, so a missing marker stops the macro before it types.
+
+        A {Scrape} is cut now unless a key or file step comes before it: a shortcut such as Ctrl+C or Ctrl+X
+        can change the clipboard and a pasted file replaces it. Those stay "scrape" steps and are cut at their
+        position. A cut one becomes a "scraped" step: plain text that is never read as a command again.
+        """
+        if not any(kind == "scrape" for kind, _ in steps):
+            return steps  # the clipboard is read only for a macro that needs it
+        out: list[macros.Step] = []
+        may_change_clipboard = False
+        for kind, value in steps:
+            if kind in ("keys", "files"):
+                may_change_clipboard = True
+            elif kind == "scrape" and not may_change_clipboard:
+                kind, value = "scraped", self._cut(value)
+            out.append((kind, value))
+        return out
+
+    def _cut(self, scrape: macros.Scrape) -> str:
+        """The text one {Scrape} types. The dry run does not read the clipboard (it may hold a password)."""
+        if getattr(self._injector, "dry_run", False):
+            return "<Ausschnitt>"
+        text = self._injector.clipboard_text()
+        if not text:
+            raise macros.MacroError("Die Zwischenablage enthält keinen Text – nichts getippt.")
+        return macros.scrape_text(scrape, text)
 
     @staticmethod
     def _check_paths(steps: list[macros.Step]) -> None:

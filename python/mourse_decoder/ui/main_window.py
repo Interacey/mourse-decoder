@@ -13,7 +13,6 @@ from ..controller import MorseController
 from ..dictionary import DictionaryManager
 from ..easter_egg import bind_sos
 from ..i18n import set_language, tr
-from ..settings import Settings
 from . import theme
 from .icon import create_icon
 
@@ -75,7 +74,7 @@ class _NavItem(tk.Canvas):
 class MainWindow:
     """Builds the UI inside the existing tk.Tk root."""
 
-    TABS = ("settings", "alphabets", "smileys", "functionkeys", "live", "translator", "update", "credits")
+    TABS = ("settings", "alphabets", "smileys", "functionkeys", "live", "calibration", "translator", "update", "credits")
     _GLYPHS = {t: t for t in TABS}
 
     def __init__(
@@ -83,7 +82,7 @@ class MainWindow:
         root: tk.Tk,
         controller: MorseController,
         dictionaries: DictionaryManager,
-        apply_settings: Callable[[Settings], None],
+        apply_settings: Callable[..., None],  # Settings, optional chosen=(names of fields the user picked)
         on_alphabets_changed: Callable[[], None],
         on_hide: Callable[[], None],
         on_quit: Callable[[], None],
@@ -107,6 +106,7 @@ class MainWindow:
         root.minsize(900, 700)
         root.protocol("WM_DELETE_WINDOW", on_hide)  # the close button hides to the tray instead of quitting
         self._build()
+        root.bind("<Unmap>", self._on_unmap, add="+")  # minimize and withdraw end a calibration measurement
 
     def _build(self) -> None:
         root, settings = self._root, self._controller.settings
@@ -194,7 +194,7 @@ class MainWindow:
         if name == "settings":
             from .settings_panel import SettingsPanel
 
-            page = SettingsPanel(stack, c, d, apply)
+            page = SettingsPanel(stack, c, d, apply, on_imported=self._changed)
         elif name == "alphabets":
             from .alphabet_panel import AlphabetPanel
 
@@ -212,6 +212,10 @@ class MainWindow:
             from .live_panel import LivePanel
 
             page = LivePanel(stack, c)
+        elif name == "calibration":
+            from .calibration_panel import CalibrationPanel
+
+            page = CalibrationPanel(stack, c, apply)
         elif name == "translator":
             from .translator_panel import TranslatorPanel
 
@@ -232,6 +236,11 @@ class MainWindow:
         """For the live page, if it has been opened (it shows what happens from then on)."""
         if (live := self._pages.get("live")) is not None:
             live.add_symbol(symbol)
+
+    def add_timing(self, kind: str, ms: int) -> None:
+        """Press and pause times for the calibration page, if it has been opened."""
+        if (page := self._pages.get("calibration")) is not None:
+            page.add_timing(kind, ms)
 
     def add_letter(self, sequence: str, text: str | None) -> None:
         if (live := self._pages.get("live")) is not None:
@@ -268,7 +277,22 @@ class MainWindow:
 
         self._battleship = BattleshipWindow(self._root)
 
+    def _stop_calibration(self) -> None:
+        if (page := self._pages.get("calibration")) is not None:
+            page.stop()  # measuring ends with the page, or the engine would stay silent
+
+    def _on_unmap(self, event: tk.Event) -> None:
+        if event.widget is self._root:  # the same event also comes from every child
+            self._stop_calibration()
+
+    def calibration_ended(self, reason: str) -> None:
+        """The controller ended the measuring itself (stop, time limit): the page drops its state."""
+        if (page := self._pages.get("calibration")) is not None:
+            page.controller_ended(reason)
+
     def show_tab(self, name: str) -> None:
+        if name != "calibration":
+            self._stop_calibration()
         self._highlight(name)
         self._page_widget(name).tkraise()
 
@@ -298,7 +322,7 @@ class MainWindow:
         if s.sidebar_collapsed != self._collapsed:
             self._collapsed = s.sidebar_collapsed
             self._apply_collapsed()
-        for name in ("settings", "alphabets", "smileys", "functionkeys", "live", "translator"):
+        for name in ("settings", "alphabets", "smileys", "functionkeys", "live", "calibration", "translator"):
             if (page := self._pages.get(name)) is not None:
                 page.refresh()
         self._update_status()
@@ -323,6 +347,7 @@ class MainWindow:
         self._root.focus_force()
 
     def hide(self) -> None:
+        self._stop_calibration()
         self._root.withdraw()
 
     @property

@@ -20,6 +20,10 @@ use std::time::{Duration, Instant};
 ///
 /// The longest regular character has 7 symbols (`$` = `...-..-`). The cap protects
 /// against unbounded growth if someone keys forever without pausing; 32 leaves room.
+///
+/// A sequence that grows past this is reported with `MAX_SEQUENCE_LEN + 1` symbols, which no
+/// code table can contain (codes have 1 to 32 symbols), so it is unknown. Cutting it to 32
+/// would let a 40-symbol input hit a 32-symbol code.
 pub const MAX_SEQUENCE_LEN: usize = 32;
 
 /// A single Morse symbol.
@@ -49,6 +53,16 @@ pub enum TimerOutput {
     Letter(String),
     /// A longer pause (>= word_gap) after at least one letter.
     WordGap,
+    /// How long the key was held, reported right before the [`TimerOutput::Symbol`] of the
+    /// same release. Only the engine worker in measuring mode emits it (calibration).
+    Press(Duration),
+    /// Silence between the last release and a new press, reported when the press arrives.
+    /// Only the engine worker in measuring mode emits it (calibration).
+    Gap(Duration),
+    /// The worker has taken over a [`crate::engine::WorkerMessage::SetMeasuring`]. It sits in the
+    /// output stream at the exact place of the switch: everything before it came out under the old
+    /// setting, everything after it under the new one. Only sent in answer to that message.
+    Measuring(bool),
 }
 
 /// Error for an invalid configuration.
@@ -199,6 +213,16 @@ impl MorseTimer {
         self.pressed_at.is_some()
     }
 
+    /// How long the key has been held at time `at`, `None` if it is not held.
+    pub fn held_for(&self, at: Instant) -> Option<Duration> {
+        self.pressed_at.map(|p| at.saturating_duration_since(p))
+    }
+
+    /// Silence between the last release and `at`, `None` before the first release.
+    pub fn silence_before(&self, at: Instant) -> Option<Duration> {
+        self.last_release.map(|r| at.saturating_duration_since(r))
+    }
+
     /// The sequence collected so far that isn't finished yet.
     pub fn pending_sequence(&self) -> &str {
         &self.buffer
@@ -248,7 +272,7 @@ impl MorseTimer {
     /// key released first).
     pub fn on_release_as(&mut self, at: Instant, symbol: Symbol) -> Option<Symbol> {
         self.pressed_at.take()?;
-        if self.buffer.len() < MAX_SEQUENCE_LEN {
+        if self.buffer.len() <= MAX_SEQUENCE_LEN {
             self.buffer.push(symbol.as_char());
         }
         self.last_release = Some(at);
@@ -556,7 +580,33 @@ mod tests {
             timer.on_release(t);
             t += ms(10);
         }
-        assert_eq!(timer.pending_sequence().len(), MAX_SEQUENCE_LEN);
+        // one symbol more than any code has: the letter is reported as too long, not cut to a valid length
+        assert_eq!(timer.pending_sequence().len(), MAX_SEQUENCE_LEN + 1);
+    }
+
+    #[test]
+    fn overlong_sequence_is_reported_longer_than_any_code() {
+        let mut timer = MorseTimer::new(TimingConfig::default());
+        let mut t = Instant::now();
+        fn keyed(timer: &mut MorseTimer, t: &mut Instant, count: usize) {
+            for _ in 0..count {
+                timer.on_press(*t);
+                *t += ms(500);
+                timer.on_release(*t); // dash
+                *t += ms(10);
+            }
+        }
+        keyed(&mut timer, &mut t, MAX_SEQUENCE_LEN + 8);
+        let out = timer.poll(t + ms(2000));
+        assert_eq!(
+            out,
+            vec![TimerOutput::Letter("-".repeat(MAX_SEQUENCE_LEN + 1))]
+        );
+        // exactly 32 symbols still arrive unchanged
+        t += ms(3000);
+        keyed(&mut timer, &mut t, MAX_SEQUENCE_LEN);
+        let out = timer.poll(t + ms(2000));
+        assert_eq!(out, vec![TimerOutput::Letter("-".repeat(MAX_SEQUENCE_LEN))]);
     }
 
     #[test]
