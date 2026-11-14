@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import queue
 import threading
+import time
 import tkinter as tk
 from collections.abc import Callable
 from tkinter import messagebox
@@ -22,6 +23,7 @@ from ..i18n import set_language, tr
 from ..import_gate import gate
 from ..settings import Settings, SettingsStore
 from ..telecode import TelecodeError
+from ..trigger import TriggerEvent, TriggerLog, TriggerService
 from ..triggers import binding_label
 from . import theme, tkfinalizers
 from .icon import create_icon
@@ -32,6 +34,7 @@ from .toast import Toast
 log = logging.getLogger(__name__)
 
 POLL_INTERVAL_MS = 250
+TRIGGER_REJECT_TOAST_S = 60.0  # at most one "request refused" toast in this time
 # What settings.json says and the program does not always run: the switches the on/off shortcut flips at run time,
 # and the alphabet, which falls back to the default in memory when the named one cannot be loaded (at the start and
 # after an import). The tray keeps the file's values (``saved_fields``) and writes them back unless the user
@@ -73,6 +76,41 @@ def fit_balloon(message: str, limit: int = BALLOON_UNITS) -> str:
     return "".join(kept) + "…"
 
 
+class ToastingLog(TriggerLog):
+    """A ``TriggerLog`` that also hands every request to ``on_event``, on the thread of the pipe server."""
+
+    on_event: Callable[[TriggerEvent], None] | None = None
+
+    def add(self, slot: int | None, code: str, now: float | None = None) -> TriggerEvent:
+        event = super().add(slot, code, now)
+        if self.on_event is not None:
+            try:
+                self.on_event(event)
+            except Exception:  # noqa: BLE001 - a notice must not change the answer to the caller
+                log.exception("Trigger-Hinweis fehlgeschlagen")
+        return event
+
+
+def follow_trigger(service: TriggerService | None, settings: Settings) -> None:
+    """Open or close the trigger pipe to match ``settings``; a failure here must not stop the save."""
+    if service is None:
+        return
+    try:
+        service.apply(settings)
+    except Exception:  # noqa: BLE001
+        log.exception("Trigger-Dienst konnte nicht angepasst werden")
+
+
+def follow_trigger_stop(service: TriggerService | None) -> None:
+    """Close the trigger pipe for good; a failure here must not keep the program from quitting."""
+    if service is None:
+        return
+    try:
+        service.stop()
+    except Exception:  # noqa: BLE001
+        log.exception("Trigger-Dienst konnte nicht beendet werden")
+
+
 def take_over_imported(controller: MorseController, settings: Settings) -> Settings:
     """Apply the settings of an imported ``settings.json``; returns what the controller really runs.
 
@@ -95,6 +133,8 @@ def take_over_imported(controller: MorseController, settings: Settings) -> Setti
 
 class TrayApp:
     _quit_pending = False  # Quit was asked for while a backup import was writing: done when it is over
+    _trigger: TriggerService | None = None
+    _trigger_rejected_at: float | None = None  # time.monotonic() of the last "request refused" toast
 
     def __init__(
         self,
@@ -103,8 +143,14 @@ class TrayApp:
         store: SettingsStore,
         start_hidden: bool = False,
         hook_error: Callable[[], str | None] | None = None,
+        trigger: TriggerService | None = None,
+        trigger_log: ToastingLog | None = None,
     ) -> None:
         self._hook_error = hook_error  # the native ``hook_error``: text once the keyboard hook has died
+        self._trigger = trigger
+        self._trigger_guard = threading.Lock()
+        if trigger_log is not None:
+            trigger_log.on_event = self._on_trigger_event
         self._hook_error_shown = False
         self._controller = controller
         self._dictionaries = dictionaries
@@ -130,6 +176,8 @@ class TrayApp:
             on_hide=self._hide_window,
             on_quit=self.quit,
             config_dir=store.directory,
+            trigger_events=trigger_log.events if trigger_log is not None else None,
+            trigger_status=(lambda: trigger.status) if trigger is not None else None,
         )
         self._icon = pystray.Icon(
             "mourse-decoder",
@@ -141,6 +189,24 @@ class TrayApp:
     def call_in_ui(self, func: Callable[[], None]) -> None:
         """Callable from any thread."""
         self._ui_queue.put(func)
+
+    def _on_trigger_event(self, event: TriggerEvent) -> None:
+        """Toasts for the external trigger. Called on the pipe server's thread: Tk work goes through ``call_in_ui``.
+
+        An accepted trigger is always shown (ignoring "show notices", like the on/off shortcut): the caller may be
+        a script nobody watches. Refused requests are shown at most once per ``TRIGGER_REJECT_TOAST_S``.
+        """
+        if event.code == "ok":
+            slot, when = event.slot, time.strftime("%H:%M:%S", time.localtime(event.time))
+            self.call_in_ui(lambda: self._toast.show(tr("trigger.toast.accepted", slot=slot, time=when)))
+            return
+        now = time.monotonic()
+        with self._trigger_guard:
+            last = self._trigger_rejected_at
+            if last is not None and now - last < TRIGGER_REJECT_TOAST_S:
+                return
+            self._trigger_rejected_at = now
+        self.call_in_ui(lambda: self._toast.show(tr("trigger.toast.rejected"), False))
 
     def _drain_queue(self) -> None:
         tkfinalizers.drain()
@@ -354,8 +420,10 @@ class TrayApp:
             to_save, saved = self._to_save(settings, runtime_only, chosen)
             self._controller.apply_settings(settings)
             live = settings
-        self._store.save(to_save)
+        self._store.save(to_save)  # first: if it raises, the pipe still matches the file
         self._saved_flags = saved
+        # after an import too: it switches the trigger off in the files it writes (getattr: test fakes of the tray)
+        follow_trigger(getattr(self, "_trigger", None), live)
         self._icon.icon = create_icon(live.enabled)
         self._set_title(self._tooltip())
         self._icon.update_menu()
@@ -386,6 +454,7 @@ class TrayApp:
             self._quit_pending = True
             self._toast.show(tr("backup.quit_wait"), False)
             return
+        follow_trigger_stop(getattr(self, "_trigger", None))  # before the controller: no request meets a stopping one
         self._controller.stop()
         self._icon.stop()
         self._root.quit()

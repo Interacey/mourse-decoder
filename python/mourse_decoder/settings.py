@@ -243,6 +243,7 @@ class Settings:
     cycle_shortcut: str = ""     # switches to the next alphabet of cycle_alphabets, "" = none
     cycle_alphabets: tuple[str, ...] = ()  # the user's own pick of alphabet ids to switch through
     undo_shortcut: str = ""      # deletes the last typed output, "" = none
+    trigger_enabled: bool = False  # other programs may start macros of slots marked "triggerable"
 
     def validate(self) -> list[str]:
         """List of error messages, empty if valid."""
@@ -286,6 +287,8 @@ class Settings:
             errors.append("'notifications' muss true oder false sein.")
         if not isinstance(self.block_input, bool):
             errors.append("'block_input' muss true oder false sein.")
+        if not isinstance(self.trigger_enabled, bool):
+            errors.append("'trigger_enabled' muss true oder false sein.")
         for spec in (self.block_shortcut, self.cycle_shortcut, self.undo_shortcut):
             if not is_valid_shortcut(spec):
                 errors.append(f"Ungültiges Tastenkürzel '{spec}'.")

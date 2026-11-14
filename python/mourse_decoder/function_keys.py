@@ -22,6 +22,7 @@ Running (see ``MorseController``)::
     controller.apply_function_keys(keys)   # ValueError if invalid; installs the slots in the hook
     controller.function_keys               # the applied FunctionKeys
     controller.run_slot(57)                # test button; None = started, else the reason (str)
+    controller.trigger_slot(57)            # outside caller; "ok", else "unknown_macro", "not_allowed", ...
     controller.poll_function_keys()        # the tray calls this every tick, starts fired macros
 
 Errors while a macro runs reach the UI through ``ControllerListener.on_error(message)``, the
@@ -46,6 +47,10 @@ File
 
 ``typing_delay_ms`` is optional (0 to 10000, the pause after each typed character); a slot without it
 types with the global setting, and files from before this field load unchanged.
+
+``triggerable`` is optional too and written only when true: other programs may start the slot (see
+``MorseController.trigger_slot``). A macro with a command of ``SENSITIVE_KINDS`` is never triggerable; a file
+that says otherwise loads with the flag cleared and a warning, the slot stays as it is.
 
 Only slots that differ from their default are written, so a new default does not need a
 migration. Unknown fields in a slot (or at the top) are kept and written back. A file that cannot
@@ -83,6 +88,8 @@ SLOT_COUNT = 100
 MAX_MACRO_LENGTH = 10_000
 MAX_LABEL_LENGTH = 100
 FILE_NAME = "function_keys.json"
+# step kinds of ``macros.parse`` that read or paste what the user has (clipboard, files): never started from outside
+SENSITIVE_KINDS = ("clipboard", "scrape", "files")
 
 # real keys, virtual-key codes 124..135
 _REAL_KEYS = tuple(f"F{n}" for n in range(13, 25))
@@ -138,6 +145,7 @@ class Slot:
     swallow: bool = True     # hide the trigger key from the focused app (Windows only)
     typing_delay_ms: int | None = None  # pause after each typed character; None = the global setting
     label: str = ""          # free text the user sees in the list
+    triggerable: bool = False  # other programs may start the macro (never one with a sensitive command)
     extra: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)  # unknown fields of the file
 
     @property
@@ -162,6 +170,24 @@ class Slot:
             return slot.replace(trigger=normalize_binding(slot.trigger)) if isinstance(slot.trigger, str) else slot
 
         return canonical(self) == canonical(other)
+
+
+def sensitive_kinds(text: str) -> list[str]:
+    """The kinds of ``SENSITIVE_KINDS`` that the macro ``text`` uses, in order of first use; [] if it does not parse.
+
+    Every key combination counts as valid here: the check must not depend on an injector.
+    """
+    try:
+        steps = macros.parse(text, lambda _combo: None)
+    except macros.MacroError:
+        return []
+    return list(dict.fromkeys(kind for kind, _ in steps if kind in SENSITIVE_KINDS))
+
+
+def outsiders_barred(macro: str) -> bool:
+    """Whether a program outside may not start ``macro``: it has a ``SENSITIVE_KINDS`` command, or it is longer
+    than ``MAX_MACRO_LENGTH`` (such a macro is not saved as a working slot, so it is not parsed here either)."""
+    return len(macro) > MAX_MACRO_LENGTH or bool(sensitive_kinds(macro))
 
 
 def default_slot(number: int) -> Slot:
@@ -246,6 +272,8 @@ class FunctionKeys:
                          "enabled": slot.enabled, "swallow": slot.swallow, "label": slot.label}
                 if slot.typing_delay_ms is not None:  # a slot without its own delay writes the same keys as before
                     entry["typing_delay_ms"] = slot.typing_delay_ms
+                if slot.triggerable:  # likewise only when set
+                    entry["triggerable"] = True
                 changed.append(entry)
         return {**self.extra, "schema_version": SCHEMA_VERSION, "slots": changed}
 
@@ -275,6 +303,15 @@ def _unusable_trigger(trigger: str, swallow: bool) -> str:
         return "normales Tippen"
     if key in ("MouseRight", "MouseMiddle") and swallow and not shortcut and "Shift" not in modifiers:
         return "normales Klicken"
+    return ""
+
+
+def _triggerable_error(slot: Slot) -> str:
+    """Why ``slot.triggerable`` is not allowed, "" if it is."""
+    if not isinstance(slot.triggerable, bool):
+        return "'triggerable' muss true oder false sein."
+    if slot.triggerable and isinstance(slot.macro, str) and outsiders_barred(slot.macro):
+        return "Ein Makro mit {Clipboard}, {Scrape …} oder {File …} kann nicht von außen ausgelöst werden."
     return ""
 
 
@@ -308,6 +345,8 @@ def _slot_errors(slot: Slot, check_shortcut: Callable[[str], None] | None) -> li
         errors.append(error)
     if not isinstance(slot.label, str) or len(slot.label) > MAX_LABEL_LENGTH:
         errors.append(f"Die Beschriftung muss ein Text mit höchstens {MAX_LABEL_LENGTH} Zeichen sein.")
+    if error := _triggerable_error(slot):
+        errors.append(error)
     return errors
 
 
@@ -318,7 +357,7 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return dict(pairs)
 
 
-_SLOT_FIELDS = {"slot", "trigger", "macro", "enabled", "swallow", "label", "typing_delay_ms"}
+_SLOT_FIELDS = {"slot", "trigger", "macro", "enabled", "swallow", "label", "typing_delay_ms", "triggerable"}
 
 
 class FunctionKeysStore:
@@ -388,7 +427,10 @@ class FunctionKeysStore:
 
     @staticmethod
     def _read_slot(entry: Any, check_shortcut: Callable[[str], None] | None) -> tuple[Slot | None, str]:
-        """(slot, problem). No slot if the entry is unusable; a problem with a slot means it was switched off."""
+        """(slot, problem). No slot if the entry is unusable; a problem with a slot says what was changed.
+
+        A broken macro or setting switches the slot off; a ``triggerable`` that is not allowed only loses the flag.
+        """
         if not isinstance(entry, dict):
             return None, "kein Objekt."
         number = entry.get("slot")
@@ -399,9 +441,13 @@ class FunctionKeysStore:
         if isinstance(values["trigger"], str):
             values["trigger"] = normalize_binding(values["trigger"])
         slot = Slot(number, **values, extra={k: v for k, v in entry.items() if k not in _SLOT_FIELDS})
+        notes = []
+        if error := _triggerable_error(slot):  # the slot is not lost for this: only the flag goes
+            slot = slot.replace(triggerable=False)
+            notes.append(f"{error} Die Freigabe zum Auslösen wurde entfernt.")
         errors = _slot_errors(slot, check_shortcut)
         if not errors:
-            return slot, ""
+            return slot, " ".join(notes)
         if not isinstance(slot.macro, str) or not isinstance(slot.trigger, str):
             return None, f"{slot.name}: Auslöser und Makro müssen Texte sein."
         # keep what the user wrote, but never run it
@@ -411,7 +457,7 @@ class FunctionKeysStore:
         # an unusable delay is dropped so the slot can be saved again; the macro stays, switched off
         bad_delay = slot.typing_delay_ms is not None and typing_delay_error(slot.typing_delay_ms) is not None
         return slot.replace(enabled=False, typing_delay_ms=None if bad_delay else slot.typing_delay_ms), (
-            "ausgeschaltet. " + "; ".join(errors)
+            " ".join(["ausgeschaltet. " + "; ".join(errors), *notes])
         )
 
     def save(self, keys: FunctionKeys) -> None:

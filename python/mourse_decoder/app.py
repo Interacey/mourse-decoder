@@ -17,6 +17,7 @@ from .i18n import set_language, tr
 from .jsontext import backup_file, clean_orphaned_scratch, display_text
 from .settings import Settings, SettingsStore
 from .telecode import TelecodeError
+from .trigger import TriggerEvent, TriggerLog, TriggerService
 
 log = logging.getLogger("mourse_decoder")
 
@@ -161,6 +162,25 @@ def _start_function_keys(controller: MorseController, directory, injector) -> li
     return warnings
 
 
+def _print_trigger(event: TriggerEvent) -> None:
+    """--headless: one line per accepted external trigger (refused requests are only in trigger.log)."""
+    when = time.strftime("%H:%M:%S", time.localtime(event.time))
+    print(f"Trigger accepted: F{event.slot} at {when}", flush=True)
+
+
+TRIGGER_EPILOG = r"""external trigger:
+  MourseDecoder.exe --trigger F57   starts the macro of slot F57 in the running program (the setting
+                                    "external trigger" must be on and the slot marked as triggerable), prints
+                                    "ok" or "error <reason>" and exits. It does not start the program.
+  exit codes:  0 started          2 bad id or bad arguments   10 program not running or trigger off
+              11 access denied   12 no such macro or not allowed   13 another macro is running
+              14 too many requests   15 Morse input is off   16 protocol error or unsupported   17 no answer in time
+  The windowed exe returns at once and its exit code is lost unless the caller waits for it:
+  PowerShell: $p = Start-Process -Wait -PassThru .\MourseDecoder.exe '--trigger F57'; $p.ExitCode
+  cmd:        start /wait MourseDecoder.exe --trigger F57
+"""
+
+
 class _PrintInjector:
     """For --dry-run: show instead of typing."""
 
@@ -250,14 +270,29 @@ def _exit_when_launcher_dies() -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    missing = [name for name in ("stdout", "stderr") if getattr(sys, name) is None]  # a windowed exe has no console
     _prepare_windows()
     _exit_when_launcher_dies()
-    parser = argparse.ArgumentParser(prog="mourse-decoder", description="Systemweiter Morsecode-Decoder")
+    parser = argparse.ArgumentParser(
+        prog="mourse-decoder", description="Systemweiter Morsecode-Decoder", epilog=TRIGGER_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("--headless", action="store_true", help="ohne Tray-Icon, Ausgabe in der Konsole")
     parser.add_argument("--dry-run", action="store_true", help="nicht in Anwendungen tippen, nur anzeigen")
     parser.add_argument("--minimized", action="store_true", help="Fenster nicht anzeigen, nur Tray-Icon")
     parser.add_argument("--verbose", "-v", action="store_true")
+    parser.add_argument(
+        "--trigger", metavar="ID", help="start the macro of slot ID (F1 to F100) in the running program and exit"
+    )
     args = parser.parse_args(argv)
+    if args.trigger is not None:
+        if args.headless or args.dry_run or args.minimized:
+            parser.error("--trigger cannot be combined with --headless, --dry-run or --minimized")
+        for name in missing:  # _prepare_windows gave them a null file; the client attaches to its caller's console
+            setattr(sys, name, None)
+        from .trigger_pipe import client_main  # light: no settings, native module, tkinter or single-instance mutex
+
+        return client_main(args.trigger)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(levelname)s %(message)s")
 
     if not args.dry_run and not acquire_single_instance():
@@ -298,6 +333,10 @@ def main(argv: list[str] | None = None) -> int:
             f"Morse-Decoder läuft (Taster: {display_text(settings.trigger)}, "
             f"Alphabet: {display_text(settings.alphabet)}). Strg+C beendet."
         )
+        trigger = TriggerService(
+            controller, TriggerLog(path=store.directory / "trigger.log"), announce=_print_trigger
+        )
+        trigger.start(controller.settings)
         try:
             while True:
                 time.sleep(0.1)
@@ -308,23 +347,31 @@ def main(argv: list[str] | None = None) -> int:
         except KeyboardInterrupt:
             pass
         finally:
+            trigger.stop()
             controller.stop()
         return 0
 
     # imported here so headless mode never loads tkinter or pystray
-    from .ui.tray import TrayApp
+    from .ui.tray import ToastingLog, TrayApp
 
     controller, startup_warnings = build_controller(engine, injector, dictionaries, settings)
-    tray = TrayApp(controller, dictionaries, store, start_hidden=args.minimized, hook_error=native.hook_error)
+    trigger_log = ToastingLog(path=store.directory / "trigger.log")
+    trigger = TriggerService(controller, trigger_log)
+    tray = TrayApp(
+        controller, dictionaries, store, start_hidden=args.minimized, hook_error=native.hook_error,
+        trigger=trigger, trigger_log=trigger_log,
+    )
     controller.set_listener(tray)  # breaks the tray <-> controller cycle
     controller.start()
     deliver_warnings(
         tray.on_error, notices + startup_warnings + _start_function_keys(controller, store.directory, injector)
     )
     show_update_result(store.directory)
+    trigger.start(controller.settings)
     try:
         tray.run()
     finally:
+        trigger.stop()
         controller.stop()
     return 0
 

@@ -8,13 +8,14 @@ running program and the file never disagree.
 
 from __future__ import annotations
 
+import functools
 import logging
 import sys
 import tkinter as tk
 from tkinter import messagebox, ttk
 
 from ..controller import MorseController
-from ..function_keys import FunctionKeys, FunctionKeysStore, Slot, default_trigger
+from ..function_keys import FunctionKeys, FunctionKeysStore, Slot, default_trigger, sensitive_kinds
 from ..i18n import tr
 from ..import_gate import gate
 from . import function_keys_view as view
@@ -31,8 +32,19 @@ EXAMPLE_MACRO = "{Loop 3 i}[i] {EndLoop}"  # types 0 1 2
 REPEAT_EXAMPLES = ("{Backspace 5}", "{Space 18}")  # key name plus count
 DELAY_EXAMPLE, WAIT_EXAMPLE, ROLLBACK_EXAMPLE = "{Delay 100}", "{Wait 500}", "{Rollback}"
 ESCAPED_BRACE = "\\{"  # how a literal "{" is written in a macro
-_COLUMNS = ("slot", "kind", "trigger", "text", "status")
-_WIDTHS = {"slot": 56, "kind": 72, "trigger": 200, "text": 120, "status": 84}
+EXTERNAL_MARK = "✓"  # list column of the slots that other programs may start
+_COLUMNS = ("slot", "kind", "trigger", "text", "status", "external")
+_WIDTHS = {"slot": 56, "kind": 72, "trigger": 200, "text": 120, "status": 84, "external": 72}
+_HEADINGS = {"external": "functionkeys.triggerable.marker"}  # the others are functionkeys.col.<name>
+
+
+@functools.lru_cache(maxsize=1)
+def is_sensitive(macro: str) -> bool:
+    """Whether the macro has a command that outsiders may not start; the last answer is kept.
+
+    One keystroke asks several times (switch, buttons, save) and parsing a long macro takes a while.
+    """
+    return bool(sensitive_kinds(macro))
 
 
 class FunctionKeysPanel(tk.Frame):
@@ -113,7 +125,7 @@ class FunctionKeysPanel(tk.Frame):
         table.grid(row=3, column=0, sticky="nsew")
         self._tree = ttk.Treeview(table.body, columns=_COLUMNS, show="headings", selectmode="browse", height=4)
         for name in _COLUMNS:
-            self._tree.heading(name, text=tr(f"functionkeys.col.{name}"), anchor="w")
+            self._tree.heading(name, text=tr(_HEADINGS.get(name, f"functionkeys.col.{name}")), anchor="w")
             self._tree.column(name, width=_WIDTHS[name], anchor="w", stretch=name == "text")
         self._tree.tag_configure("dim", foreground=theme.P.muted)
         bar = ttk.Scrollbar(table.body, orient="vertical", command=self._tree.yview)
@@ -192,6 +204,20 @@ class FunctionKeysPanel(tk.Frame):
         else:  # the hook can only watch there, the key always reaches the program
             label(swallow_row, tr("functionkeys.swallow.linux"), size=9, muted=True).pack()
 
+        self._triggerable = tk.BooleanVar()
+        self._wanted_triggerable = False  # what the user chose; the switch shows it only while the macro may be started
+        self._syncing = False  # the switch is being set by the page, not clicked
+        self._triggerable.trace_add("write", self._on_triggerable)
+        Switch(
+            card.add_row(tr("functionkeys.triggerable"), tr("functionkeys.triggerable.hint")), self._triggerable
+        ).pack()
+        self._sensitive_note = label(
+            body, tr("functionkeys.triggerable.sensitive"), size=9, muted=True, justify="left"
+        )
+        self._sensitive_note.grid(row=6, column=0, sticky="w", padx=8, pady=(8, 0))
+        self._sensitive_note.grid_remove()
+        self._wrapped.append(self._sensitive_note)
+
         self._key_hint = label(body, "", size=9, muted=True, justify="left")
         self._key_hint.grid(row=3, column=0, sticky="w", padx=8, pady=(8, 0))
         self._key_hint.grid_remove()
@@ -234,7 +260,10 @@ class FunctionKeysPanel(tk.Frame):
             name, kind, trigger, text, state = view.row(slot)
             self._tree.insert(
                 "", "end", iid=str(slot.slot), tags=("dim",) if state in ("empty", "off") else (),
-                values=(name, tr(f"functionkeys.type.{kind}"), trigger or "-", text, tr(f"functionkeys.status.{state}")),
+                values=(
+                    name, tr(f"functionkeys.type.{kind}"), trigger or "-", text, tr(f"functionkeys.status.{state}"),
+                    EXTERNAL_MARK if slot.triggerable else "",
+                ),
             )
         self._count.configure(text=tr("functionkeys.count", shown=len(shown), total=len(self._keys.slots)))
         if self._number:
@@ -276,8 +305,10 @@ class FunctionKeysPanel(tk.Frame):
             self._trigger.set_shortcut(slot.trigger)
             self._enabled.set(slot.enabled)
             self._swallow.set(slot.swallow)
+            self._wanted_triggerable = slot.triggerable
             self._macro.delete("1.0", "end")
             self._macro.insert("1.0", slot.macro)
+            self._sync_triggerable()
             self._macro.edit_reset()
             self._macro.edit_modified(False)
             self._key_hint.grid_remove()
@@ -296,11 +327,39 @@ class FunctionKeysPanel(tk.Frame):
         except ValueError:
             return text
 
+    def _on_triggerable(self, *_: object) -> None:
+        if self._syncing or self._loading:
+            return
+        if is_sensitive(self._macro.get("1.0", "end-1c")):  # a click does not stick, the choice stays as it was
+            self._show_triggerable(False)
+            return
+        self._wanted_triggerable = self._triggerable.get()
+        self._changed()
+
+    def _show_triggerable(self, on: bool) -> None:
+        if self._triggerable.get() != on:
+            self._syncing = True
+            try:
+                self._triggerable.set(on)
+            finally:
+                self._syncing = False
+
+    def _sync_triggerable(self) -> None:
+        """A macro with a clipboard, file or scrape command cannot be started from outside: the switch shows off
+        and a note says why. The chosen value comes back when the command is removed."""
+        sensitive = is_sensitive(self._macro.get("1.0", "end-1c"))
+        self._show_triggerable(self._wanted_triggerable and not sensitive)
+        if sensitive:
+            self._sensitive_note.grid()
+        else:
+            self._sensitive_note.grid_remove()
+
     def _editor_slot(self) -> Slot:
+        macro = self._macro.get("1.0", "end-1c")
         return self._keys.slot(self._number).replace(
             label=self._label_var.get(), trigger=self._trigger.shortcut, enabled=self._enabled.get(),
-            swallow=self._swallow.get(), macro=self._macro.get("1.0", "end-1c"),
-            typing_delay_ms=self._delay_value(),
+            swallow=self._swallow.get(), macro=macro, typing_delay_ms=self._delay_value(),
+            triggerable=self._triggerable.get() and not is_sensitive(macro),
         )
 
     def _dirty(self) -> bool:
@@ -314,6 +373,7 @@ class FunctionKeysPanel(tk.Frame):
     def _changed(self) -> None:
         if self._loading or not self._number:
             return
+        self._sync_triggerable()
         self._update_buttons()
         self._later("validate", VALIDATE_DELAY_MS, self._validate)
 
