@@ -30,11 +30,18 @@ LATEST_URL = f"https://api.github.com/repos/{REPO}/releases/latest"
 GITHUB = "https://github.com/"  # every link we follow or open must start with this
 RELEASES_URL = f"https://github.com/{REPO}/releases/latest"  # opened when an update cannot run by itself
 EXE_NAME = "MourseDecoder.exe"
+MSI_NAME = "MourseDecoder.msi"
+REG_KEY = r"Software\Interacey\MourseDecoder"  # written by the installer: InstallDir and ProductCode
+MSI_LOG_FILE = "msi-update.log"  # msiexec's log of an update, next to the settings
 TIMEOUT_S = 15
 MAX_JSON_BYTES = 1 << 20  # the release description is a few KB
 MAX_SHA_BYTES = 1024
 MAX_SIG_BYTES = 1024  # a base64 signature is 89 bytes
 MAX_EXE_BYTES = 200 << 20  # the exe is about 20 MB
+MAX_MSI_BYTES = 200 << 20  # the installer holds the same exe in a cabinet, so it is about as large
+MSI_MAGIC = bytes.fromhex("d0cf11e0a1b11ae1")  # OLE compound file, the container of every .msi
+# a ProductCode goes into a script, so only this shape is accepted
+_GUID = re.compile(r"\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}")
 TEMP_PREFIX = "mourse-update-"
 # the only folder names uninstall deletes recursively, whatever APPDATA says
 _OWN_FOLDERS = {"MourseDecoder", "mourse-decoder", "PolyglotMorse"}
@@ -66,6 +73,10 @@ class Release:
     sha_url: str | None
     page: str  # html_url from the release JSON; never opened, the update page opens RELEASES_URL
     sig_url: str | None = None  # MourseDecoder.exe.sig; an update is never installed without it
+    # the installer, its checksum and its signature: all three or none; an MSI-installed copy updates only with them
+    msi_url: str | None = None
+    msi_sha_url: str | None = None
+    msi_sig_url: str | None = None
 
 
 def parse_version(text: str) -> tuple[int, ...]:
@@ -85,6 +96,36 @@ def is_newer(tag: str, current: str = __version__) -> bool:
 def can_self_update() -> bool:
     """Only the downloaded exe can replace itself; a source checkout updates through git."""
     return sys.platform == "win32" and bool(getattr(sys, "frozen", False))
+
+
+def _registry_string(name: str) -> str | None:
+    """A string value of HKCU\\Software\\Interacey\\MourseDecoder, None if it is missing or the registry fails."""
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_KEY) as key:
+            value, _ = winreg.QueryValueEx(key, name)
+    except (OSError, ImportError):  # no key, no access, not Windows
+        return None
+    return value if isinstance(value, str) else None
+
+
+def install_kind() -> str:
+    """"msi" if the Windows Installer put this exe where it runs, "portable" for any other exe, "source" otherwise.
+
+    The installer records its folder in the registry; the exe is the installed one only if it runs from there.
+    """
+    if not getattr(sys, "frozen", False):
+        return "source"
+    if sys.platform == "win32":
+        import ntpath
+
+        folder = _registry_string("InstallDir")
+        # ntpath on purpose: these are Windows paths, whatever the platform of the test run
+        running_from = ntpath.dirname(ntpath.normpath(sys.executable))
+        if folder and ntpath.normcase(ntpath.normpath(folder)) == ntpath.normcase(running_from):
+            return "msi"
+    return "portable"
 
 
 def _network_error(exc: BaseException) -> UpdateError:
@@ -172,7 +213,11 @@ def fetch_latest(urlopen: Callable | None = None) -> Release:
         raise UpdateError("Unerwartete Antwort von GitHub.") from None
     if EXE_NAME not in assets:
         raise UpdateError(tr("update.err.no_exe", tag=tag, exe=EXE_NAME))  # nothing to install and nothing to offer
-    return Release(tag, notes, assets[EXE_NAME], assets.get(f"{EXE_NAME}.sha256"), page, assets.get(f"{EXE_NAME}.sig"))
+    msi = [assets.get(name) for name in (MSI_NAME, f"{MSI_NAME}.sha256", f"{MSI_NAME}.sig")]
+    if None in msi:  # a partial set counts as no installer: install() refuses it, it is never half-trusted
+        msi = [None, None, None]
+    exe_sha, exe_sig = assets.get(f"{EXE_NAME}.sha256"), assets.get(f"{EXE_NAME}.sig")
+    return Release(tag, notes, assets[EXE_NAME], exe_sha, page, exe_sig, *msi)
 
 
 def _github_only(url: str) -> str:
@@ -216,10 +261,6 @@ def download(release: Release, directory: Path, urlopen: Callable | None = None)
 
 def _download(release: Release, directory: Path, urlopen: Callable | None) -> tuple[Path, str]:
     """``download`` plus the SHA-256 (lower-case hex) that was checked and signed."""
-    import http.client
-
-    from . import signing
-
     _require_newer(release.tag)
     # No download page for a release that lacks a checksum or signature: whoever can edit a release can swap the exe
     # and delete the .sig, and a manual download would then run the swapped exe with no check at all.
@@ -227,33 +268,60 @@ def _download(release: Release, directory: Path, urlopen: Callable | None) -> tu
         raise UpdateError(tr("update.err.no_checksum", tag=release.tag))
     if release.sig_url is None:
         raise UpdateError(tr("update.err.no_signature", tag=release.tag))
+    return _fetch_verified(
+        release.tag, directory, urlopen, EXE_NAME, release.exe_url, release.sha_url, release.sig_url,
+        b"MZ", MAX_EXE_BYTES, "Die geladene Datei ist kein Windows-Programm – Update abgebrochen.",
+    )
+
+
+def _download_msi(release: Release, directory: Path, urlopen: Callable | None) -> tuple[Path, str]:
+    """Like ``_download`` for the installer; a release without all three installer files is refused (``no_msi``)."""
+    _require_newer(release.tag)
+    if release.msi_url is None or release.msi_sha_url is None or release.msi_sig_url is None:
+        raise UpdateError(tr("update.err.no_msi", tag=release.tag), open_page=True)
+    return _fetch_verified(
+        release.tag, directory, urlopen, MSI_NAME, release.msi_url, release.msi_sha_url, release.msi_sig_url,
+        MSI_MAGIC, MAX_MSI_BYTES, "Die geladene Datei ist kein Windows-Installer-Paket – Update abgebrochen.",
+    )
+
+
+def _fetch_verified(
+    tag: str, directory: Path, urlopen: Callable | None, name: str, url: str, sha_url: str, sig_url: str,
+    magic: bytes, limit: int, wrong_type: str,
+) -> tuple[Path, str]:
+    """Load ``name`` into ``directory``: it must be at most ``limit`` bytes, start with ``magic``, match the
+    checksum and carry a signature of a pinned key for ``tag``, ``name`` and its own hash. Any failure deletes it."""
+    import http.client
+
+    from . import signing
+
     if not signing.PINNED_PUBLIC_KEYS:  # verify_release says the same, but only after 20 MB were loaded
         # open_page stays True here: this is a property of the installed build, not of the release, so nobody
         # who edits a release can cause it, and a build without a key has no other way to get an update
         raise signing.SignatureError("no_pinned_key")
-    words = _small_file(release.sha_url, MAX_SHA_BYTES, urlopen).decode("ascii", "replace").split()
+    words = _small_file(sha_url, MAX_SHA_BYTES, urlopen).decode("ascii", "replace").split()
     expected = words[0].lower() if words else ""
     if not re.fullmatch(r"[0-9a-f]{64}", expected):
         raise UpdateError("Die Prüfsumme des Releases ist ungültig.")
-    signature = _small_file(release.sig_url, MAX_SIG_BYTES, urlopen)
+    signature = _small_file(sig_url, MAX_SIG_BYTES, urlopen)
 
-    target = Path(directory) / EXE_NAME
+    target = Path(directory) / name
     digest = hashlib.sha256()
     size, head = 0, b""
     try:
-        with _open(_github_only(release.exe_url), urlopen) as response, target.open("wb") as out:
+        with _open(_github_only(url), urlopen) as response, target.open("wb") as out:
             while chunk := response.read(1 << 16):
                 size += len(chunk)
-                if size > MAX_EXE_BYTES:
+                if size > limit:
                     raise UpdateError("Die Datei ist viel größer als erwartet – Update abgebrochen.")
-                head = head or chunk[:2]
+                head += chunk[: len(magic) - len(head)]
                 digest.update(chunk)
                 out.write(chunk)
         if digest.hexdigest() != expected:
             raise UpdateError("Die geladene Datei passt nicht zur Prüfsumme – Update abgebrochen.")
-        if head != b"MZ":
-            raise UpdateError("Die geladene Datei ist kein Windows-Programm – Update abgebrochen.")
-        signing.verify_release(release.tag, EXE_NAME, digest.hexdigest(), signature)
+        if head != magic:
+            raise UpdateError(wrong_type)
+        signing.verify_release(tag, name, digest.hexdigest(), signature)
     except (OSError, http.client.HTTPException) as exc:  # includes a download that breaks off half-way
         target.unlink(missing_ok=True)
         raise UpdateError(f"Download fehlgeschlagen ({exc}).", open_page=True) from None
@@ -281,7 +349,7 @@ def result_path(config_dir: Path | None = None) -> Path:
 
 
 # the helper script cannot show anything, so it leaves a code here; tr() turns it into a sentence
-_RESULT_CODES = ("busy", "start", "uninstall", "reparse", "verify", "rollback")
+_RESULT_CODES = ("busy", "start", "uninstall", "reparse", "verify", "rollback", "msi")
 
 
 def read_update_result(config_dir: Path | None = None) -> str | None:
@@ -417,6 +485,157 @@ def update_script(
     )
 
 
+def _wait_for_exe(tries: int) -> list[str]:
+    """PowerShell: set ``$free`` once ``$target`` can be opened for writing, which a running exe does not allow."""
+    return [
+        "$free = $false",
+        f"for ($i = 0; $i -lt {tries} -and -not $free; $i++) {{",
+        "  try {",
+        "    if (Test-Path -LiteralPath $target) {",
+        "      [System.IO.File]::Open($target, 'Open', 'ReadWrite', 'None').Close()",
+        "    }",
+        "    $free = $true",
+        "  } catch { Start-Sleep -Milliseconds 500 }",
+        "}",
+    ]
+
+
+def _msiexec(msiexec: Path | None) -> str:
+    """PowerShell expression for the Windows Installer; ``msiexec`` only replaces it in tests."""
+    return '"$env:SystemRoot\\System32\\msiexec.exe"' if msiexec is None else _quote(msiexec)
+
+
+def msi_update_script(
+    msi: Path,
+    target: Path,
+    status: Path | None,
+    sha256: str,
+    log: Path,
+    start: bool = True,
+    delay_s: int = 1,
+    tries: int = 120,
+    msiexec: Path | None = None,
+) -> str:
+    """Wait until ``target`` is free, check ``msi`` against ``sha256``, install it with msiexec, start ``target``.
+
+    The installer replaces the program inside its own folder, so the exe is never swapped by hand there. The
+    arguments of msiexec are fixed text around two local paths; nothing from the release reaches the command line.
+    Exit code 0 = installed, 1 = ``target`` stayed busy, 2 = installed but did not start, 3 = ``msi`` no longer has
+    the hash ``sha256`` (64 hex digits) and msiexec did not run, 5 = msiexec failed. msiexec's own 0 and 3010
+    (restart wanted; not needed for a per-user install) count as installed.
+    On 1 and 3 the download folder is removed; on 5 it stays, next to ``log`` with msiexec's details. On every
+    failure ``status`` gets a one-line code for the next start and the old program is started again if it is still
+    there (if ``start``).
+    """
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", sha256):
+        raise ValueError("sha256 must be 64 hex digits")
+    download_folder = msi.parent
+    own_folder = download_folder.name.startswith(TEMP_PREFIX)  # only the folder our own mkdtemp made
+    cleanup = [f"Remove-Item -LiteralPath {_quote(download_folder)} -Recurse -Force -ErrorAction Ignore"] * own_folder
+    restart = ["try { Start-Process -FilePath $target -ErrorAction Stop } catch { }"] * start
+
+    def failed(code: str, exit_code: int, remove_download: bool) -> list[str]:
+        return [f"Report '{code}'", *(cleanup if remove_download else []), *restart, f"exit {exit_code}"]
+
+    return "\n".join(
+        [
+            f"Start-Sleep -Seconds {delay_s}",
+            *_status_function(status),
+            f"$msi = {_quote(msi)}; $target = {_quote(target)}; $log = {_quote(log)}; $msiexec = {_msiexec(msiexec)}",
+            *_wait_for_exe(tries),
+            "if (-not $free) {",
+            *[f"  {line}" for line in failed("busy", 1, True)],
+            "}",
+            # the download sat in the temp folder since it was verified
+            "$actual = ''",
+            "try { $actual = (Get-FileHash -LiteralPath $msi -Algorithm SHA256).Hash } catch { }",
+            f"if ($actual -ne '{sha256.lower()}') {{",
+            *[f"  {line}" for line in failed("verify", 3, True)],
+            "}",
+            "try {",
+            "  New-Item -ItemType Directory -Force -Path (Split-Path -Parent $log) -ErrorAction Stop | Out-Null",
+            "} catch { }",
+            "$rc = -1",
+            "try {",
+            "  $msiArgs = '/i \"' + $msi + '\" /qn /norestart /l*v \"' + $log + '\"'",
+            "  $run = Start-Process -FilePath $msiexec -ArgumentList $msiArgs -Wait -PassThru -ErrorAction Stop",
+            "  $rc = $run.ExitCode",
+            "} catch { }",
+            "if ($rc -ne 0 -and $rc -ne 3010) {",
+            *[f"  {line}" for line in failed("msi", 5, False)],
+            "}",
+            *cleanup,
+            *(["Remove-Item -LiteralPath $statusFile -Force -ErrorAction Ignore"] if status else []),
+            *(["try { Start-Process -FilePath $target -ErrorAction Stop } catch { Report 'start'; exit 2 }"] * start),
+            "exit 0",
+        ]
+    )
+
+
+def _folder_removal(folders: list[Path]) -> list[str]:
+    """PowerShell: delete each folder; one that is a junction or symlink is skipped (``$code`` = 'reparse')."""
+    lines: list[str] = []
+    for folder in folders:
+        lines += [
+            f"$f = Get-Item -LiteralPath {_quote(folder)} -Force -ErrorAction Ignore",
+            "if ($f -and ($f.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) { $code = 'reparse' }",
+            "elseif ($f) { Remove-Item -LiteralPath $f.FullName -Recurse -Force -ErrorAction Ignore }",
+        ]
+    return lines
+
+
+def msi_uninstall_script(
+    exe: Path,
+    product_code: str,
+    folders: list[Path],
+    delay_s: int = 1,
+    tries: int = 120,
+    status: Path | None = None,
+    msiexec: Path | None = None,
+) -> str:
+    """Wait until ``exe`` is free, remove the installed program with msiexec, then delete the ``folders``.
+
+    msiexec's 0 (removed), 1605 (not installed any more) and 3010 count as done. If it fails or ``exe`` stays busy,
+    ``status`` gets the code 'uninstall', exit code 1, and the folders are left alone so that a second try can do all.
+    A folder that is a junction or symlink is skipped, not followed; that and other leftovers give exit code 1 without a
+    status code, since the status file would live in the folder that was just deleted.
+    """
+    _check_product_code(product_code)
+    lines = [
+        f"Start-Sleep -Seconds {delay_s}",
+        *_status_function(status),
+        f"$target = {_quote(exe)}; $msiexec = {_msiexec(msiexec)}",
+        *_wait_for_exe(tries),
+        "$rc = -1",
+        "if ($free) {",
+        "  try {",
+        f"    $msiArgs = '/x {product_code} /qn /norestart'",
+        "    $run = Start-Process -FilePath $msiexec -ArgumentList $msiArgs -Wait -PassThru -ErrorAction Stop",
+        "    $rc = $run.ExitCode",
+        "  } catch { }",
+        "}",
+        "if ($rc -ne 0 -and $rc -ne 1605 -and $rc -ne 3010) {",
+        "  Report 'uninstall'",
+        "  exit 1",
+        "}",
+        "$code = ''",
+        *_folder_removal(folders),
+    ]
+    if folders:
+        paths = ", ".join(_quote(p) for p in folders)
+        lines += [f"if (@({paths}) | Where-Object {{ Test-Path -LiteralPath $_ }}) {{ exit 1 }}"]
+    # a status file from an earlier failed run; one inside a deleted folder is gone already (Ignore: no error)
+    lines += ["Remove-Item -LiteralPath $statusFile -Force -ErrorAction Ignore"] * (status is not None)
+    return "\n".join([*lines, "exit 0"])
+
+
+def _check_product_code(code: object) -> str:
+    """``code`` if it is a GUID in braces, the only shape that may reach a script; UpdateError otherwise."""
+    if not isinstance(code, str) or not _GUID.fullmatch(code):
+        raise UpdateError(tr("update.err.bad_product_code"))
+    return code
+
+
 def uninstall_script(
     exe: Path | None, folders: list[Path], delay_s: int = 1, tries: int = 120, status: Path | None = None
 ) -> str:
@@ -435,12 +654,7 @@ def uninstall_script(
             "}",
             f"Remove-Item -LiteralPath {_quote(_backup_path(exe))} -Force -ErrorAction Ignore",
         ]
-    for folder in folders:
-        lines += [
-            f"$f = Get-Item -LiteralPath {_quote(folder)} -Force -ErrorAction Ignore",
-            "if ($f -and ($f.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) { $code = 'reparse' }",
-            "elseif ($f) { Remove-Item -LiteralPath $f.FullName -Recurse -Force -ErrorAction Ignore }",
-        ]
+    lines += _folder_removal(folders)
     paths = ", ".join(_quote(p) for p in [*([exe, _backup_path(exe)] if exe is not None else []), *folders])
     lines += [
         f"if (@({paths}) | Where-Object {{ Test-Path -LiteralPath $_ }}) {{",
@@ -499,17 +713,26 @@ def install(release: Release, urlopen: Callable | None = None, popen: Callable |
     """Download ``release`` and schedule the swap. The caller must quit the app right afterwards.
 
     Only a release newer than this program is installed, so a correctly signed older one is no way back.
+    A copy installed by the MSI loads the MSI of the release and runs it with msiexec instead of swapping the exe.
     """
     _require_newer(release.tag)
     if not can_self_update():
         raise UpdateError("Automatisch aktualisieren geht nur mit der heruntergeladenen MourseDecoder.exe.")
     target = Path(sys.executable)
-    if not _can_write(target.parent):
+    msi = install_kind() == "msi"
+    # Windows Installer keeps a record of the files it put there; swapping the exe in its folder would corrupt it,
+    # so an installed copy takes only the installer, and never falls back to the exe
+    if not msi and not _can_write(target.parent):
         raise UpdateError(tr("update.err.no_write", folder=target.parent), open_page=True)
     folder = Path(tempfile.mkdtemp(prefix=TEMP_PREFIX))
     try:
-        new_exe, digest = _download(release, folder, urlopen)
-        run_after_exit(update_script(new_exe, target, status=result_path(), sha256=digest), popen)
+        if msi:
+            status = result_path()
+            installer, digest = _download_msi(release, folder, urlopen)
+            run_after_exit(msi_update_script(installer, target, status, digest, status.parent / MSI_LOG_FILE), popen)
+        else:
+            new_exe, digest = _download(release, folder, urlopen)
+            run_after_exit(update_script(new_exe, target, status=result_path(), sha256=digest), popen)
     except BaseException:
         shutil.rmtree(folder, ignore_errors=True)  # nothing downloaded is worth keeping
         raise
@@ -535,9 +758,14 @@ def uninstall_targets(config_dir: Path, delete_data: bool = True) -> list[Path]:
 def uninstall(config_dir: Path, popen: Callable | None = None, delete_data: bool = True) -> None:
     """Remove the program (from the exe) and, if ``delete_data``, settings, cache and own files.
 
+    A copy installed by the MSI is removed by msiexec, using the ProductCode the installer wrote to the registry.
     The files are removed after this app has ended, so the caller must quit right afterwards.
     """
     folders = uninstall_targets(config_dir, delete_data)
+    if install_kind() == "msi":  # the installer removes its own files; the exe is not deleted by hand
+        code = _check_product_code(_registry_string("ProductCode"))
+        run_after_exit(msi_uninstall_script(Path(sys.executable), code, folders, status=result_path(config_dir)), popen)
+        return
     exe = Path(sys.executable) if can_self_update() else None
     if exe is not None and not _can_write(exe.parent):  # the script could not delete it, and nobody would see that
         raise UpdateError(tr("update.err.no_write", folder=exe.parent))

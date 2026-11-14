@@ -152,3 +152,21 @@ def test_a_result_arriving_after_the_page_was_destroyed_is_harmless(root, tmp_pa
     widget._results.put(lambda: quits.append("after install"))
     widget._poll()
     assert quits == ["after install"]  # an install result still quits the app
+
+
+def test_an_msi_copy_without_an_installer_in_the_release_shows_the_error_and_offers_the_page(panel, root, monkeypatch):
+    monkeypatch.setattr(update_panel.updater, "can_self_update", lambda: True)
+
+    def refuse(release, *a, **kw):
+        raise updater.UpdateError(update_panel.tr("update.err.no_msi", tag=release.tag), open_page=True)
+
+    monkeypatch.setattr(update_panel.updater, "install", refuse)
+    panel._release = updater.Release("v9.9.9", "", "https://github.com/e", None, "https://github.com/p")
+    panel._install()
+    for _ in range(100):
+        root.update()
+        if not panel.busy:
+            break
+        time.sleep(0.05)
+    assert "has no installer" in panel._status.get() and panel._page_btn.winfo_manager() == "pack"
+    assert panel.quits == []  # the app stays open: nothing was installed

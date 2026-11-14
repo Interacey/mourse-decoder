@@ -1,4 +1,4 @@
-# Builds MourseDecoder.exe and attaches it to a GitHub release.
+# Builds MourseDecoder.exe and MourseDecoder.msi and attaches them to a GitHub release.
 #
 # Publish a release by pushing a version tag:
 #   git tag v.0.1.2 && git push origin v.0.1.2
@@ -6,7 +6,8 @@
 # and the tests must pass. It can also be started by hand from the Actions tab (the exe is then
 # only an artifact). Actions are pinned by commit SHA (the tag is in the comment).
 # The release is created as a DRAFT. The signing key is never in GitHub: the maintainer signs the exe
-# offline and uploads MourseDecoder.exe.sig before publishing (see packaging/RELEASING.md).
+# offline and uploads MourseDecoder.exe.sig and MourseDecoder.msi.sig before publishing (see
+# packaging/RELEASING.md).
 name: Release
 
 on:
@@ -101,11 +102,99 @@ jobs:
       - name: Build the exe
         run: .venv\Scripts\python packaging\build.py
 
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
+        with:
+          dotnet-version: 8.0.x
+
+      # WiX 5.0.2 is the last major version without an EULA acceptance; do not move it to 6 or 7
+      - name: Install WiX
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "$env:USERPROFILE\.dotnet\tools" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - name: Build the MSI
+        run: .venv\Scripts\python packaging\build_msi.py
+
+      # per-user install, upgrade and uninstall of the MSI that is about to be released
+      - name: Smoke test the MSI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installDir = Join-Path $env:LOCALAPPDATA 'Programs\MourseDecoder'
+          $shortcut = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Mourse Decoder.lnk'
+          $regKey = 'HKCU:\Software\Interacey\MourseDecoder'
+          # from an elevated session Windows Installer lists a per-user package under HKLM, otherwise under HKCU
+          $uninstallRoots = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
+                            'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall'
+          $dataDir = Join-Path $env:APPDATA 'MourseDecoder'
+          $logDir = New-Item -ItemType Directory -Force dist\msi-logs
+          $msi = (Resolve-Path dist\MourseDecoder.msi).Path
+
+          function Invoke-Msi($switch, $package, $name) {
+            $log = Join-Path $logDir "$name.log"
+            $process = Start-Process msiexec.exe -Wait -PassThru -ArgumentList "$switch `"$package`" /qn /norestart /l*v `"$log`""
+            if ($process.ExitCode -ne 0) { throw "msiexec $switch $name exited with $($process.ExitCode)" }
+          }
+          function Get-Entries {
+            @(Get-ChildItem $uninstallRoots | Where-Object { (Get-ItemProperty $_.PSPath).DisplayName -eq 'Mourse Decoder' })
+          }
+          function Assert($condition, $message) { if (-not $condition) { throw "MSI smoke test: $message" } }
+
+          # user data must survive install, upgrade and uninstall
+          New-Item -ItemType Directory -Force $dataDir | Out-Null
+          $marker = Join-Path $dataDir 'msi-smoke-test.txt'
+          'keep' | Out-File $marker -Encoding ascii
+
+          Assert (@(Get-Entries).Count -eq 0) 'Mourse Decoder is installed before the test'
+          Invoke-Msi '/i' $msi 'install'
+          Assert (Test-Path (Join-Path $installDir 'MourseDecoder.exe')) 'exe missing after install'
+          Assert (Test-Path $shortcut) 'Start menu shortcut missing after install'
+          $entries = Get-Entries
+          Assert ($entries.Count -eq 1) "expected 1 uninstall entry after install, found $($entries.Count)"
+          $values = Get-ItemProperty $regKey
+          Assert ($values.InstallDir -eq "$installDir\") "InstallDir is '$($values.InstallDir)'"
+          Assert ($values.ProductCode -eq $entries[0].PSChildName) "ProductCode is '$($values.ProductCode)', uninstall key is '$($entries[0].PSChildName)'"
+          $oldVersion = (Get-ItemProperty $entries[0].PSPath).DisplayVersion
+
+          # a higher version over the first one: one entry, new version
+          $upgrade = 'build\MourseDecoder-9.9.9.msi'
+          .venv\Scripts\python packaging\build_msi.py --version 9.9.9 --output $upgrade
+          if ($LASTEXITCODE -ne 0) { throw "building the upgrade MSI failed ($LASTEXITCODE)" }
+          $upgrade = (Resolve-Path $upgrade).Path
+          Invoke-Msi '/i' $upgrade 'upgrade'
+          $entries = Get-Entries
+          Assert ($entries.Count -eq 1) "expected 1 uninstall entry after upgrade, found $($entries.Count)"
+          $newVersion = (Get-ItemProperty $entries[0].PSPath).DisplayVersion
+          Assert ($newVersion -eq '9.9.9') "version after upgrade is '$newVersion' (was '$oldVersion')"
+          Assert (Test-Path (Join-Path $installDir 'MourseDecoder.exe')) 'exe missing after upgrade'
+          Assert ((Get-ItemProperty $regKey).ProductCode -eq $entries[0].PSChildName) 'ProductCode not updated by the upgrade'
+
+          Invoke-Msi '/x' $upgrade 'uninstall'
+          Assert (@(Get-Entries).Count -eq 0) 'uninstall entry remains after uninstall'
+          Assert (-not (Test-Path (Join-Path $installDir 'MourseDecoder.exe'))) 'exe remains after uninstall'
+          Assert (-not (Test-Path $installDir)) 'install folder remains after uninstall'
+          Assert (-not (Test-Path $shortcut)) 'Start menu shortcut remains after uninstall'
+          Assert (-not (Test-Path $regKey)) 'registry key remains after uninstall'
+          Assert (Test-Path $marker) 'user data in %APPDATA%\MourseDecoder was removed'
+          Remove-Item $marker
+
+      - name: Upload the MSI logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: MourseDecoder-msi-logs
+          path: dist/msi-logs/*.log
+          if-no-files-found: ignore
+
       - name: Checksum
         shell: pwsh
         run: |
-          $hash = (Get-FileHash dist\MourseDecoder.exe -Algorithm SHA256).Hash.ToLower()
-          "$hash  MourseDecoder.exe" | Out-File dist\MourseDecoder.exe.sha256 -Encoding ascii
+          foreach ($name in 'MourseDecoder.exe', 'MourseDecoder.msi') {
+            $hash = (Get-FileHash "dist\$name" -Algorithm SHA256).Hash.ToLower()
+            "$hash  $name" | Out-File "dist\$name.sha256" -Encoding ascii
+          }
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -113,6 +202,8 @@ jobs:
           path: |
             dist/MourseDecoder.exe
             dist/MourseDecoder.exe.sha256
+            dist/MourseDecoder.msi
+            dist/MourseDecoder.msi.sha256
 
       - name: Publish release
         if: startsWith(github.ref, 'refs/tags/v')
@@ -121,6 +212,9 @@ jobs:
           files: |
             dist/MourseDecoder.exe
             dist/MourseDecoder.exe.sha256
+            dist/MourseDecoder.msi
+            dist/MourseDecoder.msi.sha256
           generate_release_notes: true
-          # stays a draft until the maintainer has signed offline, uploaded MourseDecoder.exe.sig and published
+          # stays a draft until the maintainer has signed offline, uploaded MourseDecoder.exe.sig and
+          # MourseDecoder.msi.sig and published
           draft: true
