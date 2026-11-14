@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import ctypes
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -385,10 +386,61 @@ def test_pipe_acl_is_the_documented_one(harness):
     finally:
         tp._api().kernel32.LocalFree(text)
         tp._api().kernel32.LocalFree(descriptor)
-    # Windows maps the generic right GA to the pipe's file right FA when it stores the ACL; same ACEs otherwise
-    assert actual == trigger.pipe_sddl(harness.sid).replace(";GA;", ";FA;")
-    assert actual.startswith("D:P(D;;FA;;;NU)(A;;FA;;;S-1-5-21-")  # exactly two ACEs: deny network, allow this user
-    assert actual.count("(") == 2
+    # Windows maps the generic right GA to the pipe's file right FA when it stores the ACL, and prints well-known
+    # SIDs as aliases when it reads it back (the built-in Administrator, RID 500, comes back as LA). So compare SIDs,
+    # not text.
+    protected, aces = parse_dacl(actual)
+    assert protected
+    assert [(kind, flags) for kind, flags, _, _ in aces] == [("D", ""), ("A", "")]
+    assert [rights for _, _, rights, _ in aces] in (["FA", "FA"], ["GA", "GA"])
+    assert [normalise_sid(sid) for *_, sid in aces] == ["S-1-5-2", normalise_sid(harness.sid)]  # deny network, allow this user
+
+
+def parse_dacl(sddl: str) -> tuple[bool, list[tuple[str, str, str, str]]]:
+    """A ``D:[P](type;flags;rights;object;inherited;sid)...`` string as (protected, [(type, flags, rights, sid)])."""
+    match = re.fullmatch(r"D:(P?)((?:\([^()]*\))*)", sddl)
+    assert match, sddl
+    aces = []
+    for body in re.findall(r"\(([^()]*)\)", match.group(2)):
+        kind, flags, rights, _object, _inherited, sid = body.split(";")
+        aces.append((kind, flags, rights, sid))
+    return match.group(1) == "P", aces
+
+
+def normalise_sid(sid: str) -> str:
+    """``S-1-...`` form of a SID given as ``S-1-...`` or as an SDDL alias (LA, NU, WD, ...)."""
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    advapi32.ConvertStringSidToSidW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p)]
+    advapi32.ConvertStringSidToSidW.restype = wintypes.BOOL
+    advapi32.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+    advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
+    binary, text = ctypes.c_void_p(), ctypes.c_void_p()
+    assert advapi32.ConvertStringSidToSidW(sid, ctypes.byref(binary)), f"not a SID: {sid!r}"
+    try:
+        assert advapi32.ConvertSidToStringSidW(binary, ctypes.byref(text))
+        try:
+            return ctypes.wstring_at(text.value)
+        finally:
+            tp._api().kernel32.LocalFree(text)
+    finally:
+        tp._api().kernel32.LocalFree(binary)
+
+
+def test_acl_parser_and_sid_normaliser_read_aliases():
+    protected, aces = parse_dacl("D:P(D;;FA;;;NU)(A;;FA;;;LA)")
+    assert protected
+    assert aces == [("D", "", "FA", "NU"), ("A", "", "FA", "LA")]
+    assert normalise_sid("NU") == "S-1-5-2"
+    assert normalise_sid("WD") == "S-1-1-0"
+    assert normalise_sid("SY") == "S-1-5-18"
+    assert normalise_sid("BA") == "S-1-5-32-544"
+    assert normalise_sid("LA").startswith("S-1-5-21-") and normalise_sid("LA").endswith("-500")
+    assert normalise_sid("S-1-5-2") == "S-1-5-2"
+    assert parse_dacl("D:(A;;GA;;;WD)")[0] is False
+    with pytest.raises(AssertionError):
+        normalise_sid("not a sid")
 
 
 def test_remote_clients_are_rejected_by_the_pipe_mode(monkeypatch):
