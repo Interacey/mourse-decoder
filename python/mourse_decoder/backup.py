@@ -74,6 +74,7 @@ MAX_MANIFEST_BYTES = 4 * MiB  # 2000 entries of about 250 bytes
 KEEP_RESTORE_POINTS = 5
 SQLITE_CHECK_SECONDS = 60
 MACRO_SUMMARY_LENGTH = 200
+EXTERNAL_TRIGGER_RISK = "external trigger"  # risk label of a slot that another program may start, like "trigger F5"
 PARAM_LIMIT = 300  # characters of one value in a message
 _UNCUT = ("files",)  # lists the user needs in full (the files a failed write left behind): written out, not cut
 
@@ -199,7 +200,8 @@ class SlotSummary:
     trigger: str
     enabled: bool
     macro: str  # shortened and escaped for display
-    risks: tuple[str, ...]  # what it does besides typing, from macros.commands_in_texts, plus a risky trigger
+    risks: tuple[str, ...]  # what it does besides typing, from macros.commands_in_texts, plus a risky trigger and
+    # EXTERNAL_TRIGGER_RISK when the slot may be started by the external trigger
 
 
 @dataclass(frozen=True)
@@ -755,6 +757,8 @@ def _summaries(keys: FunctionKeys) -> tuple[SlotSummary, ...]:
         risks = list(backup_content.slot_commands(slot.macro))
         if risk := backup_content.trigger_risk(slot.trigger):
             risks.append(f"trigger {display_text(risk)}")
+        if slot.triggerable:
+            risks.append(EXTERNAL_TRIGGER_RISK)
         out.append(
             SlotSummary(
                 slot.slot, display_text(slot.trigger), slot.enabled, display_text(slot.macro, MACRO_SUMMARY_LENGTH),
@@ -989,6 +993,35 @@ class _Loaded:
     language: str | None = None  # ``language`` of the settings.json of the bundle
 
 
+def _trigger_off(data: bytes) -> bytes | None:
+    """``settings.json`` with ``trigger_enabled`` set to false, or None if it is not true in it (no rewrite then).
+
+    The file is read as the settings loader reads it (a repeated key: the last one counts) and written the way
+    ``SettingsStore.save`` writes it. Only a real ``true`` is changed; any other value is left to the validation.
+    """
+    parsed = _parse_json(data)
+    if parsed.get("trigger_enabled") is not True:
+        return None
+    parsed["trigger_enabled"] = False
+    return json.dumps(parsed, indent=2, ensure_ascii=False).encode("utf-8")
+
+
+def _trigger_flags_off(data: bytes) -> bytes | None:
+    """``function_keys.json`` without any ``triggerable``, or None if no slot has it set (no rewrite then).
+
+    Read as the loader reads it and written the way ``FunctionKeysStore.save`` writes it. Any value that is not
+    false, null, 0 or "" counts as set (the loader drops a flag that is not a boolean, but the file is not left
+    to that); the key goes from every slot entry.
+    """
+    parsed = _parse_json(data)
+    entries = [e for e in parsed.get("slots", []) if isinstance(e, dict)]
+    if not any(e.get("triggerable") for e in entries):
+        return None
+    for entry in entries:
+        entry.pop("triggerable", None)
+    return json.dumps(parsed, indent=2, ensure_ascii=False).encode("utf-8")
+
+
 def _load(
     zip_path: Path,
     config_dir: Path,
@@ -1003,15 +1036,25 @@ def _load(
     manifest, files = _load_bundle(data, Path(zip_path).name)
     skipped = set(exclude)
     files = {name: content for name, content in files.items() if name not in skipped}
+    own = _is_own_restore_point(Path(zip_path), config_dir, manifest)
     removed = tuple(
         name
         for name in manifest.get("restore_created", [])
         if name not in skipped and name not in files and _regular(config_dir / name, config_dir)
-    ) if _is_own_restore_point(Path(zip_path), config_dir, manifest) else ()
+    ) if own else ()
     checked = _validate_files(config_dir, files, check_shortcut, set(removed))
+    notes = checked.notes
+    # An import never switches the external trigger on. A restore point of this config folder is the user's own
+    # earlier state (``_import`` writes it from the files in use), so undoing an import brings back what was set.
+    if SETTINGS_FILE in files and not own and (off := _trigger_off(files[SETTINGS_FILE])) is not None:
+        files = {**files, SETTINGS_FILE: off}
+        notes = (*notes, Note("trigger_off", {}))
+    # The macros of a foreign bundle are not startable from outside either: the flags go, the user marks them again.
+    if FUNCTION_KEYS_FILE in files and not own and (off := _trigger_flags_off(files[FUNCTION_KEYS_FILE])) is not None:
+        files = {**files, FUNCTION_KEYS_FILE: off}
+        notes = (*notes, Note("trigger_flags_removed", {}))
     return _Loaded(
-        manifest, files, digest, checked.keys, checked.warnings, checked.notes, removed, checked.telecode,
-        checked.language,
+        manifest, files, digest, checked.keys, checked.warnings, notes, removed, checked.telecode, checked.language
     )
 
 

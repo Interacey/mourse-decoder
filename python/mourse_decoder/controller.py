@@ -22,7 +22,7 @@ from typing import NamedTuple, Protocol
 from . import clipboard, desktop, macros
 from .decoders import Decoder, Emission, create_decoder
 from .dictionary import DictionaryManager
-from .function_keys import FunctionKeys, Slot
+from .function_keys import SLOT_COUNT, FunctionKeys, Slot, outsiders_barred
 from .scroller import DOWN, UP, Scroller
 from .settings import Settings, effective_typing_delay
 
@@ -217,6 +217,7 @@ class MorseController:
     MODIFIER_TIMEOUT_S = 3.0  # a function key waits this long for Ctrl/Alt/Shift/Win to be let go
     # measuring ends by itself after this long, so letters can never stay muted because a page forgot to stop
     CALIBRATION_MAX_S = 600.0
+    BUSY_REASON = "Ein anderes Makro läuft noch."
 
     def __init__(
         self,
@@ -603,16 +604,56 @@ class MorseController:
                 return f"{slot.name} ist ausgeschaltet oder hat kein Makro."
             if not (self._settings.enabled and self._engine.active):
                 return "Die Morse-Eingabe ist ausgeschaltet."
+        return self._start_slot(slot, block)
+
+    def trigger_slot(self, number: int) -> str:
+        """Start the macro of a slot for a caller outside the program; never raises, never waits.
+
+        Returns "ok" (started on its own thread, like a function key) or why not: "unknown_macro" (no such
+        slot), "not_allowed" (slot not triggerable, off or empty, or its macro has a command of
+        ``SENSITIVE_KINDS``: parsed again here, whatever the stored flag says), "inactive" (Morse input is off, or
+        the controller is stopped or stopping), "broken" (the macro does not parse, or anything else went wrong)
+        or "busy" (another macro is typing).
+        The slot is read once, so the flag that was checked and the macro that runs are the same object.
+        """
+        try:
+            if type(number) is not int or not 1 <= number <= SLOT_COUNT:
+                return "unknown_macro"
+            with self._lock:
+                keys = self._function_keys
+                slot = keys.slot(number) if number <= len(keys.slots) else None
+                running = bool(self._running and self._settings.enabled and self._engine.active)
+            if slot is None:
+                return "unknown_macro"
+            allowed = slot.triggerable is True and slot.enabled is True and isinstance(slot.macro, str)
+            if not (allowed and slot.macro.strip()) or outsiders_barred(slot.macro):
+                return "not_allowed"
+            if not running:
+                return "inactive"
+            reason = self._start_slot(slot, block=False)
+            return "ok" if reason is None else "busy" if reason == self.BUSY_REASON else "broken"
+        except Exception:  # noqa: BLE001 - the caller gets an answer, whatever happens here
+            log.exception("Auslösen von Slot %r fehlgeschlagen", number)
+            return "broken"
+
+    def _start_slot(self, slot: Slot, block: bool) -> str | None:
+        """Check the macro and start it; None if it runs, else why not (``BUSY_REASON`` or the parse error)."""
         try:
             macros.parse(slot.macro, self._injector.check_shortcut)  # a broken macro is reported right away
         except macros.MacroError as exc:
             return str(exc)
         if not self._macro_lock.acquire(blocking=False):
-            return "Ein anderes Makro läuft noch."
+            return self.BUSY_REASON
         if block:
             self._run_slot_locked(slot)
         else:
-            threading.Thread(target=self._run_slot_locked, args=(slot,), name=f"macro-{slot.name}", daemon=True).start()
+            try:
+                threading.Thread(
+                    target=self._run_slot_locked, args=(slot,), name=f"macro-{slot.name}", daemon=True
+                ).start()
+            except BaseException:  # no thread, so nobody would release the lock
+                self._macro_lock.release()
+                raise
         return None
 
     def _run_slot_locked(self, slot: Slot) -> None:

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import ast
+import dataclasses
 import json
+from pathlib import Path
 
 import pytest
 from mourse_decoder.settings import TRIGGER_NAMES, Settings, SettingsStore, default_config_dir
@@ -150,3 +153,94 @@ def test_clash_without_shortcut_cause_still_falls_back(tmp_path):
     (tmp_path / "settings.json").write_text(json.dumps(data), encoding="utf-8")
     assert SettingsStore(tmp_path).load() == Settings()
     assert (tmp_path / "settings.json.bak").exists()
+
+
+# trigger_enabled (external macro trigger)
+
+# values that need no valid default: the field is checked as a boolean like the other switches
+NOT_BOOLEAN = ["ja", "true", 1, 0, None, [], {}]
+
+
+def test_trigger_enabled_is_off_by_default():
+    assert Settings().trigger_enabled is False
+    assert Settings().to_dict()["trigger_enabled"] is False
+    assert Settings(trigger_enabled=True).validate() == []
+
+
+def test_from_dict_of_an_old_dict_defaults_trigger_enabled_to_false():
+    assert Settings.from_dict({}).trigger_enabled is False
+    assert Settings.from_dict({"trigger": "F8", "enabled": False}).trigger_enabled is False
+    old = Settings().to_dict()
+    del old["trigger_enabled"]
+    assert Settings.from_dict(old) == Settings()
+    assert Settings.from_dict({"trigger_enabled": True}).trigger_enabled is True
+
+
+@pytest.mark.parametrize("value", NOT_BOOLEAN)
+def test_trigger_enabled_must_be_a_boolean(value):
+    assert Settings(trigger_enabled=value).validate() == ["'trigger_enabled' muss true oder false sein."]
+
+
+@pytest.mark.parametrize("value", NOT_BOOLEAN)
+def test_a_file_with_a_non_boolean_trigger_enabled_is_dropped_like_other_booleans(tmp_path, value):
+    data = Settings().to_dict()
+    data.update(trigger_enabled=value, letter_gap_ms=555)
+    text = json.dumps(data)
+    (tmp_path / "settings.json").write_text(text, encoding="utf-8")
+    store = SettingsStore(tmp_path)
+    assert store.load() == Settings()
+    assert (tmp_path / "settings.json.bak").read_text(encoding="utf-8") == text
+    assert store.warnings and store.warnings[0][0] == "startup.settings_discarded"
+
+
+def test_a_file_without_the_key_loads_with_false_and_is_not_rewritten(tmp_path):
+    text = '{"alphabet": "de", "letter_gap_ms": 700}'
+    (tmp_path / "settings.json").write_text(text, encoding="utf-8")
+    loaded = SettingsStore(tmp_path).load()
+    assert loaded.trigger_enabled is False and loaded.alphabet == "de"
+    assert (tmp_path / "settings.json").read_text(encoding="utf-8") == text
+    assert not (tmp_path / "settings.json.bak").exists()
+
+
+def test_a_saved_file_holds_the_key_and_round_trips_it(tmp_path):
+    store = SettingsStore(tmp_path)
+    store.save(Settings())
+    assert json.loads(store.path.read_text(encoding="utf-8"))["trigger_enabled"] is False
+    store.save(Settings(trigger_enabled=True))
+    assert json.loads(store.path.read_text(encoding="utf-8"))["trigger_enabled"] is True
+    assert store.load() == Settings(trigger_enabled=True)
+
+
+def test_a_file_with_unknown_future_keys_still_loads(tmp_path):
+    data = Settings(trigger_enabled=True).to_dict()
+    data.update(zukunft={"a": 1}, trigger_port=1234)
+    (tmp_path / "settings.json").write_text(json.dumps(data), encoding="utf-8")
+    store = SettingsStore(tmp_path)
+    assert store.load() == Settings(trigger_enabled=True)
+    assert store.warnings == [] and not (tmp_path / "settings.json.bak").exists()
+
+
+def _settings_samples() -> list[tuple[str, str]]:
+    """Every string in the test files that is a JSON object whose keys are all setting names: the sample
+    settings.json files the other tests write (and ``{}``)."""
+    names = {f.name for f in dataclasses.fields(Settings)}
+    found: dict[str, str] = {}
+    for path in sorted(Path(__file__).parent.glob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str | bytes):
+                try:
+                    parsed = json.loads(node.value)
+                except ValueError:
+                    continue
+                if isinstance(parsed, dict) and set(parsed) <= names and "trigger_enabled" not in parsed:
+                    found[json.dumps(parsed, sort_keys=True)] = f"{path.name}:{node.lineno}"
+    return [(source, text) for text, source in found.items()]
+
+
+def test_every_settings_sample_of_the_other_tests_loads_with_trigger_enabled_false(tmp_path):
+    samples = _settings_samples()
+    assert len(samples) >= 10, "the scan must find the samples (an empty scan would pass)"
+    for source, text in samples:
+        (tmp_path / "settings.json").write_text(text, encoding="utf-8")
+        assert SettingsStore(tmp_path).load().trigger_enabled is False, (source, text)
+        assert Settings.from_dict(json.loads(text)).trigger_enabled is False, (source, text)

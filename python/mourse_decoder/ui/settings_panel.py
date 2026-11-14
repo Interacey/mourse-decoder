@@ -22,6 +22,7 @@ from ..function_keys import FunctionKeys, FunctionKeysStore
 from ..i18n import available_languages, tr
 from ..import_gate import gate
 from ..settings import THEME_MODES, TYPING_DELAY_RANGE, Settings, SettingsStore, default_config_dir
+from ..trigger import TriggerEvent
 from . import theme, tkfinalizers
 from .form import parse_form
 from .key_capture import CaptureBackend, KeyCaptureButton, ShortcutCaptureButton
@@ -30,6 +31,8 @@ from .theme import Button, Card, ScrollFrame, Switch, field_box, label, list_box
 PREVIEW_LINES = 12  # file names listed in the import confirmation
 MAX_COMMAND_LINES = 100  # entries with commands from alphabet and smiley files listed in the confirmation
 WORKER_POLL_MS = 50  # how often the Tk thread looks for the result of a backup job
+TRIGGER_LOG_LINES = 20  # requests of the external trigger listed on the page
+TRIGGER_HINT_WIDTH = 600  # the long explanation wraps here
 
 log = logging.getLogger(__name__)
 
@@ -42,6 +45,11 @@ def _trusted(key: str, **values: object) -> str:
     come from a language file in the user's folder: one that arrived with an earlier import could drop the
     warning from it, or swap what Yes and No say (see ``i18n.tr_trusted``)."""
     return i18n.tr_trusted(key, **values)
+
+
+def _risk_label(risk: str) -> str:
+    """A risk of a macro in the import confirmation: the external trigger in the current language, the rest as it is."""
+    return _trusted("backup.risk.external_trigger") if risk == backup.EXTERNAL_TRIGGER_RISK else risk
 
 
 def _note_text(note: backup_content.Note) -> str:
@@ -148,8 +156,12 @@ class SettingsPanel(tk.Frame):
         backup_dialogs: BackupDialogs | None = None,
         config_dir: Path | None = None,
         on_imported: Callable[[], None] | None = None,
+        trigger_events: Callable[[], list[TriggerEvent]] | None = None,  # oldest first
+        trigger_status: Callable[[], str] | None = None,  # "off", "running" or "unavailable"
     ) -> None:
         super().__init__(master, bg=theme.P.bg)
+        self._trigger_events = trigger_events
+        self._trigger_status = trigger_status
         # the window, not this page: a language change rebuilds the pages while a dialog may still be open
         self._backup_dialogs = backup_dialogs or BackupDialogs(self.winfo_toplevel())
         self._backup_running = False  # a backup job is on its way: buttons off, no settings changes
@@ -299,6 +311,24 @@ class SettingsPanel(tk.Frame):
             button.pack()
             self._backup_buttons.append(button)
 
+        # external trigger: other programs may start macros of slots marked on the function keys page
+        self._section(13, "settings.section.trigger")
+        external = Card(body)
+        external.grid(row=14, column=0, sticky="ew")
+        self._trigger_enabled = tk.BooleanVar()
+        self._trigger_enabled.trace_add("write", lambda *_: self._changed())
+        Switch(external.add_row(tr("settings.trigger")), self._trigger_enabled).pack()
+        label(body, tr("settings.trigger.hint"), size=9, muted=True, justify="left", wraplength=TRIGGER_HINT_WIDTH).grid(
+            row=15, column=0, sticky="w", padx=8, pady=(8, 0)
+        )
+        self._trigger_state = label(body, "", size=9, muted=True, justify="left", wraplength=TRIGGER_HINT_WIDTH)
+        self._trigger_state.grid(row=16, column=0, sticky="w", padx=8, pady=(8, 0))
+        label(body, tr("settings.trigger.log.title"), size=9, weight="bold", muted=True).grid(
+            row=17, column=0, sticky="w", padx=8, pady=(12, 0)
+        )
+        self._trigger_log = label(body, "", size=9, muted=True, justify="left")
+        self._trigger_log.grid(row=18, column=0, sticky="w", padx=8, pady=(4, 8))
+
         self.refresh()
 
     def _section(self, row: int, key: str) -> None:
@@ -323,8 +353,28 @@ class SettingsPanel(tk.Frame):
         else:
             self._key_hint.grid_remove()
 
+    def _show_trigger(self) -> None:
+        """The state of the external trigger and its last requests (nothing without the two callables)."""
+        status = self._trigger_status() if self._trigger_status else "off"
+        text = tr(f"settings.trigger.status.{status}") if status in ("running", "unavailable") else ""
+        self._trigger_state.configure(text=text)
+        if text:
+            self._trigger_state.grid()
+        else:
+            self._trigger_state.grid_remove()
+        events = self._trigger_events()[-TRIGGER_LOG_LINES:] if self._trigger_events else []
+        lines = [
+            tr(
+                "trigger.log.line", time=datetime.fromtimestamp(e.time).strftime("%H:%M:%S"),
+                slot="-" if e.slot is None else f"F{e.slot}", result=tr(f"trigger.result.{e.code}"),
+            )
+            for e in reversed(events)  # newest first
+        ]
+        self._trigger_log.configure(text="\n".join(lines) or tr("settings.trigger.log.empty"))
+
     def refresh(self) -> None:
         """Fill the form from the current settings and files (not during our own change)."""
+        self._show_trigger()
         if self._busy:
             return
         self._loading = True
@@ -339,6 +389,7 @@ class SettingsPanel(tk.Frame):
             self._dash_button.set_enabled(current.separate_dash_key)
             self._block.set(current.block_input)
             self._notify.set(current.notifications)
+            self._trigger_enabled.set(current.trigger_enabled)
             self._shortcut_button.set_shortcut(current.block_shortcut)
             self._undo_button.set_shortcut(current.undo_shortcut)
 
@@ -405,6 +456,7 @@ class SettingsPanel(tk.Frame):
             enabled=self._enabled.get(),
             block_input=self._block.get(),
             notifications=self._notify.get(),
+            trigger_enabled=self._trigger_enabled.get(),
             block_shortcut=self._shortcut_button.shortcut,
             cycle_shortcut=self._cycle_button.shortcut,
             undo_shortcut=self._undo_button.shortcut,
@@ -676,13 +728,16 @@ class SettingsPanel(tk.Frame):
             lines = [
                 _trusted(
                     "backup.import.slot", slot=s.slot, trigger=s.trigger or "-", macro=s.macro,
-                    risks=(" [" + ", ".join(s.risks) + "]") if s.risks else "",
+                    risks=(" [" + ", ".join(_risk_label(r) for r in s.risks) + "]") if s.risks else "",
                 )
                 for s in preview.slots  # all of them, the risky ones first; the dialog scrolls
             ]
             warning = _trusted("backup.import.warn.macros", count=len(preview.slots))
             if preview.risky:
-                found = sorted({r for s in preview.slots for r in s.risks} | {r for c in preview.commands for r in c.risks})
+                found = sorted(
+                    {_risk_label(r) for s in preview.slots for r in s.risks}
+                    | {_risk_label(r) for c in preview.commands for r in c.risks}
+                )
                 warning += " " + _trusted("backup.import.warn.risky", commands=", ".join(found))
             blocks.append(warning + "\n" + "\n".join(lines))
         if preview.commands:
@@ -690,7 +745,7 @@ class SettingsPanel(tk.Frame):
             total = max(preview.commands_total, len(preview.commands))  # the list kept per file is capped
             lines = [
                 _trusted(
-                    "backup.import.command", path=c.label, code=c.code, text=c.text, risks=", ".join(c.risks)
+                    "backup.import.command", path=c.label, code=c.code, text=c.text, risks=", ".join(_risk_label(r) for r in c.risks)
                 )
                 for c in shown
             ]
