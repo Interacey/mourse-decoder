@@ -7,12 +7,14 @@ import threading
 import time
 
 import mourse_decoder.controller as controller_module
+import mourse_decoder.function_keys as function_keys
 import pytest
 from mourse_decoder.controller import MorseController
 from mourse_decoder.dictionary import DictionaryManager
 from mourse_decoder.function_keys import (
     MAX_MACRO_LENGTH,
     SCHEMA_VERSION,
+    SENSITIVE_KINDS,
     SLOT_COUNT,
     FunctionKeys,
     FunctionKeysStore,
@@ -20,6 +22,7 @@ from mourse_decoder.function_keys import (
     default_slot,
     default_trigger,
     describe_trigger,
+    sensitive_kinds,
     slot_name,
 )
 from mourse_decoder.settings import Settings, is_valid_binding, normalize_binding, same_binding
@@ -667,3 +670,151 @@ def test_a_slot_without_trigger_can_still_be_run_from_the_ui(fake_engine, inject
     controller.apply_function_keys(with_slot(trigger="", macro="Hallo"))
     assert controller.run_slot(5, block=True) is None
     assert injector.calls == [("text", "Hallo")]
+
+
+# triggerable (external macro trigger)
+
+
+def test_triggerable_is_off_by_default_and_a_default_slot_stays_default():
+    assert Slot(5).triggerable is False
+    assert default_slot(5).is_default()
+    assert not default_slot(5).replace(triggerable=True).is_default()
+    assert not default_slot(5).replace(triggerable=True).same_content(default_slot(5))
+
+
+def test_triggerable_is_written_only_when_true_and_survives_a_round_trip(tmp_path):
+    s = store(tmp_path)
+    keys = with_slot(None, 5, trigger="Ctrl+F5", macro="Hallo", triggerable=True)
+    keys = with_slot(keys, 6, trigger="Ctrl+F6", macro="Hallo", triggerable=False)
+    keys = with_slot(keys, 30, triggerable=True)  # a default slot that only gained the flag is written too
+    s.save(keys)
+    data = json.loads((tmp_path / "function_keys.json").read_text(encoding="utf-8"))
+    by_slot = {e["slot"]: e for e in data["slots"]}
+    assert sorted(by_slot) == [5, 6, 30]
+    assert by_slot[5]["triggerable"] is True and by_slot[30]["triggerable"] is True
+    assert "triggerable" not in by_slot[6], "same bytes per slot as before this field"
+    loaded, warnings = s.load(check)
+    assert warnings == [] and loaded == keys
+    assert loaded.slot(5).triggerable is True and loaded.slot(6).triggerable is False
+
+
+def test_a_file_from_before_the_field_loads_unchanged(tmp_path):
+    entry = {"slot": 5, "trigger": "Ctrl+F5", "macro": "x", "enabled": True, "swallow": True, "label": "alt"}
+    (tmp_path / "function_keys.json").write_text(json.dumps({"schema_version": 1, "slots": [entry]}), encoding="utf-8")
+    keys, warnings = store(tmp_path).load(check)
+    assert warnings == [] and not (tmp_path / "function_keys.json.bak").exists()
+    assert keys.slot(5) == Slot(5, trigger="Ctrl+F5", macro="x", label="alt") and keys.slot(5).extra == {}
+    store(tmp_path).save(keys)
+    assert json.loads((tmp_path / "function_keys.json").read_text(encoding="utf-8"))["slots"] == [entry]
+
+
+def test_a_program_that_does_not_know_the_field_keeps_it_in_extra_and_writes_it_back(tmp_path, monkeypatch):
+    entry = {"slot": 5, "trigger": "Ctrl+F5", "macro": "x", "triggerable": True}
+    (tmp_path / "function_keys.json").write_text(json.dumps({"schema_version": 1, "slots": [entry]}), encoding="utf-8")
+    monkeypatch.setattr(function_keys, "_SLOT_FIELDS", function_keys._SLOT_FIELDS - {"triggerable"})  # the older program
+    s = store(tmp_path)
+    keys, warnings = s.load(check)
+    assert warnings == [] and keys.slot(5).extra == {"triggerable": True}
+    s.save(with_slot(keys, 5, macro="y"))
+    saved = json.loads((tmp_path / "function_keys.json").read_text(encoding="utf-8"))["slots"][0]
+    assert saved["triggerable"] is True and saved["macro"] == "y"
+
+
+@pytest.mark.parametrize(
+    "macro",
+    ["{Clipboard}", "a{Zwischenablage}b", "{Scrape A | B | => $1}", "{File C:/x.txt}", "{Loop 2}{Datei C:/x}{EndLoop}"],
+)
+def test_a_sensitive_macro_loses_the_flag_on_load_but_the_slot_stays(tmp_path, macro):
+    entry = {"slot": 6, "trigger": "Ctrl+F6", "macro": macro, "triggerable": True, "label": "mein"}
+    (tmp_path / "function_keys.json").write_text(json.dumps({"schema_version": 1, "slots": [entry]}), encoding="utf-8")
+    keys, warnings = store(tmp_path).load(check)
+    slot = keys.slot(6)
+    assert slot.triggerable is False
+    assert slot.enabled and slot.active and slot.macro == macro and slot.label == "mein" and slot.trigger == "Ctrl+F6"
+    assert len(warnings) == 1 and warnings[0].startswith("F6: ") and "von außen" in warnings[0]
+    assert "ausgeschaltet" not in warnings[0]
+    assert (tmp_path / "function_keys.json.bak").is_file(), "the file is saved before the next write changes it"
+    assert keys.validate(None, check) == []
+
+
+def test_a_sensitive_macro_that_is_also_broken_is_switched_off_and_loses_the_flag(tmp_path):
+    entry = {"slot": 6, "trigger": "VK27", "macro": "{Clipboard}", "triggerable": True}
+    (tmp_path / "function_keys.json").write_text(json.dumps({"schema_version": 1, "slots": [entry]}), encoding="utf-8")
+    keys, warnings = store(tmp_path).load()
+    assert keys.slot(6).triggerable is False and keys.slot(6).enabled is False and keys.slot(6).macro == "{Clipboard}"
+    assert len(warnings) == 1 and warnings[0].startswith("F6: ausgeschaltet.") and "von außen" in warnings[0]
+
+
+@pytest.mark.parametrize("value", ["ja", 1, 0, None, [], {}])
+def test_a_flag_that_is_no_boolean_is_cleared_with_a_warning_and_the_slot_stays(tmp_path, value):
+    entry = {"slot": 6, "trigger": "Ctrl+F6", "macro": "x", "triggerable": value}
+    (tmp_path / "function_keys.json").write_text(json.dumps({"schema_version": 1, "slots": [entry]}), encoding="utf-8")
+    keys, warnings = store(tmp_path).load(check)
+    assert keys.slot(6).triggerable is False and keys.slot(6).active and keys.slot(6).macro == "x"
+    assert len(warnings) == 1 and "'triggerable' muss true oder false sein" in warnings[0]
+
+
+def test_validate_refuses_a_non_boolean_flag_and_a_sensitive_macro_with_the_flag():
+    errors = with_slot(None, 5, macro="x", triggerable="ja").validate()
+    assert errors == ["F5: 'triggerable' muss true oder false sein."]
+    errors = with_slot(None, 5, macro="{Clipboard}", triggerable=True).validate()
+    assert errors == ["F5: Ein Makro mit {Clipboard}, {Scrape …} oder {File …} kann nicht von außen ausgelöst werden."]
+    assert with_slot(None, 5, macro="{Clipboard}", triggerable=False).validate() == []
+    assert with_slot(None, 5, macro="{Ctrl+C}{Wait 5}", triggerable=True).validate(None, check) == []
+    assert with_slot(None, 5, macro="{Schleife 2}x", triggerable=True, enabled=False).validate(None, check) == []
+
+
+def test_save_refuses_a_sensitive_triggerable_slot_and_keeps_the_old_file(tmp_path):
+    s = store(tmp_path)
+    s.save(with_slot(None, 1, macro="a"))
+    before = (tmp_path / "function_keys.json").read_bytes()
+    with pytest.raises(ValueError, match="von außen"):
+        s.save(with_slot(None, 1, macro="{Datei C:/x}", triggerable=True))
+    assert (tmp_path / "function_keys.json").read_bytes() == before
+
+
+def test_sensitive_kinds_lists_the_kinds_in_order_of_first_use():
+    assert SENSITIVE_KINDS == ("clipboard", "scrape", "files")
+    assert sensitive_kinds("a{Datei x}{Zwischenablage}{File y}") == ["files", "clipboard"]
+    assert sensitive_kinds("{Scrape A | B | => $1}{Clipboard}") == ["scrape", "clipboard"]
+    assert sensitive_kinds("{Loop 2}{Clipboard}{EndLoop}") == ["clipboard"]
+    assert sensitive_kinds("{Ctrl+C}{Anything odd}hello{WaitWindow x}{Scroll Down}{Rollback}") == []
+    assert sensitive_kinds("") == []
+    assert sensitive_kinds("{Clipboard}{Loop 2}") == [], "a macro that does not parse never runs, so it has no kinds"
+    assert sensitive_kinds("\ud800{Clipboard}") == []
+
+
+# the length cap and the cheap guard of the trigger check
+
+def test_outsiders_barred_is_the_sensitive_kinds_or_a_macro_over_the_cap():
+    assert function_keys.outsiders_barred("{Clipboard}") is True
+    assert function_keys.outsiders_barred("a" * (MAX_MACRO_LENGTH + 1)) is True
+    assert function_keys.outsiders_barred("a" * MAX_MACRO_LENGTH) is False
+    assert function_keys.outsiders_barred("{Ctrl+V}hello") is False
+
+
+def test_an_over_long_macro_with_the_flag_is_refused_without_parsing_it(monkeypatch):
+    parsed = []
+    monkeypatch.setattr(function_keys.macros, "parse", lambda *a: parsed.append(a) or [])
+    long_macro = "a" * (MAX_MACRO_LENGTH + 1)
+    errors = with_slot(None, 5, macro=long_macro, triggerable=True).validate()
+    assert "F5: Ein Makro mit {Clipboard}, {Scrape …} oder {File …} kann nicht von außen ausgelöst werden." in errors
+    assert f"F5: Das Makro ist länger als {MAX_MACRO_LENGTH} Zeichen." in errors
+    assert parsed == []
+
+
+def test_a_slot_without_the_flag_is_not_parsed_for_the_trigger_check(monkeypatch):
+    parsed = []
+    monkeypatch.setattr(function_keys.macros, "parse", lambda *a: parsed.append(a) or [])
+    for changes in ({"enabled": False}, {"enabled": True}):
+        slot = Slot(5, trigger="Ctrl+F5", macro="x" * MAX_MACRO_LENGTH, **changes)
+        assert function_keys._triggerable_error(slot) == ""
+    assert parsed == []
+
+
+def test_an_over_long_macro_with_the_flag_loses_the_flag_on_load_and_the_slot_is_switched_off(tmp_path):
+    entry = {"slot": 6, "trigger": "Ctrl+F6", "macro": "a" * (MAX_MACRO_LENGTH + 1), "triggerable": True}
+    (tmp_path / "function_keys.json").write_text(json.dumps({"schema_version": 1, "slots": [entry]}), encoding="utf-8")
+    keys, warnings = store(tmp_path).load(check)
+    assert keys.slot(6).triggerable is False and keys.slot(6).enabled is False
+    assert len(warnings) == 1 and "von außen" in warnings[0] and "länger als" in warnings[0]

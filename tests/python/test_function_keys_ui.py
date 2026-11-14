@@ -352,3 +352,131 @@ def test_changing_only_the_delay_makes_the_slot_dirty(page):
     assert not page._dirty()
     page._delay_var.set("60")
     assert page._dirty()
+
+
+# external trigger
+
+
+def test_the_trigger_switch_round_trips_through_save_and_the_list_marks_the_slot(page):
+    select(page, 57)
+    type_macro(page, "hello")
+    assert page._triggerable.get() is False
+    page._triggerable.set(True)
+    assert page._dirty()
+    page._save()
+    assert page.controller.function_keys.slot(57).triggerable is True
+    assert saved_slots(page)[57]["triggerable"] is True
+    assert page._tree.item("57", "values")[5] == "✓"
+    assert page._tree.item("13", "values")[5] == ""
+    select(page, 13)
+    assert page._triggerable.get() is False
+    select(page, 57)
+    assert page._triggerable.get() is True and not page._dirty()
+    page._triggerable.set(False)
+    page._save()
+    assert page.controller.function_keys.slot(57).triggerable is False
+    assert "triggerable" not in saved_slots(page)[57]
+    assert page._tree.item("57", "values")[5] == ""
+
+
+def test_a_sensitive_macro_switches_the_trigger_off_and_says_why(page):
+    select(page, 57)
+    type_macro(page, "hello")
+    page._triggerable.set(True)
+    assert not page._sensitive_note.grid_info()
+    type_macro(page, "x{Clipboard}")
+    assert page._triggerable.get() is False
+    assert page._sensitive_note.grid_info()
+    page._triggerable.set(True)  # a click on the switch does not stick
+    assert page._triggerable.get() is False
+    assert page._editor_slot().triggerable is False
+    page._save()
+    assert page.controller.function_keys.slot(57).triggerable is False
+    assert page.controller.function_keys.slot(57).macro == "x{Clipboard}"
+    assert "triggerable" not in saved_slots(page)[57]
+    type_macro(page, "x")
+    assert not page._sensitive_note.grid_info()
+
+
+def test_the_editor_never_hands_a_sensitive_triggerable_slot_to_the_commit(page, monkeypatch):
+    select(page, 57)
+    type_macro(page, "x{Scrape A | B | => $1}")
+    committed = []
+    monkeypatch.setattr(page, "_commit", lambda new: committed.append(new) or True)
+    page._triggerable.set(True)
+    page._save()
+    assert committed and not committed[0].slot(57).triggerable
+
+
+def test_the_trigger_column_has_a_heading(page):
+    assert page._tree.heading("external", "text") == "External"
+
+
+def test_the_switch_choice_comes_back_when_the_sensitive_command_is_removed(page):
+    select(page, 57)
+    type_macro(page, "hello")
+    page._triggerable.set(True)
+    type_macro(page, "hello{Clipboard}")
+    assert page._triggerable.get() is False and page._sensitive_note.grid_info()
+    assert page._editor_slot().triggerable is False
+    type_macro(page, "hello")
+    assert page._triggerable.get() is True and not page._sensitive_note.grid_info()
+    assert page._editor_slot().triggerable is True
+
+
+def test_a_click_on_the_switch_while_the_macro_is_sensitive_does_not_change_the_choice(page):
+    select(page, 57)
+    type_macro(page, "hello")
+    type_macro(page, "{Scrape A | B | => $1}")
+    page._triggerable.set(True)  # the click does not stick
+    assert page._triggerable.get() is False
+    type_macro(page, "hello")
+    assert page._triggerable.get() is False and page._editor_slot().triggerable is False
+
+
+def test_a_switch_that_was_off_stays_off_after_a_sensitive_command_came_and_went(page):
+    select(page, 57)
+    type_macro(page, "hello")
+    type_macro(page, "hello{File C:/x}")
+    type_macro(page, "hello")
+    assert page._triggerable.get() is False
+
+
+def test_a_slot_saved_as_triggerable_keeps_the_flag_when_the_command_is_typed_and_deleted_again(page):
+    select(page, 57)
+    type_macro(page, "hello")
+    page._triggerable.set(True)
+    page._save()
+    assert page.controller.function_keys.slot(57).triggerable is True
+    type_macro(page, "hello{Clipboard}")
+    type_macro(page, "hello")
+    assert page._triggerable.get() is True and not page._dirty()
+
+
+def test_loading_a_slot_does_not_leak_the_choice_of_the_previous_one(page, monkeypatch):
+    monkeypatch.setattr("mourse_decoder.ui.function_keys_panel.messagebox.askyesno", lambda *a, **k: True)
+    select(page, 57)
+    type_macro(page, "hello")
+    page._triggerable.set(True)
+    type_macro(page, "hello{Clipboard}")
+    select(page, 13)  # the question about the unsaved edit is answered yes
+    assert page._triggerable.get() is False
+    type_macro(page, "Hello{Clipboard}")
+    type_macro(page, "Hello")
+    assert page._triggerable.get() is False
+
+
+def test_one_keystroke_parses_the_macro_at_most_once(page, monkeypatch):
+    from mourse_decoder.ui import function_keys_panel as panel
+
+    calls = []
+    real = panel.sensitive_kinds
+    monkeypatch.setattr(panel, "sensitive_kinds", lambda text: calls.append(text) or real(text))
+    panel.is_sensitive.cache_clear()
+    select(page, 57)
+    page._macro.delete("1.0", "end")
+    page._macro.insert("1.0", "unique text 1{Clipboard}")
+    page.update()  # <<Modified>> -> _changed: switch, buttons (dirty check)
+    page._editor_slot()
+    page._dirty()
+    assert calls.count("unique text 1{Clipboard}") == 1

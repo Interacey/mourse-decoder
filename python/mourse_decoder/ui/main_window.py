@@ -87,6 +87,8 @@ class MainWindow:
         on_hide: Callable[[], None],
         on_quit: Callable[[], None],
         config_dir: Path | None = None,
+        trigger_events: Callable[[], list] | None = None,  # the settings page lists these (TriggerEvent, oldest first)
+        trigger_status: Callable[[], str] | None = None,  # "off", "running" or "unavailable"
     ) -> None:
         self._root = root
         self._controller = controller
@@ -96,6 +98,8 @@ class MainWindow:
         self._on_hide = on_hide
         self._on_quit = on_quit
         self._config_dir = config_dir
+        self._trigger_events = trigger_events
+        self._trigger_status = trigger_status
         self._page = "settings"
         self._icon_image: ImageTk.PhotoImage | None = None
         self._rendered: tuple[str, str] = ("", "")
@@ -194,7 +198,10 @@ class MainWindow:
         if name == "settings":
             from .settings_panel import SettingsPanel
 
-            page = SettingsPanel(stack, c, d, apply, on_imported=self._changed)
+            page = SettingsPanel(
+                stack, c, d, apply, on_imported=self._changed,
+                trigger_events=self._trigger_events, trigger_status=self._trigger_status,
+            )
         elif name == "alphabets":
             from .alphabet_panel import AlphabetPanel
 
