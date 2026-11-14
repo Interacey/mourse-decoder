@@ -73,7 +73,8 @@ class Release:
     sha_url: str | None
     page: str  # html_url from the release JSON; never opened, the update page opens RELEASES_URL
     sig_url: str | None = None  # MourseDecoder.exe.sig; an update is never installed without it
-    # the installer, its checksum and its signature: all three or none; an MSI-installed copy updates only with them
+    # the installer, its checksum and its signature, as found in the release: an MSI-installed copy updates only with
+    # all three; some but not all is refused without the download page (see _download_msi)
     msi_url: str | None = None
     msi_sha_url: str | None = None
     msi_sig_url: str | None = None
@@ -213,9 +214,7 @@ def fetch_latest(urlopen: Callable | None = None) -> Release:
         raise UpdateError("Unerwartete Antwort von GitHub.") from None
     if EXE_NAME not in assets:
         raise UpdateError(tr("update.err.no_exe", tag=tag, exe=EXE_NAME))  # nothing to install and nothing to offer
-    msi = [assets.get(name) for name in (MSI_NAME, f"{MSI_NAME}.sha256", f"{MSI_NAME}.sig")]
-    if None in msi:  # a partial set counts as no installer: install() refuses it, it is never half-trusted
-        msi = [None, None, None]
+    msi = [assets.get(name) for name in (MSI_NAME, f"{MSI_NAME}.sha256", f"{MSI_NAME}.sig")]  # install() judges the set
     exe_sha, exe_sig = assets.get(f"{EXE_NAME}.sha256"), assets.get(f"{EXE_NAME}.sig")
     return Release(tag, notes, assets[EXE_NAME], exe_sha, page, exe_sig, *msi)
 
@@ -275,13 +274,20 @@ def _download(release: Release, directory: Path, urlopen: Callable | None) -> tu
 
 
 def _download_msi(release: Release, directory: Path, urlopen: Callable | None) -> tuple[Path, str]:
-    """Like ``_download`` for the installer; a release without all three installer files is refused (``no_msi``)."""
+    """Like ``_download`` for the installer; a release without all three installer files is refused.
+
+    No installer file at all (``no_msi``) offers the download page. Some but not all of the three (``msi_incomplete``)
+    does not, for the same reason as the exe: whoever can edit a release can delete the signature and swap the file.
+    """
     _require_newer(release.tag)
-    if release.msi_url is None or release.msi_sha_url is None or release.msi_sig_url is None:
+    found = (release.msi_url, release.msi_sha_url, release.msi_sig_url)
+    if all(url is None for url in found):
         raise UpdateError(tr("update.err.no_msi", tag=release.tag), open_page=True)
+    if None in found:
+        raise UpdateError(tr("update.err.msi_incomplete", tag=release.tag))
     return _fetch_verified(
         release.tag, directory, urlopen, MSI_NAME, release.msi_url, release.msi_sha_url, release.msi_sig_url,
-        MSI_MAGIC, MAX_MSI_BYTES, "Die geladene Datei ist kein Windows-Installer-Paket – Update abgebrochen.",
+        MSI_MAGIC, MAX_MSI_BYTES, tr("update.err.not_msi"),
     )
 
 
@@ -349,7 +355,7 @@ def result_path(config_dir: Path | None = None) -> Path:
 
 
 # the helper script cannot show anything, so it leaves a code here; tr() turns it into a sentence
-_RESULT_CODES = ("busy", "start", "uninstall", "reparse", "verify", "rollback", "msi")
+_RESULT_CODES = ("busy", "start", "uninstall", "reparse", "verify", "rollback", "msi", "msi_uninstall")
 
 
 def read_update_result(config_dir: Path | None = None) -> str | None:
@@ -523,8 +529,8 @@ def msi_update_script(
     Exit code 0 = installed, 1 = ``target`` stayed busy, 2 = installed but did not start, 3 = ``msi`` no longer has
     the hash ``sha256`` (64 hex digits) and msiexec did not run, 5 = msiexec failed. msiexec's own 0 and 3010
     (restart wanted; not needed for a per-user install) count as installed.
-    On 1 and 3 the download folder is removed; on 5 it stays, next to ``log`` with msiexec's details. On every
-    failure ``status`` gets a one-line code for the next start and the old program is started again if it is still
+    On every failure the download folder is removed (``log`` lies in the settings folder and stays, with msiexec's
+    details), ``status`` gets a one-line code for the next start and the old program is started again if it is still
     there (if ``start``).
     """
     if not re.fullmatch(r"[0-9a-fA-F]{64}", sha256):
@@ -562,7 +568,7 @@ def msi_update_script(
             "  $rc = $run.ExitCode",
             "} catch { }",
             "if ($rc -ne 0 -and $rc -ne 3010) {",
-            *[f"  {line}" for line in failed("msi", 5, False)],
+            *[f"  {line}" for line in failed("msi", 5, True)],
             "}",
             *cleanup,
             *(["Remove-Item -LiteralPath $statusFile -Force -ErrorAction Ignore"] if status else []),
@@ -596,7 +602,7 @@ def msi_uninstall_script(
     """Wait until ``exe`` is free, remove the installed program with msiexec, then delete the ``folders``.
 
     msiexec's 0 (removed), 1605 (not installed any more) and 3010 count as done. If it fails or ``exe`` stays busy,
-    ``status`` gets the code 'uninstall', exit code 1, and the folders are left alone so that a second try can do all.
+    ``status`` gets the code 'msi_uninstall', exit code 1, and the folders are left alone so a second try can do all.
     A folder that is a junction or symlink is skipped, not followed; that and other leftovers give exit code 1 without a
     status code, since the status file would live in the folder that was just deleted.
     """
@@ -615,7 +621,7 @@ def msi_uninstall_script(
         "  } catch { }",
         "}",
         "if ($rc -ne 0 -and $rc -ne 1605 -and $rc -ne 3010) {",
-        "  Report 'uninstall'",
+        "  Report 'msi_uninstall'",
         "  exit 1",
         "}",
         "$code = ''",
@@ -700,6 +706,9 @@ def run_after_exit(script: str, popen: Callable | None = None) -> None:
             [_powershell(), "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
             creationflags=_CREATE_NO_WINDOW | _NEW_PROCESS_GROUP,
             close_fds=True,
+            # not the app's folder: the Start menu shortcut starts the app in the install folder, and a process
+            # with that as its working directory keeps msiexec from removing it
+            cwd=tempfile.gettempdir(),
             env=env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,

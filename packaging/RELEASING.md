@@ -40,7 +40,15 @@ key, and you have to fix the permissions by hand.
 ## b) Every release
 
 1. Bump the version in `Cargo.toml`, `pyproject.toml` and `python/mourse_decoder/__init__.py`, merge to `main`.
-2. Push the tag (the form is `v.0.1.10`; the release workflow compares it with the three version files):
+2. Dry run first: run the workflow from the release branch and wait until it is green. It runs the tests, builds
+   and validates the MSI and runs the install, upgrade and uninstall smoke test. The check of the tag against the
+   version files, the check for a pinned key and the publish step run only for a `v*` tag, so nothing is released:
+
+        git push origin release-v.0.1.10
+        gh workflow run release.yml --ref release-v.0.1.10
+        gh run watch
+
+   Then push the tag (the form is `v.0.1.10`; the release workflow compares it with the three version files):
 
         git tag v.0.1.10
         git push origin v.0.1.10
@@ -88,8 +96,9 @@ key, and you have to fix the permissions by hand.
    The spelling matters: the app signs over the exact `tag_name` of the GitHub release, and `v.0.1.10` and
    `v0.1.10` are different strings. Use the tag as pushed in step 2.
 6. Sign both files. Each command writes `<asset name>.sig` next to the file and verifies it straight away.
-   The exe is signed under the default asset name `MourseDecoder.exe`, the MSI with `--asset-name MourseDecoder.msi`
-   (the only other name the script accepts). The asset name is part of what is signed, so a signature for one
+   The asset name follows the suffix of `--exe`: `.exe` is signed as `MourseDecoder.exe`, `.msi` as
+   `MourseDecoder.msi`. `--asset-name` may repeat it, any other value is refused (exit code 2), and the output
+   prints the asset name. The asset name is part of what is signed, so a signature for one
    file is not valid for the other:
 
         .venv\Scripts\python.exe -I packaging\sign_release.py sign --tag v.0.1.10 --exe C:\release-v.0.1.10\MourseDecoder.exe --key D:\keys\mourse-update.key

@@ -138,7 +138,7 @@ jobs:
             if ($process.ExitCode -ne 0) { throw "msiexec $switch $name exited with $($process.ExitCode)" }
           }
           function Get-Entries {
-            @(Get-ChildItem $uninstallRoots | Where-Object { (Get-ItemProperty $_.PSPath).DisplayName -eq 'Mourse Decoder' })
+            @(Get-ChildItem $uninstallRoots -ErrorAction SilentlyContinue | Where-Object { (Get-ItemProperty $_.PSPath).DisplayName -eq 'Mourse Decoder' })
           }
           function Assert($condition, $message) { if (-not $condition) { throw "MSI smoke test: $message" } }
 

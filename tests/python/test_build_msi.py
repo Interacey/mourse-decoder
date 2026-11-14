@@ -150,3 +150,21 @@ def test_main_reports_a_missing_icon(exe, calls, monkeypatch, tmp_path, capsys):
     assert build_msi.main(["--exe", str(exe)]) == 1
     assert "icon" in capsys.readouterr().err
     assert calls == []
+
+
+WIX_NS = "{http://wixtoolset.org/schemas/v4/wxs}"
+
+
+def test_the_registry_values_the_updater_reads_are_the_ones_the_installer_writes():
+    from xml.etree import ElementTree
+
+    from mourse_decoder import updater
+
+    root = ElementTree.parse(build_msi.WXS).getroot()
+    values = {
+        (v.get("Root"), v.get("Key"), v.get("Name")): v.get("Value")
+        for v in root.iter(f"{WIX_NS}RegistryValue")
+    }
+    # install_kind() reads InstallDir and uninstall() reads ProductCode, both from HKCU\<REG_KEY>
+    assert values[("HKCU", updater.REG_KEY, "InstallDir")] == "[INSTALLFOLDER]"
+    assert values[("HKCU", updater.REG_KEY, "ProductCode")] == "[ProductCode]"

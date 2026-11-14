@@ -6,8 +6,9 @@
     python packaging/sign_release.py verify --tag v.0.1.10 --exe MourseDecoder.exe --sig MourseDecoder.exe.sig
 
 The signature covers the manifest from ``signing.build_manifest`` (tag, the asset name, SHA-256 of the file). The
-asset name is MourseDecoder.exe (default) or MourseDecoder.msi (``--asset-name MourseDecoder.msi``, with the msi as
-``--exe``), whatever the local file is called.
+asset name follows the suffix of ``--exe``: .exe is signed as MourseDecoder.exe, .msi as MourseDecoder.msi, whatever
+the local file is called. ``--asset-name`` may repeat that name; a different one is refused (exit code 2), so
+signing the msi can never write the signature of the exe.
 See packaging/RELEASING.md for the full procedure.
 """
 
@@ -28,13 +29,32 @@ sys.path.insert(0, str(ROOT / "python"))
 from mourse_decoder import signing  # noqa: E402
 
 ASSET_NAMES = ("MourseDecoder.exe", "MourseDecoder.msi")
-DEFAULT_ASSET = ASSET_NAMES[0]
+ASSET_OF_SUFFIX = {".exe": ASSET_NAMES[0], ".msi": ASSET_NAMES[1]}
 # release.yml strips `^v\.?` and compares the rest with the version files
 TAG_RE = re.compile(r"v\.?\d+\.\d+\.\d+")
 
 
 class UserError(Exception):
     """A problem the user can fix; printed without a traceback."""
+
+
+class UsageError(UserError):
+    """The options contradict each other; like a bad command line, this ends with exit code 2."""
+
+
+def asset_name_for(path: Path, asset_name: str | None) -> str:
+    """The release asset name of ``path``: given by its suffix, and ``asset_name`` may only repeat it."""
+    derived = ASSET_OF_SUFFIX.get(path.suffix.lower())
+    if asset_name is None:
+        if derived is None:
+            raise UsageError(f"Cannot tell the asset name from {path.name!r}: it does not end in .exe or .msi")
+        return derived
+    if asset_name != derived:
+        raise UsageError(
+            f"--asset-name {asset_name} does not match {path.name!r}: a file ending in {path.suffix or 'nothing'} "
+            f"is signed as {derived or 'no known asset'}"
+        )
+    return asset_name
 
 
 def sig_name(asset_name: str) -> str:
@@ -191,6 +211,7 @@ def cmd_sign(args: argparse.Namespace) -> int:
     if not args.no_git_check:
         check_git_tag(tag, warn_head=True)
     exe = Path(args.exe)
+    asset_name = asset_name_for(exe, args.asset_name)
     seed = read_seed(Path(args.key))
     pubkey = signing.public_key(seed)
     pinned = pubkey in signing.PINNED_PUBLIC_KEYS
@@ -200,9 +221,9 @@ def cmd_sign(args: argparse.Namespace) -> int:
             "reject the signature. Use the right key file, or pass --allow-unpinned (key rotation preparation, tests)"
         )
     digest = sha256_hex(exe)
-    manifest = signing.build_manifest(tag, args.asset_name, digest)
+    manifest = signing.build_manifest(tag, asset_name, digest)
     signature = signing.sign(seed, manifest)
-    out = Path(args.out) if args.out else exe.resolve().parent / sig_name(args.asset_name)
+    out = Path(args.out) if args.out else exe.resolve().parent / sig_name(asset_name)
     try:
         out.write_text(signing.encode_signature(signature), encoding="ascii", newline="\n")
         written = signing.parse_signature(out.read_text(encoding="ascii"))
@@ -212,6 +233,7 @@ def cmd_sign(args: argparse.Namespace) -> int:
         out.unlink(missing_ok=True)
         raise UserError("The written signature does not verify; it was deleted")
     print(f"tag:        {tag}")
+    print(f"asset:      {asset_name}")
     print(f"sha256:     {digest}")
     print(f"public key: {pubkey.hex()} ({'pinned' if pinned else 'NOT pinned'})")
     print(f"signature:  {out} (verified)")
@@ -220,6 +242,7 @@ def cmd_sign(args: argparse.Namespace) -> int:
 
 def cmd_verify(args: argparse.Namespace) -> int:
     tag = check_tag(args.tag)
+    asset_name = asset_name_for(Path(args.exe), args.asset_name)
     if not args.no_git_check:
         check_git_tag(tag, warn_head=not args.pubkey)
     if args.pubkey:
@@ -238,9 +261,9 @@ def cmd_verify(args: argparse.Namespace) -> int:
         signature = signing.parse_signature(Path(args.sig).read_text(encoding="ascii"))
     except (OSError, ValueError) as error:
         raise UserError(f"Cannot read signature {args.sig}: {error}") from error
-    manifest = signing.build_manifest(tag, args.asset_name, digest)
+    manifest = signing.build_manifest(tag, asset_name, digest)
     if any(signing.verify(key, signature, manifest) for key in keys):
-        print(f"OK: signature is valid for {tag}, sha256 {digest}")
+        print(f"OK: signature is valid for {tag}, {asset_name}, sha256 {digest}")
         return 0
     print(f"FAILED: signature does not match {tag} with sha256 {digest} for the given key(s)", file=sys.stderr)
     return 1
@@ -261,7 +284,7 @@ def build_parser() -> argparse.ArgumentParser:
     sign = sub.add_parser("sign", help="write the .sig file for a downloaded release asset")
     sign.add_argument("--tag", required=True, help="release tag, e.g. v.0.1.9")
     sign.add_argument("--exe", required=True, help="the downloaded exe or msi")
-    sign.add_argument("--asset-name", choices=ASSET_NAMES, default=DEFAULT_ASSET, help="name of the release asset")
+    sign.add_argument("--asset-name", choices=ASSET_NAMES, help="must match the suffix of --exe (default)")
     sign.add_argument("--key", required=True)
     sign.add_argument("--out", help="signature file (default: <asset name>.sig next to the file)")
     sign.add_argument("--allow-unpinned", action="store_true", help="sign even if the key is not in PINNED_PUBLIC_KEYS")
@@ -271,7 +294,7 @@ def build_parser() -> argparse.ArgumentParser:
     verify = sub.add_parser("verify", help="check a signature against the pinned key(s)")
     verify.add_argument("--tag", required=True)
     verify.add_argument("--exe", required=True, help="the downloaded exe or msi")
-    verify.add_argument("--asset-name", choices=ASSET_NAMES, default=DEFAULT_ASSET, help="name of the release asset")
+    verify.add_argument("--asset-name", choices=ASSET_NAMES, help="must match the suffix of --exe (default)")
     verify.add_argument("--sig", required=True)
     verify.add_argument("--pubkey", help="hex public key instead of PINNED_PUBLIC_KEYS")
     verify.add_argument("--no-git-check", action="store_true", help="do not check that the git tag exists locally")
@@ -283,6 +306,9 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return args.func(args)
+    except UsageError as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 2
     except (UserError, ValueError) as error:
         print(f"Error: {error}", file=sys.stderr)
         return 1

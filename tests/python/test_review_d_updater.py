@@ -148,7 +148,7 @@ def test_read_update_result_returns_text_and_clears_the_file(tmp_path):
 
 
 def test_read_update_result_knows_every_code_and_survives_garbage(tmp_path):
-    for code in ("start", "uninstall", "reparse", "verify", "rollback", "msi"):
+    for code in ("start", "uninstall", "reparse", "verify", "rollback", "msi", "msi_uninstall"):
         (tmp_path / updater.RESULT_FILE).write_text(code + "\n", encoding="utf-8-sig")
         assert updater.read_update_result(tmp_path) == updater.tr(f"update.result.{code}")
     (tmp_path / updater.RESULT_FILE).write_bytes(b"\xff\xfe{x}")

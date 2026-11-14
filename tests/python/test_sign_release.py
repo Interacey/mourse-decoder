@@ -479,12 +479,80 @@ def test_msi_signature_does_not_verify_as_the_exe_and_the_other_way_round(msi, e
     assert run_sign(exe, key_file) == 0
     msi_sig = msi.parent / "MourseDecoder.msi.sig"
     exe_sig = exe.parent / "MourseDecoder.exe.sig"
-    assert run_verify(msi, msi_sig, pubkey=pubkey) == 1  # default asset name is the exe
-    assert run_verify(exe, exe_sig, pubkey=pubkey, asset_name=MSI) == 1
-    assert run_verify(msi, exe_sig, pubkey=pubkey, asset_name=MSI) == 1
-    assert run_verify(exe, msi_sig, pubkey=pubkey) == 1
-    assert run_verify(msi, msi_sig, pubkey=pubkey, asset_name=MSI) == 0
+    assert run_verify(msi, exe_sig, pubkey=pubkey) == 1  # the asset name comes from the suffix: .msi
+    assert run_verify(exe, msi_sig, pubkey=pubkey) == 1  # and .exe
+    assert run_verify(msi, msi_sig, pubkey=pubkey) == 0
     assert run_verify(exe, exe_sig, pubkey=pubkey) == 0
+    assert run_verify(msi, msi_sig, pubkey=pubkey, asset_name=MSI) == 0
+    assert run_verify(exe, exe_sig, pubkey=pubkey, asset_name="MourseDecoder.exe") == 0
+
+
+def test_signing_the_msi_without_the_flag_does_not_touch_the_signature_of_the_exe(tmp_path, key_file, capsys):
+    exe_file, msi_file = tmp_path / "MourseDecoder.exe", tmp_path / "MourseDecoder.msi"
+    exe_file.write_bytes(EXE_BYTES)
+    msi_file.write_bytes(MSI_BYTES)
+    assert run_sign(exe_file, key_file) == 0
+    exe_sig = tmp_path / "MourseDecoder.exe.sig"
+    before = exe_sig.read_bytes()
+    capsys.readouterr()
+    assert run_sign(msi_file, key_file) == 0  # forgot --asset-name MourseDecoder.msi
+    out = capsys.readouterr().out
+    assert exe_sig.read_bytes() == before
+    msi_sig = tmp_path / "MourseDecoder.msi.sig"
+    seed = seed_of(key_file)
+    manifest = signing.build_manifest(TAG, MSI, hashlib.sha256(MSI_BYTES).hexdigest())
+    assert msi_sig.read_text(encoding="ascii") == signing.encode_signature(signing.sign(seed, manifest))
+    assert f"asset:      {MSI}" in out  # the output says which name was signed
+    pubkey = signing.public_key(seed)
+    assert run_verify(msi_file, msi_sig, pubkey=pubkey) == 0  # verify needs no flag either
+    assert run_verify(exe_file, exe_sig, pubkey=pubkey) == 0
+
+
+def test_the_exe_is_signed_as_the_exe_and_the_output_names_the_asset(exe, key_file, capsys):
+    assert run_sign(exe, key_file) == 0
+    assert "asset:      MourseDecoder.exe" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("suffix", [".EXE", ".Msi"])
+def test_the_suffix_is_read_without_regard_to_case(tmp_path, key_file, suffix):
+    path = tmp_path / ("build" + suffix)
+    path.write_bytes(MSI_BYTES)
+    assert run_sign(path, key_file) == 0
+    assert (tmp_path / ("MourseDecoder.exe.sig" if suffix == ".EXE" else "MourseDecoder.msi.sig")).exists()
+
+
+@pytest.mark.parametrize(
+    ("fixture", "asset_name"), [("exe", MSI), ("msi", "MourseDecoder.exe")], ids=["exe as msi", "msi as exe"]
+)
+def test_an_asset_name_that_contradicts_the_file_suffix_is_refused_by_sign(request, key_file, capsys, fixture, asset_name):
+    path = request.getfixturevalue(fixture)
+    assert run_sign(path, key_file, TAG, "--asset-name", asset_name) == 2
+    assert "does not match" in capsys.readouterr().err
+    assert not list(path.parent.glob("*.sig"))  # nothing was written
+
+
+@pytest.mark.parametrize(
+    ("fixture", "asset_name"), [("exe", MSI), ("msi", "MourseDecoder.exe")], ids=["exe as msi", "msi as exe"]
+)
+def test_an_asset_name_that_contradicts_the_file_suffix_is_refused_by_verify(
+    request, tmp_path, key_file, capsys, fixture, asset_name
+):
+    path = request.getfixturevalue(fixture)
+    assert run_sign(path, key_file) == 0
+    sig = next(path.parent.glob("*.sig"))
+    capsys.readouterr()
+    assert run_verify(path, sig, pubkey=signing.public_key(seed_of(key_file)), asset_name=asset_name) == 2
+    assert "does not match" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("command", ["sign", "verify"])
+def test_a_file_that_is_neither_exe_nor_msi_needs_no_guess(tmp_path, key_file, capsys, command):
+    other = tmp_path / "build.bin"
+    other.write_bytes(EXE_BYTES)
+    extra = ["--key", str(key_file)] if command == "sign" else ["--sig", str(other), "--pubkey", "00" * 32]
+    assert sign_release.main([command, "--tag", TAG, "--exe", str(other), *extra, "--no-git-check"]) == 2
+    assert "Cannot tell the asset name" in capsys.readouterr().err
+    assert not list(tmp_path.glob("*.sig"))
 
 
 def test_msi_out_option_still_names_the_signature_file(msi, key_file, tmp_path):
