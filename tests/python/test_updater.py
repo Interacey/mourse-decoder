@@ -13,6 +13,7 @@ import shutil
 import ssl
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 from pathlib import Path
@@ -112,8 +113,8 @@ def test_parse_version_ignores_case_of_the_v():
     assert updater.parse_version("V.1.2") == (1, 2)
 
 
-def test_this_is_version_0_1_9():
-    assert __version__ == "0.1.9"
+def test_this_is_version_0_1_10():
+    assert __version__ == "0.1.10"
 
 
 # --- looking at the latest release ---
@@ -275,9 +276,22 @@ def test_script_runs_hidden_and_detached_with_a_clean_environment(monkeypatch):
     (args, kwargs), = calls
     assert decoded(args[0]) == "Write-Output 'ü'"
     assert kwargs["creationflags"] == 0x08000200 and kwargs["close_fds"] is True
+    assert kwargs["cwd"] == tempfile.gettempdir()  # not inherited from the app
     assert "_PYI_APPLICATION_HOME_DIR" not in kwargs["env"] and "_MEIPASS2" not in kwargs["env"]
     assert kwargs["env"]["PYINSTALLER_RESET_ENVIRONMENT"] == "1"
     assert "-ExecutionPolicy" not in args[0] and "Bypass" not in args[0]  # the policy is left as the user set it
+
+
+def test_the_helper_does_not_run_in_the_app_folder(tmp_path, monkeypatch):
+    """The Start menu shortcut starts the app in the install folder; a helper that inherited it would keep msiexec
+    from removing that folder."""
+    install = tmp_path / "Programs" / "MourseDecoder"
+    install.mkdir(parents=True)
+    monkeypatch.chdir(install)
+    calls = []
+    updater.run_after_exit("exit 0", lambda *a, **kw: calls.append(kw))
+    cwd = Path(calls[0]["cwd"])
+    assert cwd != install and install not in cwd.parents and cwd.is_dir()
 
 
 def test_quotes_in_paths_cannot_break_out_of_the_script():
@@ -1132,3 +1146,813 @@ def test_a_file_that_changes_after_the_move_is_never_started_when_it_cannot_be_r
         assert code == 3 and status.read_bytes() == b"verify"
         assert target.read_bytes() == old and not backup_of(target).exists()
         assert wait_until(lambda: file_has(marker, b"old\r\n"))  # the restored old program was started, not the evil one
+
+
+# --- a copy installed by the MSI updates through the installer, never by swapping the exe ---
+
+MSI_NAME = "MourseDecoder.msi"
+MSI_BYTES = updater.MSI_MAGIC + b"\x00" * 1000
+MSI_SHA = hashlib.sha256(MSI_BYTES).hexdigest()
+MSI_ROUTES = {
+    MSI_NAME: MSI_BYTES,
+    MSI_NAME + ".sha256": MSI_SHA.encode(),
+    MSI_NAME + ".sig": signature(name=MSI_NAME, sha=MSI_SHA),
+}
+ALL_ROUTES = {**ROUTES, **MSI_ROUTES}
+MSI_URLS = {"msi_url": GH + MSI_NAME, "msi_sha_url": GH + MSI_NAME + ".sha256", "msi_sig_url": GH + MSI_NAME + ".sig"}
+GUID = "{6F9619FF-8B86-D011-B42D-00C04FC964FF}"
+
+
+def msi_release(**changes):
+    fields = {**MSI_URLS, **changes}
+    return Release(
+        "v9.9.9", "", GH + "MourseDecoder.exe", GH + "MourseDecoder.exe.sha256", "https://github.com/x",
+        GH + "MourseDecoder.exe.sig", **fields,
+    )
+
+
+class FakeWinreg:
+    """winreg stand-in; ``values`` is HKCU\\Software\\Interacey\\MourseDecoder, None means there is no such key."""
+
+    HKEY_CURRENT_USER = "HKCU"
+
+    def __init__(self, values=None):
+        self.values = values
+        self.opened = []
+
+    def OpenKey(self, hive, path):
+        self.opened.append((hive, path))
+        if self.values is None:
+            raise FileNotFoundError(path)
+        return contextlib.nullcontext()
+
+    def QueryValueEx(self, key, name):
+        if name not in self.values:
+            raise FileNotFoundError(name)
+        return self.values[name], 1
+
+
+def registry(monkeypatch, values=None) -> FakeWinreg:
+    fake = FakeWinreg(values)
+    monkeypatch.setitem(sys.modules, "winreg", fake)
+    return fake
+
+
+def installed(monkeypatch, tmp_path, **values):
+    """This process is an exe that the MSI put into ``tmp_path`` (the registry says so, with a trailing backslash)."""
+    frozen_at(monkeypatch, tmp_path / "MourseDecoder.exe")
+    monkeypatch.setattr(
+        updater, "result_path", lambda config_dir=None: (Path(config_dir) if config_dir else tmp_path / "cfg") / updater.RESULT_FILE
+    )
+    return registry(monkeypatch, {"InstallDir": str(tmp_path) + "\\", **values})
+
+
+@pytest.fixture(autouse=True)
+def no_registry(monkeypatch):
+    registry(monkeypatch)  # nothing is read from the real registry; a test that needs values calls registry() again
+
+
+def temp_folders(monkeypatch) -> list[str]:
+    made = []
+    real_mkdtemp = updater.tempfile.mkdtemp
+    monkeypatch.setattr(updater.tempfile, "mkdtemp", lambda **kw: made.append(real_mkdtemp(**kw)) or made[-1])
+    return made
+
+
+def scripts_instead_of_powershell(monkeypatch) -> list[str]:
+    scripts = []
+    monkeypatch.setattr(updater, "run_after_exit", lambda script, popen=None: scripts.append(script))
+    return scripts
+
+
+# fetch_latest
+
+
+def assets_of(*names) -> bytes:
+    return json.dumps(release_json(assets=["MourseDecoder.exe", "MourseDecoder.exe.sha256", "MourseDecoder.exe.sig", *names])).encode()
+
+
+def test_fetch_latest_picks_up_the_installer_files():
+    release = updater.fetch_latest(serving({"latest": assets_of(MSI_NAME, MSI_NAME + ".sha256", MSI_NAME + ".sig")}))
+    assert release.msi_url.endswith("/v9.9.9/MourseDecoder.msi")
+    assert release.msi_sha_url.endswith("/v9.9.9/MourseDecoder.msi.sha256")
+    assert release.msi_sig_url.endswith("/v9.9.9/MourseDecoder.msi.sig")
+    assert release.exe_url.endswith("/MourseDecoder.exe") and release.sig_url.endswith("/MourseDecoder.exe.sig")
+
+
+def test_fetch_latest_without_installer_files_still_returns_the_exe_release():
+    release = updater.fetch_latest(serving({"latest": assets_of()}))  # what 0.1.9 and older releases look like
+    assert (release.msi_url, release.msi_sha_url, release.msi_sig_url) == (None, None, None)
+    assert release.exe_url.endswith("/MourseDecoder.exe") and release.sha_url and release.sig_url
+
+
+@pytest.mark.parametrize("missing", [MSI_NAME, MSI_NAME + ".sha256", MSI_NAME + ".sig"])
+def test_a_partial_installer_set_keeps_what_it_has_so_install_can_tell_it_from_no_installer(missing):
+    names = [n for n in (MSI_NAME, MSI_NAME + ".sha256", MSI_NAME + ".sig") if n != missing]
+    release = updater.fetch_latest(serving({"latest": assets_of(*names)}))
+    found = (release.msi_url, release.msi_sha_url, release.msi_sig_url)
+    assert sum(url is None for url in found) == 1 and sum(url is not None for url in found) == 2
+    assert release.exe_url.endswith("/MourseDecoder.exe") and release.sha_url and release.sig_url  # the exe is untouched
+
+
+def test_the_exe_is_still_required_when_only_the_installer_is_there():
+    data = json.dumps(release_json(assets=[MSI_NAME, MSI_NAME + ".sha256", MSI_NAME + ".sig"])).encode()
+    with pytest.raises(UpdateError, match="contains no MourseDecoder.exe"):
+        updater.fetch_latest(serving({"latest": data}))
+
+
+# download of the installer
+
+
+def test_the_installer_is_loaded_checked_and_kept(tmp_path):
+    path, digest = updater._download_msi(msi_release(), tmp_path, serving(ALL_ROUTES))
+    assert path == tmp_path / MSI_NAME and path.read_bytes() == MSI_BYTES and digest == MSI_SHA
+
+
+MZ_AS_MSI = {
+    MSI_NAME: EXE,
+    MSI_NAME + ".sha256": SHA.encode(),
+    MSI_NAME + ".sig": signature(name=MSI_NAME, sha=SHA),  # signed and hashed correctly, but it is an exe
+}
+
+
+@pytest.mark.parametrize(
+    ("routes", "message"),
+    [
+        ({**MSI_ROUTES, MSI_NAME + ".sig": signature(name=MSI_NAME, sha=MSI_SHA, seed=OTHER_SEED)}, "does not match"),
+        ({**MSI_ROUTES, MSI_NAME + ".sig": signature(name="MourseDecoder.exe", sha=MSI_SHA)}, "does not match"),
+        ({**MSI_ROUTES, MSI_NAME + ".sig": signature(name=MSI_NAME, sha=SHA)}, "does not match"),
+        ({**MSI_ROUTES, MSI_NAME + ".sig": signature(tag="v9.9.8", name=MSI_NAME, sha=MSI_SHA)}, "does not match"),
+        ({**MSI_ROUTES, MSI_NAME + ".sha256": b"0" * 64}, "passt nicht"),
+        ({**MSI_ROUTES, MSI_NAME: MSI_BYTES + b"x"}, "passt nicht"),
+        ({**MSI_ROUTES, MSI_NAME + ".sha256": b"keine summe"}, "ungültig"),
+        (MZ_AS_MSI, "not a Windows Installer package"),
+        ({k: v for k, v in MSI_ROUTES.items() if k != MSI_NAME}, "No connection to GitHub"),
+    ],
+    ids=["other key", "exe signature", "other hash signed", "other tag", "wrong checksum", "changed file", "bad checksum",
+         "wrong magic", "no download"],
+)
+def test_a_bad_installer_download_is_deleted(tmp_path, routes, message):
+    with pytest.raises(UpdateError, match=message):
+        updater._download_msi(msi_release(), tmp_path, serving(routes))
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_an_oversized_installer_is_cut_off_and_deleted(tmp_path, monkeypatch):
+    monkeypatch.setattr(updater, "MAX_MSI_BYTES", 500)
+    with pytest.raises(UpdateError, match="größer als erwartet"):
+        updater._download_msi(msi_release(), tmp_path, serving(MSI_ROUTES))
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_an_installer_cap_of_exactly_its_size_still_loads(tmp_path, monkeypatch):
+    monkeypatch.setattr(updater, "MAX_MSI_BYTES", len(MSI_BYTES))
+    assert updater._download_msi(msi_release(), tmp_path, serving(MSI_ROUTES))[0].read_bytes() == MSI_BYTES
+
+
+@pytest.mark.parametrize("field", ["msi_url", "msi_sha_url", "msi_sig_url"])
+def test_an_installer_link_outside_github_is_refused(tmp_path, field):
+    with pytest.raises(UpdateError, match="nicht von GitHub"):
+        updater._download_msi(msi_release(**{field: "https://evil.example/MourseDecoder.msi"}), tmp_path, serving(MSI_ROUTES))
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_an_installer_that_breaks_off_is_deleted_and_offers_the_page(tmp_path):
+    def urlopen(request, timeout=None):
+        name = request.full_url.rsplit("/", 1)[-1]
+        return Broken(b"") if name == MSI_NAME else FakeResponse(MSI_ROUTES[name])
+
+    with pytest.raises(UpdateError, match="Download fehlgeschlagen") as caught:
+        updater._download_msi(msi_release(), tmp_path, urlopen)
+    assert caught.value.open_page and list(tmp_path.iterdir()) == []
+
+
+def test_the_installer_is_never_loaded_without_a_pinned_key_or_for_an_older_release(tmp_path, monkeypatch):
+    ask = Recorder(MSI_ROUTES)
+    old = Release("v0.1.8", "", GH + "x.exe", None, "https://github.com/x", None, **MSI_URLS)
+    with pytest.raises(UpdateError, match="not newer"):
+        updater._download_msi(old, tmp_path, ask)
+    monkeypatch.setattr(signing, "PINNED_PUBLIC_KEYS", ())
+    with pytest.raises(UpdateError, match="contains no key"):
+        updater._download_msi(msi_release(), tmp_path, ask)
+    assert ask.asked == [] and list(tmp_path.iterdir()) == []
+
+
+def test_the_exe_download_still_checks_for_mz_and_names_its_own_file(tmp_path):
+    # the shared helper must not let an installer pass as an exe or the other way round
+    with pytest.raises(UpdateError, match="kein Windows-Programm"):
+        updater.download(release(), tmp_path, serving({**ROUTES, "MourseDecoder.exe": MSI_BYTES, "MourseDecoder.exe.sha256": MSI_SHA.encode(), "MourseDecoder.exe.sig": signature(sha=MSI_SHA)}))
+    assert list(tmp_path.iterdir()) == []
+    assert updater.download(release(), tmp_path, serving(ROUTES)).name == "MourseDecoder.exe"
+
+
+# install_kind
+
+
+def test_a_source_checkout_is_source(monkeypatch):
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    registry(monkeypatch, {"InstallDir": str(Path(sys.executable).parent)})
+    assert updater.install_kind() == "source"
+
+
+def test_a_frozen_exe_outside_windows_is_portable(monkeypatch):
+    frozen_at(monkeypatch, Path("/opt/mourse/MourseDecoder.exe"))
+    monkeypatch.setattr(sys, "platform", "linux")
+    assert updater.install_kind() == "portable"
+
+
+@pytest.mark.parametrize(
+    ("install_dir", "exe", "kind"),
+    [
+        ("C:\\Users\\a\\AppData\\Local\\Programs\\MourseDecoder\\", "C:\\Users\\a\\AppData\\Local\\Programs\\MourseDecoder\\MourseDecoder.exe", "msi"),
+        ("C:\\Users\\a\\AppData\\Local\\Programs\\MourseDecoder", "C:\\Users\\a\\AppData\\Local\\Programs\\MourseDecoder\\MourseDecoder.exe", "msi"),
+        ("c:\\users\\A\\appdata\\local\\programs\\mourse decoder\\", "C:\\Users\\a\\AppData\\Local\\Programs\\Mourse Decoder\\MourseDecoder.exe", "msi"),
+        ("C:/Users/a/Programs/MourseDecoder/", "C:\\Users\\a\\Programs\\MourseDecoder\\MourseDecoder.exe", "msi"),
+        ("C:\\Users\\a\\Programs\\MourseDecoder\\\\", "C:\\Users\\a\\Programs\\MourseDecoder\\MourseDecoder.exe", "msi"),
+        ("C:\\Users\\a\\Programs\\.\\MourseDecoder\\", "C:\\Users\\a\\Programs\\MourseDecoder\\MourseDecoder.exe", "msi"),
+        ("C:\\Users\\a\\Programs\\MourseDecoder\\", "C:\\Users\\a\\Downloads\\MourseDecoder.exe", "portable"),
+        ("C:\\Users\\a\\Programs\\MourseDecoder\\", "C:\\Users\\a\\Programs\\MourseDecoder\\sub\\MourseDecoder.exe", "portable"),
+        ("C:\\Users\\a\\Programs\\MourseDecoder\\", "C:\\Users\\a\\Programs\\MourseDecoder2\\MourseDecoder.exe", "portable"),
+        ("", "C:\\Users\\a\\Programs\\MourseDecoder\\MourseDecoder.exe", "portable"),
+    ],
+    ids=["trailing backslash", "no trailing backslash", "case", "forward slashes", "two backslashes", "dot segment",
+         "other folder", "subfolder", "similar name", "empty value"],
+)
+def test_install_kind_compares_the_registered_folder_with_the_one_the_exe_runs_from(monkeypatch, install_dir, exe, kind):
+    frozen_at(monkeypatch, Path("unused"))
+    monkeypatch.setattr(sys, "executable", exe)
+    registry(monkeypatch, {"InstallDir": install_dir})
+    assert updater.install_kind() == kind
+
+
+def test_install_kind_reads_the_current_users_key_only(monkeypatch):
+    frozen_at(monkeypatch, Path("unused"))
+    fake = registry(monkeypatch, {"InstallDir": "C:\\x"})
+    updater.install_kind()
+    assert fake.opened == [("HKCU", r"Software\Interacey\MourseDecoder")]
+
+
+class BrokenWinreg(FakeWinreg):
+    def __init__(self, error):
+        super().__init__({})
+        self.error = error
+
+    def OpenKey(self, hive, path):
+        raise self.error
+
+
+@pytest.mark.parametrize(
+    "winreg_module",
+    [
+        None,  # the module cannot be imported
+        FakeWinreg(None),  # no key
+        FakeWinreg({}),  # key without InstallDir
+        FakeWinreg({"InstallDir": 5}),  # a number
+        FakeWinreg({"InstallDir": b"C:\\x"}),
+        BrokenWinreg(PermissionError("denied")),
+        BrokenWinreg(OSError(5, "boom")),
+    ],
+    ids=["no module", "no key", "no value", "number", "bytes", "denied", "oserror"],
+)
+def test_a_registry_that_does_not_help_makes_a_frozen_exe_portable_and_never_crashes(monkeypatch, winreg_module):
+    frozen_at(monkeypatch, Path("C:\\x\\MourseDecoder.exe"))
+    monkeypatch.setitem(sys.modules, "winreg", winreg_module)
+    assert updater.install_kind() == "portable"
+
+
+# install() by kind
+
+
+def test_a_portable_exe_still_swaps_the_exe_and_never_asks_for_the_installer(tmp_path, monkeypatch):
+    frozen_at(monkeypatch, tmp_path / "MourseDecoder.exe")  # registry has no key: portable
+    made, scripts, ask = temp_folders(monkeypatch), scripts_instead_of_powershell(monkeypatch), Recorder(ALL_ROUTES)
+    try:
+        updater.install(msi_release(), ask)
+    finally:
+        shutil.rmtree(made[0], ignore_errors=True)
+    assert set(ask.asked) == set(ROUTES) and "msiexec" not in scripts[0]
+    assert "File]::Move($new, $target)" in scripts[0] and f"-ne '{SHA}'" in scripts[0]
+
+
+def test_a_portable_exe_in_another_folder_than_the_registered_one_is_portable(tmp_path, monkeypatch):
+    installed(monkeypatch, tmp_path / "elsewhere")  # the registry names a different folder than the exe runs from
+    monkeypatch.setattr(sys, "executable", str(tmp_path / "MourseDecoder.exe"))
+    assert updater.install_kind() == "portable"
+
+
+def test_an_msi_copy_loads_the_installer_and_hands_msiexec_a_script(tmp_path, monkeypatch):
+    installed(monkeypatch, tmp_path)
+    made, scripts, ask = temp_folders(monkeypatch), scripts_instead_of_powershell(monkeypatch), Recorder(ALL_ROUTES)
+    try:
+        updater.install(msi_release(), ask)
+        assert (Path(made[0]) / MSI_NAME).read_bytes() == MSI_BYTES  # the script finds the checked file there
+    finally:
+        shutil.rmtree(made[0], ignore_errors=True)
+    assert set(ask.asked) == set(MSI_ROUTES)  # the exe is not even loaded
+    script = scripts[0]
+    assert "System32\\msiexec.exe" in script and f"-ne '{MSI_SHA}'" in script
+    assert str(Path(made[0]) / MSI_NAME) in script and str(tmp_path / "MourseDecoder.exe") in script
+    assert str(tmp_path / "cfg" / "msi-update.log") in script and "update-result.txt" in script
+    assert "File]::Move" not in script and ".old" not in script  # no exe swap inside the installer's folder
+
+
+@pytest.mark.parametrize(
+    ("changes", "message", "page"),
+    [
+        ({k: None for k in MSI_URLS}, "has no installer", True),  # an older release: the download page is a way out
+        ({"msi_url": None}, "only part of the installer files", False),
+        ({"msi_sha_url": None}, "only part of the installer files", False),
+        ({"msi_sig_url": None}, "only part of the installer files", False),
+        ({"msi_sha_url": None, "msi_sig_url": None}, "only part of the installer files", False),
+    ],
+    ids=["none", "no msi", "no checksum", "no signature", "msi alone"],
+)
+def test_an_msi_copy_without_the_full_installer_set_is_refused_and_not_swapped(tmp_path, monkeypatch, changes, message, page):
+    installed(monkeypatch, tmp_path)
+    made = temp_folders(monkeypatch)
+    monkeypatch.setattr(updater, "run_after_exit", lambda *a, **kw: pytest.fail("darf nichts starten"))
+    monkeypatch.setattr(updater, "update_script", lambda *a, **kw: pytest.fail("never build the exe swap"))
+    ask = Recorder(ALL_ROUTES)
+    with pytest.raises(UpdateError, match=message) as caught:
+        updater.install(msi_release(**changes), ask)
+    # a partial set must not send the user to a page where they would run an unsigned or swapped installer
+    assert caught.value.open_page is page and "v9.9.9" in str(caught.value)
+    assert ask.asked == [] and all(not Path(m).exists() for m in made)
+    assert not (tmp_path / "MourseDecoder.exe.old").exists()
+
+
+def test_a_release_with_a_partial_installer_set_is_refused_without_the_page_from_fetch_to_install(tmp_path, monkeypatch):
+    installed(monkeypatch, tmp_path)
+    temp_folders(monkeypatch)
+    release = updater.fetch_latest(serving({"latest": assets_of(MSI_NAME, MSI_NAME + ".sha256")}))  # .sig is missing
+    with pytest.raises(UpdateError, match="only part of the installer files") as caught:
+        updater.install(release, Recorder(ALL_ROUTES), lambda *a, **kw: pytest.fail("darf nichts starten"))
+    assert not caught.value.open_page
+
+
+def test_an_msi_copy_never_falls_back_to_the_exe_when_the_release_has_only_the_exe(tmp_path, monkeypatch):
+    installed(monkeypatch, tmp_path)
+    monkeypatch.setattr(updater, "_download", lambda *a, **kw: pytest.fail("never the exe"))
+    with pytest.raises(UpdateError, match="not updated by swapping the exe"):
+        updater.install(release(), Recorder(ROUTES), lambda *a, **kw: pytest.fail("darf nichts starten"))
+
+
+def test_a_bad_installer_never_starts_msiexec_and_removes_the_download_folder(tmp_path, monkeypatch):
+    installed(monkeypatch, tmp_path)
+    made = temp_folders(monkeypatch)
+    routes = {**ALL_ROUTES, MSI_NAME + ".sig": signature(name=MSI_NAME, sha=MSI_SHA, seed=OTHER_SEED)}
+    with pytest.raises(UpdateError, match="does not match"):
+        updater.install(msi_release(), serving(routes), lambda *a, **kw: pytest.fail("darf nichts starten"))
+    assert made and not Path(made[0]).exists()
+
+
+def test_an_older_release_is_not_installed_through_the_installer_either(tmp_path, monkeypatch):
+    installed(monkeypatch, tmp_path)
+    old = msi_release()
+    old = Release("v0.1.8", "", old.exe_url, old.sha_url, old.page, old.sig_url, old.msi_url, old.msi_sha_url, old.msi_sig_url)
+    ask = Recorder(ALL_ROUTES)
+    with pytest.raises(UpdateError, match="not newer"):
+        updater.install(old, ask, lambda *a, **kw: pytest.fail("darf nichts starten"))
+    assert ask.asked == []
+
+
+def test_powershell_that_cannot_start_for_the_installer_is_reported_and_the_download_removed(tmp_path, monkeypatch):
+    installed(monkeypatch, tmp_path)
+    made = temp_folders(monkeypatch)
+
+    def blocked(*a, **kw):
+        raise PermissionError("durch Richtlinie gesperrt")
+
+    with pytest.raises(UpdateError, match="PowerShell could not be started"):
+        updater.install(msi_release(), serving(ALL_ROUTES), blocked)
+    assert made and not Path(made[0]).exists()
+
+
+def test_the_msi_install_does_not_need_write_access_to_its_folder_itself(tmp_path, monkeypatch):
+    installed(monkeypatch, tmp_path)
+    monkeypatch.setattr(updater, "_can_write", lambda folder: pytest.fail("msiexec does the writing"))
+    made = temp_folders(monkeypatch)
+    scripts_instead_of_powershell(monkeypatch)
+    try:
+        updater.install(msi_release(), serving(ALL_ROUTES))
+    finally:
+        shutil.rmtree(made[0], ignore_errors=True)
+
+
+# msi_update_script: text
+
+
+def msi_script(**kw) -> str:
+    args = {"msi": Path("C:/T/mourse-update-x/MourseDecoder.msi"), "target": Path("C:/A/MourseDecoder.exe"),
+            "status": Path("C:/C/update-result.txt"), "sha256": DIGEST, "log": Path("C:/C/msi-update.log")}
+    return updater.msi_update_script(**{**args, **kw})
+
+
+def test_msi_update_script_runs_msiexec_with_fixed_arguments_around_two_local_paths():
+    script = msi_script()
+    assert "\"$env:SystemRoot\\System32\\msiexec.exe\"" in script  # by full path, not found through PATH
+    assert "'/i \"' + $msi + '\" /qn /norestart /l*v \"' + $log + '\"'" in script
+    assert "-Wait -PassThru" in script
+    assert f"$msi = '{Path('C:/T/mourse-update-x/MourseDecoder.msi')}'" in script
+    assert f"$log = '{Path('C:/C/msi-update.log')}'" in script
+    assert "Invoke-Expression" not in script and "cmd /c" not in script
+
+
+def test_msi_update_script_rehashes_the_installer_before_msiexec_and_leaves_the_program_alone_on_a_mismatch():
+    script = msi_script(sha256=DIGEST.upper())
+    assert f"-ne '{DIGEST}'" in script and "Get-FileHash -LiteralPath $msi" in script
+    mismatch = script.split("if ($actual -ne")[1].split("exit 3")[0]
+    assert "Report 'verify'" in mismatch and "Remove-Item -LiteralPath" in mismatch  # the changed file is deleted
+    assert "Start-Process -FilePath $target" in mismatch and "msiexec" not in mismatch  # the old program runs again
+    assert script.index("Get-FileHash") < script.index("Start-Process -FilePath $msiexec")
+    assert "File]::Move" not in script and "File]::Delete" not in script
+
+
+def test_msi_update_script_waits_for_the_exe_before_it_hashes_or_installs():
+    script = msi_script()
+    assert "[System.IO.File]::Open($target, 'Open', 'ReadWrite', 'None').Close()" in script
+    assert script.index("'None').Close()") < script.index("Get-FileHash") < script.index("Start-Process -FilePath $msiexec")
+    busy = script.split("if (-not $free) {")[1].split("exit 1")[0]
+    assert "Report 'busy'" in busy and "msiexec" not in busy
+
+
+def test_msi_update_script_handles_the_exit_codes():
+    script = msi_script()
+    assert "if ($rc -ne 0 -and $rc -ne 3010) {" in script  # 0 and 3010 are success
+    failure = script.split("if ($rc -ne 0 -and $rc -ne 3010) {")[1].split("exit 5")[0]
+    assert "Report 'msi'" in failure and "Start-Process -FilePath $target" in failure
+    assert failure.index("Report 'msi'") < failure.index("Remove-Item -LiteralPath 'C:") < failure.index("Start-Process")
+    success = script.split("exit 5\n}")[1]
+    assert "Remove-Item -LiteralPath 'C:" in success and "$statusFile" in success
+    assert success.index("Remove-Item") < success.index("Start-Process -FilePath $target") and success.rstrip().endswith("exit 0")
+    assert "Report 'start'; exit 2" in success
+
+
+def test_msi_update_script_removes_only_its_own_download_folder():
+    own = msi_script()
+    assert f"Remove-Item -LiteralPath '{Path('C:/T/mourse-update-x')}' -Recurse" in own
+    foreign = msi_script(msi=Path("C:/Users/x/Downloads/MourseDecoder.msi"))
+    assert "-Recurse" not in foreign
+
+
+def test_msi_update_script_without_start_or_status_starts_and_reports_nothing():
+    script = msi_script(start=False, status=None)
+    assert "Start-Process -FilePath $target" not in script and "$statusFile" not in script
+    assert "function Report($code) { }" in script
+
+
+def test_quotes_in_the_msi_paths_cannot_break_out_of_the_script():
+    script = msi_script(msi=Path("C:/it's/mourse-update-a'b/m.msi"), target=Path("C:/a'; Remove-Item x; '/app.exe"),
+                        log=Path("C:/l\u2019;calc;\u2019/msi-update.log"))
+    assert "a''; Remove-Item x; ''" in script and "l\u2019\u2019;calc;\u2019\u2019" in script
+    assert str(Path("C:/it's/mourse-update-a'b/m.msi")).replace("'", "''") in script
+
+
+@pytest.mark.parametrize("bad", ["", "ab" * 31, "zz" * 32, DIGEST + "'; calc; '", " " + DIGEST, DIGEST + "\n"])
+def test_a_digest_that_is_not_64_hex_digits_never_reaches_the_msi_script(bad):
+    with pytest.raises(ValueError):
+        msi_script(sha256=bad)
+
+
+# msi_update_script: PowerShell with a stand-in for msiexec
+
+
+def fake_msiexec(folder: Path, exit_code: int) -> tuple[Path, Path]:
+    """A batch file in place of msiexec: it writes its arguments into a file and ends with ``exit_code``."""
+    seen = folder / "msiexec-args.txt"
+    cmd = folder / "fake msiexec.cmd"
+    cmd.write_bytes(f'@echo %*>"{seen}"\r\n@exit /b {exit_code}\r\n'.encode())
+    return cmd, seen
+
+
+class MsiRun:
+    """A download folder with an installer, an installed exe and a fake msiexec; nothing outside ``tmp_path`` is touched."""
+
+    def __init__(self, tmp_path: Path, exit_code: int = 0, data: bytes = MSI_BYTES, app: str = "MourseDecoder.exe",
+                 where: Path | None = None):
+        where = where or tmp_path  # the batch file stays in ``tmp_path``: cmd cannot write to every spelling of a path
+        self.download = where / (updater.TEMP_PREFIX + "msi [1]")
+        self.download.mkdir()
+        self.msi = self.download / MSI_NAME
+        self.msi.write_bytes(data)
+        self.target = where / "Programs" / app
+        self.target.parent.mkdir()
+        self.target.write_bytes(b"ALT")
+        self.status = where / "cfg" / updater.RESULT_FILE
+        self.log = where / "cfg" / updater.MSI_LOG_FILE
+        self.msiexec, self.seen = fake_msiexec(tmp_path, exit_code)
+
+    def script(self, sha: str = MSI_SHA, **kw) -> str:
+        kw = {"start": False, "delay_s": 0, **kw}
+        return updater.msi_update_script(self.msi, self.target, self.status, sha, self.log, msiexec=self.msiexec, **kw)
+
+
+@win
+@pytest.mark.parametrize("code", [0, 3010])
+def test_msi_update_installs_and_cleans_up_on_success(tmp_path, code):
+    run = MsiRun(tmp_path, exit_code=code)
+    run.status.parent.mkdir()
+    run.status.write_text("busy")  # an old failure is cleared
+    assert powershell(run.script()) == 0
+    assert run.seen.read_bytes().decode().strip() == f'/i "{run.msi}" /qn /norestart /l*v "{run.log}"'  # exactly this
+    assert not run.download.exists() and not run.status.exists()
+    assert run.target.read_bytes() == b"ALT"  # the script never touches the exe itself, msiexec does
+
+
+@win
+def test_msi_update_starts_the_program_in_its_folder_after_the_installer(tmp_path):
+    marker = tmp_path / "started.txt"
+    run = MsiRun(tmp_path, app="app.cmd")
+    run.target.write_bytes(marker_app(marker, "new"))
+    assert powershell(run.script(start=True)) == 0
+    assert wait_until(lambda: file_has(marker, b"new\r\n"))
+
+
+@win
+def test_msi_update_works_in_awkward_folders_and_creates_the_log_folder(tmp_path):
+    base = tmp_path / "ä'x \u2019[2]"
+    base.mkdir()
+    run = MsiRun(tmp_path, where=base)
+    assert not run.log.parent.exists()
+    assert powershell(run.script()) == 0
+    assert run.seen.exists() and not run.download.exists()
+
+
+@win
+@pytest.mark.parametrize("code", [1603, 1618, 1, 1641, 5])
+def test_msi_update_failure_removes_the_download_reports_and_restarts_the_old_program(tmp_path, code):
+    marker = tmp_path / "old-started.txt"
+    run = MsiRun(tmp_path, exit_code=code, app="app.cmd")
+    run.target.write_bytes(marker_app(marker, "old"))
+    assert powershell(run.script(start=True)) == 5
+    assert run.status.read_bytes() == b"msi"  # no BOM, one code
+    assert not run.download.exists()  # the log is in the settings folder, so the download is not kept for it
+    assert wait_until(lambda: file_has(marker, b"old\r\n"))
+    assert run.seen.exists()
+
+
+@win
+def test_msi_update_failure_without_start_starts_nothing(tmp_path):
+    run = MsiRun(tmp_path, exit_code=1603)
+    assert powershell(run.script()) == 5
+    assert run.status.read_bytes() == b"msi" and not run.download.exists()
+
+
+@win
+def test_msi_update_with_a_msiexec_that_cannot_start_is_a_failure_not_a_crash(tmp_path):
+    run = MsiRun(tmp_path)
+    run.msiexec = tmp_path / "gibt-es-nicht.exe"
+    assert powershell(run.script()) == 5
+    assert run.status.read_bytes() == b"msi" and not run.download.exists()
+
+
+@win
+def test_msi_update_does_not_run_a_file_that_changed_after_the_download_check(tmp_path):
+    run = MsiRun(tmp_path, data=MSI_BYTES + b"EVIL")  # swapped in the temp folder after the download had been verified
+    assert powershell(run.script()) == 3
+    assert not run.seen.exists()  # msiexec was never started
+    assert not run.download.exists() and run.status.read_bytes() == b"verify"
+    assert run.target.read_bytes() == b"ALT"
+
+
+@win
+def test_msi_update_does_not_run_a_file_that_vanished(tmp_path):
+    run = MsiRun(tmp_path)
+    run.msi.unlink()
+    assert powershell(run.script()) == 3
+    assert not run.seen.exists() and run.status.read_bytes() == b"verify"
+
+
+@win
+def test_msi_update_gives_up_while_the_exe_stays_busy(tmp_path):
+    run = MsiRun(tmp_path)
+    with run.target.open("rb"):  # open files can't be opened for writing, like a running exe
+        assert powershell(run.script(tries=2)) == 1
+    assert not run.seen.exists() and run.status.read_bytes() == b"busy"
+    assert not run.download.exists() and run.target.read_bytes() == b"ALT"
+
+
+@win
+def test_msi_update_waits_while_the_exe_is_running_and_then_installs(tmp_path):
+    run = MsiRun(tmp_path)
+    runner = start_powershell(run.script())
+    try:
+        with held_like_a_running_exe(run.target):
+            with pytest.raises(subprocess.TimeoutExpired):
+                runner.wait(timeout=3)
+            assert not run.seen.exists()  # msiexec waits for the program to end
+        assert runner.wait(timeout=60) == 0
+    finally:
+        if runner.poll() is None:
+            runner.kill()
+    assert run.seen.exists()
+
+
+# msi_uninstall_script
+
+
+def test_msi_uninstall_script_removes_the_product_and_never_deletes_the_exe():
+    script = updater.msi_uninstall_script(Path("C:/A/MourseDecoder.exe"), GUID, [Path("C:/R/MourseDecoder")], status=Path("C:/C/r.txt"))
+    assert f"'/x {GUID} /qn /norestart'" in script and "\"$env:SystemRoot\\System32\\msiexec.exe\"" in script
+    assert "Remove-Item -LiteralPath $target" not in script and "Remove-Item -LiteralPath $exe" not in script
+    assert "$rc -ne 0 -and $rc -ne 1605 -and $rc -ne 3010" in script  # done: removed, not installed any more, restart wanted
+    assert "[System.IO.File]::Open($target, 'Open', 'ReadWrite', 'None').Close()" in script  # waits for the app to end
+    assert "-Recurse" in script and "MourseDecoder'" in script
+    failed, deletion = script.split("$code = ''")
+    assert "Report 'msi_uninstall'" in failed and "-Recurse" not in failed  # nothing is deleted when msiexec failed
+    assert "Report 'uninstall'" not in script  # that code says "files left over"; msiexec failing is a different case
+
+
+def test_msi_uninstall_script_without_folders_deletes_no_data():
+    script = updater.msi_uninstall_script(Path("C:/A/MourseDecoder.exe"), GUID, [])
+    assert "-Recurse" not in script and f"/x {GUID}" in script
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["", "{}", GUID[1:-1], GUID.lower() + " ", GUID + "\n", GUID + "'; calc; '", "{6F9619FF-8B86-D011-B42D-00C04FC964F}",
+     "{6F9619FF-8B86-D011-B42D-00C04FC964FG}", "{6F9619FF8B86D011B42D00C04FC964FF}", "'" + GUID, "\u2019" + GUID, None, 5],
+)
+def test_a_product_code_that_is_not_a_guid_never_reaches_the_script(bad):
+    with pytest.raises(UpdateError, match="no valid product code"):
+        updater.msi_uninstall_script(Path("C:/A/MourseDecoder.exe"), bad, [])
+
+
+def test_lower_and_upper_case_guids_are_accepted():
+    for code in (GUID, GUID.lower()):
+        assert f"/x {code} " in updater.msi_uninstall_script(Path("C:/A/a.exe"), code, [])
+
+
+class UninstallRun:
+    def __init__(self, tmp_path: Path, exit_code: int = 0):
+        self.exe = tmp_path / "Programs" / "MourseDecoder.exe"
+        self.exe.parent.mkdir()
+        self.exe.write_bytes(b"x")
+        self.config, self.legacy = tmp_path / "Roaming" / "MourseDecoder", tmp_path / "Roaming" / "PolyglotMorse"
+        for folder in (self.config, self.legacy):
+            (folder / "alphabets").mkdir(parents=True)
+            (folder / "settings.json").write_text("{}")
+        self.status = self.config / updater.RESULT_FILE
+        self.msiexec, self.seen = fake_msiexec(tmp_path, exit_code)
+
+    def script(self, folders=None, **kw) -> str:
+        folders = [self.config, self.legacy] if folders is None else folders
+        kw = {"delay_s": 0, "status": self.status, **kw}
+        return updater.msi_uninstall_script(self.exe, GUID, folders, msiexec=self.msiexec, **kw)
+
+
+@win
+@pytest.mark.parametrize("code", [0, 1605, 3010])
+def test_msi_uninstall_removes_the_product_then_the_data_but_not_the_exe(tmp_path, code):
+    run = UninstallRun(tmp_path, exit_code=code)
+    other = tmp_path / "Roaming" / "Dokumente"
+    other.mkdir()
+    assert powershell(run.script()) == 0
+    assert run.seen.read_bytes().decode().strip() == f"/x {GUID} /qn /norestart"
+    assert not run.config.exists() and not run.legacy.exists() and other.exists()
+    assert run.exe.exists()  # the installer removes it, the script does not
+
+
+@win
+def test_msi_uninstall_can_keep_the_data(tmp_path):
+    run = UninstallRun(tmp_path)
+    assert powershell(run.script(folders=[])) == 0
+    assert run.seen.exists() and (run.config / "settings.json").exists() and not run.status.exists()
+
+
+@win
+@pytest.mark.parametrize("code", [1603, 1618, 1])
+def test_msi_uninstall_failure_keeps_the_data_and_reports(tmp_path, code):
+    run = UninstallRun(tmp_path, exit_code=code)
+    assert powershell(run.script()) == 1
+    assert run.status.read_bytes() == b"msi_uninstall"  # the settings folder is still there to hold it
+    assert (run.config / "settings.json").exists() and run.legacy.exists()
+
+
+def test_msi_uninstall_script_removes_the_status_file_of_an_earlier_failure_on_success():
+    script = updater.msi_uninstall_script(Path("C:/A/a.exe"), GUID, [], status=Path("C:/cfg/result"))
+    assert script.rstrip().splitlines()[-2:] == [
+        "Remove-Item -LiteralPath $statusFile -Force -ErrorAction Ignore", "exit 0"]
+    assert "Remove-Item" not in updater.msi_uninstall_script(Path("C:/A/a.exe"), GUID, [])
+
+
+@win
+@pytest.mark.parametrize("folders", ["keep", "delete"])
+def test_msi_uninstall_second_run_clears_the_status_of_the_failed_first_run(tmp_path, folders):
+    run = UninstallRun(tmp_path, exit_code=1603)
+    kept = [] if folders == "keep" else None  # None: the settings folders, which hold the status file
+    assert powershell(run.script(folders=kept)) == 1
+    assert run.status.read_bytes() == b"msi_uninstall"
+    fake_msiexec(tmp_path, 0)  # same batch file, now it succeeds
+    assert powershell(run.script(folders=kept)) == 0
+    assert not run.status.exists()
+    assert run.config.exists() == (folders == "keep")
+
+
+@win
+def test_msi_uninstall_does_not_start_msiexec_while_the_exe_runs(tmp_path):
+    run = UninstallRun(tmp_path)
+    with run.exe.open("rb"):
+        assert powershell(run.script(tries=2)) == 1
+    assert not run.seen.exists() and run.status.read_bytes() == b"msi_uninstall"
+    assert (run.config / "settings.json").exists()
+
+
+@win
+def test_msi_uninstall_with_a_msiexec_that_cannot_start_reports_a_failure(tmp_path):
+    run = UninstallRun(tmp_path)
+    run.msiexec = tmp_path / "gibt-es-nicht.exe"
+    assert powershell(run.script()) == 1
+    assert run.status.read_bytes() == b"msi_uninstall" and run.config.exists()
+
+
+@win
+def test_msi_uninstall_skips_a_junction_and_leaves_its_target_alone(tmp_path):
+    run = UninstallRun(tmp_path)
+    real = tmp_path / "wichtig"
+    real.mkdir()
+    (real / "datei.txt").write_text("bleibt")
+    link = tmp_path / "Roaming" / "Linked" / "MourseDecoder"
+    link.parent.mkdir()
+    made = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(real)], capture_output=True)
+    if made.returncode != 0:
+        pytest.skip("Junction nicht möglich")
+    try:
+        assert powershell(run.script(folders=[link, run.legacy])) == 1
+        assert (real / "datei.txt").read_text() == "bleibt" and link.exists()
+        assert not run.legacy.exists()  # the real folder was still deleted
+    finally:
+        subprocess.run(["cmd", "/c", "rmdir", str(link)], capture_output=True)
+
+
+# uninstall() by kind
+
+
+def test_uninstall_of_an_msi_copy_runs_msiexec_with_the_registered_product_code(tmp_path, monkeypatch):
+    installed(monkeypatch, tmp_path, ProductCode=GUID)
+    calls = []
+    updater.uninstall(tmp_path / "MourseDecoder", lambda *a, **kw: calls.append(a))
+    script = decoded(calls[0][0])
+    assert f"/x {GUID} /qn /norestart" in script and "msiexec.exe" in script
+    assert "-Recurse" in script and "PolyglotMorse'" in script  # the data goes when the user chose that
+    assert "Remove-Item -LiteralPath $exe" not in script and "Remove-Item -LiteralPath $target" not in script
+    assert str(tmp_path / "MourseDecoder" / "update-result.txt") in script  # a failure can be shown at the next start
+
+
+def test_uninstall_of_an_msi_copy_can_keep_the_data(tmp_path, monkeypatch):
+    installed(monkeypatch, tmp_path, ProductCode=GUID)
+    calls = []
+    updater.uninstall(tmp_path / "MourseDecoder", lambda *a, **kw: calls.append(a), delete_data=False)
+    script = decoded(calls[0][0])
+    assert f"/x {GUID}" in script and "-Recurse" not in script
+
+
+@pytest.mark.parametrize("values", [{}, {"ProductCode": ""}, {"ProductCode": "{nope}"}, {"ProductCode": "x'; calc; '"}, {"ProductCode": 7}])
+def test_uninstall_of_an_msi_copy_without_a_valid_product_code_starts_nothing(tmp_path, monkeypatch, values):
+    installed(monkeypatch, tmp_path, **values)
+    with pytest.raises(UpdateError, match="no valid product code") as caught:
+        updater.uninstall(tmp_path / "MourseDecoder", lambda *a, **kw: pytest.fail("darf nichts starten"))
+    assert not caught.value.open_page
+
+
+def test_uninstall_of_an_msi_copy_still_checks_the_folder_name_first(tmp_path, monkeypatch):
+    installed(monkeypatch, tmp_path, ProductCode=GUID)
+    with pytest.raises(UpdateError, match="gehört nicht zum Programm"):
+        updater.uninstall(tmp_path / "Documents", lambda *a, **kw: pytest.fail("darf nichts starten"))
+
+
+def test_uninstall_of_a_portable_exe_still_deletes_the_exe_by_script(tmp_path, monkeypatch):
+    frozen_at(monkeypatch, tmp_path / "MourseDecoder.exe")  # no registry key
+    calls = []
+    updater.uninstall(tmp_path / "MourseDecoder", lambda *a, **kw: calls.append(a))
+    script = decoded(calls[0][0])
+    assert "$exe" in script and "msiexec" not in script
+
+
+# texts
+
+
+def test_the_msi_result_code_is_known_and_shown(tmp_path):
+    (tmp_path / updater.RESULT_FILE).write_text("msi", encoding="utf-8")
+    text = updater.read_update_result(tmp_path)
+    assert text == updater.tr("update.result.msi") and "msi-update.log" in text and text != updater.tr("update.result.unknown")
+
+
+def test_the_result_code_of_a_failed_msiexec_uninstall_has_its_own_text(tmp_path):
+    (tmp_path / updater.RESULT_FILE).write_text("msi_uninstall", encoding="utf-8")
+    text = updater.read_update_result(tmp_path)
+    assert text == updater.tr("update.result.msi_uninstall") and "Apps" in text
+    assert text not in (updater.tr("update.result.unknown"), updater.tr("update.result.uninstall"))
+    assert "could not be deleted" not in text  # that is the leftover-files text
+
+
+@pytest.mark.parametrize("code", ["en", "de", "de-saar", "es", "fr", "it", "pt"])
+def test_the_new_texts_exist_in_every_language_and_fit_both_install_kinds(code):
+    strings = json.loads((Path(updater.__file__).parent / "locales" / f"{code}.json").read_text(encoding="utf-8"))["strings"]
+    assert "msi-update.log" in strings["update.result.msi"]
+    assert strings["update.result.msi_uninstall"] not in (strings["update.result.uninstall"], strings["update.result.unknown"])
+    assert "{tag}" in strings["update.err.msi_incomplete"] and "MourseDecoder.msi.sig" in strings["update.err.msi_incomplete"]
+    assert strings["update.err.msi_incomplete"] != strings["update.err.no_msi"] and strings["update.err.not_msi"]
+    assert "{tag}" in strings["update.err.no_msi"] and "MourseDecoder.msi" in strings["update.err.no_msi"]
+    assert strings["update.err.bad_product_code"] and strings["update.err.bad_product_code"] != strings["update.err.no_msi"]
+    assert "MourseDecoder.exe" not in strings["uninstall.confirm"]  # an installed copy has no loose exe to name

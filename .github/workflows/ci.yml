@@ -44,3 +44,20 @@ jobs:
           maturin develop --release
           ruff check python tests
           if [ "$RUNNER_OS" = "Linux" ]; then xvfb-run -a pytest -q; else pytest -q; fi
+
+      # builds an MSI around a placeholder file (WiX does not look inside the exe), so a broken .wxs fails on every push
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
+        if: runner.os == 'Windows' && matrix.python == '3.13'
+        with:
+          dotnet-version: 8.0.x
+
+      - name: MSI - build and validate
+        if: runner.os == 'Windows' && matrix.python == '3.13'
+        shell: bash
+        run: |
+          source .venv/Scripts/activate
+          dotnet tool install --global wix --version 5.0.2
+          export PATH="$PATH:$HOME/.dotnet/tools"
+          python -c "import sys; sys.path.insert(0, 'packaging'); import build; build.make_icon()"
+          echo "placeholder, not a PE file" > "$RUNNER_TEMP/MourseDecoder.exe"
+          python packaging/build_msi.py --exe "$RUNNER_TEMP/MourseDecoder.exe" --output "$RUNNER_TEMP/MourseDecoder.msi"

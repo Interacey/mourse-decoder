@@ -68,6 +68,12 @@ def test_scripts_with_typographic_quotes_parse_cleanly_and_call_nothing_extra(tm
         "update": updater.update_script(new, target, status=tmp_path / name / "r.txt"),
         "update with hash check": updater.update_script(new, target, status=tmp_path / name / "r.txt", sha256="ab" * 32),
         "uninstall": updater.uninstall_script(target, [tmp_path / name / "MourseDecoder"], status=tmp_path / name / "r.txt"),
+        "msi update": updater.msi_update_script(
+            new.with_suffix(".msi"), target, tmp_path / name / "r.txt", "ab" * 32, tmp_path / name / "msi-update.log"
+        ),
+        "msi uninstall": updater.msi_uninstall_script(
+            target, "{6F9619FF-8B86-D011-B42D-00C04FC964FF}", [tmp_path / name / "MourseDecoder"], status=tmp_path / name / "r.txt"
+        ),
     }
     for kind, script in scripts.items():
         file = tmp_path / f"{kind}.ps1"
@@ -142,7 +148,7 @@ def test_read_update_result_returns_text_and_clears_the_file(tmp_path):
 
 
 def test_read_update_result_knows_every_code_and_survives_garbage(tmp_path):
-    for code in ("start", "uninstall", "reparse", "verify", "rollback"):
+    for code in ("start", "uninstall", "reparse", "verify", "rollback", "msi", "msi_uninstall"):
         (tmp_path / updater.RESULT_FILE).write_text(code + "\n", encoding="utf-8-sig")
         assert updater.read_update_result(tmp_path) == updater.tr(f"update.result.{code}")
     (tmp_path / updater.RESULT_FILE).write_bytes(b"\xff\xfe{x}")

@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Per-user installer for MourseDecoder.exe, built by packaging/build_msi.py with WiX 5.0.2.
+  Variables (passed with -d): Version (a.b.c), ExePath, IconPath.
+  The registry values InstallDir and ProductCode under HKCU\Software\Interacey\MourseDecoder are read by the app's updater.
+  Nothing is written to %APPDATA%: user data stays when the program is uninstalled or upgraded.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="Mourse Decoder" Manufacturer="Interacey" Version="$(Version)"
+           UpgradeCode="22EBA0AB-5107-49F9-964C-E55809B3FF31" Scope="perUser" InstallerVersion="500">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Mourse Decoder is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="AppIcon.ico" SourceFile="$(IconPath)" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon.ico" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/Interacey/mourse-decoder" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="ProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="MourseDecoder" />
+      </Directory>
+    </StandardDirectory>
+
+    <Component Id="MainExe" Directory="INSTALLFOLDER" Guid="E7260E20-66BC-4F79-9674-395B3850E1CF">
+      <File Id="MourseDecoderExe" Source="$(ExePath)" Name="MourseDecoder.exe" />
+      <RemoveFolder Id="RemoveInstallFolder" Directory="INSTALLFOLDER" On="uninstall" />
+      <RemoveFolder Id="RemoveProgramsFolder" Directory="ProgramsFolder" On="uninstall" />
+      <RegistryValue Root="HKCU" Key="Software\Interacey\MourseDecoder" Name="InstallDir" Type="string"
+                     Value="[INSTALLFOLDER]" KeyPath="yes" />
+      <RegistryValue Root="HKCU" Key="Software\Interacey\MourseDecoder" Name="ProductCode" Type="string"
+                     Value="[ProductCode]" />
+    </Component>
+
+    <Component Id="StartMenuShortcut" Directory="ProgramMenuFolder">
+      <Shortcut Id="MourseDecoderShortcut" Name="Mourse Decoder" Target="[INSTALLFOLDER]MourseDecoder.exe"
+                WorkingDirectory="INSTALLFOLDER" />
+      <RegistryValue Root="HKCU" Key="Software\Interacey\MourseDecoder" Name="StartMenuShortcut" Type="integer"
+                     Value="1" KeyPath="yes" />
+    </Component>
+
+    <Feature Id="Main" Title="Mourse Decoder" Level="1">
+      <ComponentRef Id="MainExe" />
+      <ComponentRef Id="StartMenuShortcut" />
+    </Feature>
+  </Package>
+</Wix>
